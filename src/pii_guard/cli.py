@@ -49,6 +49,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="Presidio 信心分數閾值（預設：0.5）",
     )
+    anon.add_argument(
+        "--llm-fallback",
+        action="store_true",
+        default=False,
+        help="啟用 Ollama LLM 輔助偵測（需先安裝 Ollama 並拉取模型）",
+    )
+    anon.add_argument(
+        "--ollama-model",
+        type=str,
+        default="qwen2.5:1.5b",
+        help="Ollama 模型名稱（預設：qwen2.5:1.5b）",
+    )
 
     # ── restore ──────────────────────────────────────────────────────────
     restore = subparsers.add_parser(
@@ -84,6 +96,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="ckiplab/bert-base-chinese-ner",
         help="CKIP NER 模型 ID 或本地路徑",
     )
+    serve.add_argument(
+        "--llm-fallback",
+        action="store_true",
+        default=False,
+        help="啟用 Ollama LLM 輔助偵測",
+    )
 
     return parser
 
@@ -107,7 +125,12 @@ def cmd_anonymize(args: argparse.Namespace) -> int:
 
     text = _read_input(args.input)
     print("[pii-guard] 載入模型中，首次執行需要下載 CKIP 模型…", file=sys.stderr)
-    engine = PiiGuardEngine(ckip_model=args.model, score_threshold=args.threshold)
+    engine = PiiGuardEngine(
+        ckip_model=args.model,
+        score_threshold=args.threshold,
+        llm_fallback=args.llm_fallback,
+        ollama_model=args.ollama_model,
+    )
     anonymized, mapping = engine.anonymize(text)
 
     _write_output(anonymized, args.output)
@@ -132,6 +155,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     import os
 
     os.environ.setdefault("PII_GUARD_MODEL", args.model)
+    if args.llm_fallback:
+        os.environ["PII_GUARD_LLM_FALLBACK"] = "1"
     from pii_guard.server import app
 
     app.run(transport="stdio")

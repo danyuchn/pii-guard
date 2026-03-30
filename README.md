@@ -17,7 +17,7 @@
 ```
 原始文件
     ↓
-[偵測層] CKIP NER + 台灣 Regex
+[偵測層] CKIP NER + 台灣 Regex + (可選) Ollama LLM
     → 輸出 JSON 實體列表
     ↓
 [替換層] 程式碼建立 mapping table
@@ -41,7 +41,7 @@ AI 回答（含佔位符）
 | PII 框架 | [Microsoft Presidio](https://github.com/microsoft/presidio) | 偵測 + 匿名化 + 還原，MIT 授權 |
 | 繁中 NER | [ckiplab/bert-base-chinese-ner](https://huggingface.co/ckiplab/bert-base-chinese-ner) | 中研院，繁體中文人名/組織，102M |
 | 台灣 PII Regex | 自建 PatternRecognizer | 身分證、統一編號、手機、市話 |
-| LLM（可選輔助） | Qwen2.5-3B/7B via Ollama | 補充 NER 漏掉的非結構化 PII |
+| LLM fallback（可選） | Qwen2.5:1.5b via Ollama | `--llm-fallback` 啟用，補充 NER 漏掉的非結構化 PII |
 | Pipeline 整合 | LangChain PresidioReversibleAnonymizer | mapping table 序列化/還原 |
 | 語言 | Python 3.11+ | |
 | 套件管理 | uv | |
@@ -61,11 +61,33 @@ AI 回答（含佔位符）
 - 統一編號：`\d{8}`（搭配 context 詞過濾）
 - Email、信用卡號（Presidio 內建）
 
+## LLM Fallback（可選）
+
+啟用 Ollama Qwen2.5 作為輔助偵測層，補抓 regex/CKIP 遺漏的邊緣案例：
+
+```bash
+# 前置：安裝 Ollama 並拉取模型
+ollama pull qwen2.5:1.5b
+
+# CLI 使用
+uv run python -m pii_guard --llm-fallback input.txt -o output.txt
+
+# 指定其他模型
+uv run python -m pii_guard --llm-fallback --ollama-model qwen2.5:3b input.txt
+
+# MCP Server 啟用
+uv run python -m pii_guard serve --llm-fallback
+# 或透過環境變數
+PII_GUARD_LLM_FALLBACK=1 uv run python -m pii_guard serve
+```
+
+LLM confidence 設為 0.75（低於 regex 0.85 和 CKIP 0.85），確保確定性偵測結果優先。Ollama 不可用時自動降級，不影響既有功能。
+
 ## 開發路線圖
 
-- [ ] Phase 1 MVP：Presidio + CKIP NER + 台灣 Regex，CLI 工具
-- [ ] Phase 2：LangChain PresidioReversibleAnonymizer 整合，mapping JSON 可存檔
-- [ ] Phase 3：Ollama Qwen2.5 作為 fallback 偵測層
+- [x] Phase 1 MVP：Presidio + CKIP NER + 台灣 Regex，MCP Server 介面
+- [x] Phase 2：CKIP BERT NER 整合，+4 種 PII 類型（車牌/出生日期/國際手機/銀行帳號）
+- [x] Phase 3：Ollama Qwen2.5:1.5b LLM fallback 偵測層（`--llm-fallback` 啟用）
 - [ ] Phase 4：評估集建立，precision/recall 測試
 - [ ] Phase 5：Claude Code PreToolUse hook 整合（自動攔截讀檔）
 

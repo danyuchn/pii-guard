@@ -34,12 +34,19 @@ _CKIP_LABEL_MAP: dict[str, str] = {
 }
 
 
-def _build_analyzer(ckip_model: str) -> AnalyzerEngine:
+def _build_analyzer(
+    ckip_model: str,
+    *,
+    llm_fallback: bool = False,
+    ollama_model: str = "qwen2.5:1.5b",
+    ollama_base_url: str = "http://localhost:11434",
+) -> AnalyzerEngine:
     """
     Build Presidio AnalyzerEngine backed by CKIP BERT (for PERSON/ORG/LOCATION)
     plus Taiwan-specific PatternRecognizers.
 
     Falls back gracefully if transformers/spaCy models are unavailable.
+    Optionally registers an Ollama LLM fallback recognizer.
     """
     nlp_engine = _create_nlp_engine(ckip_model)
     analyzer = AnalyzerEngine(
@@ -48,6 +55,14 @@ def _build_analyzer(ckip_model: str) -> AnalyzerEngine:
     )
     for recognizer in get_all_tw_recognizers():
         analyzer.registry.add_recognizer(recognizer)
+
+    if llm_fallback:
+        from pii_guard.recognizers.ollama_recognizer import OllamaRecognizer
+
+        ollama_rec = OllamaRecognizer(model=ollama_model, base_url=ollama_base_url)
+        analyzer.registry.add_recognizer(ollama_rec)
+        logger.info("OllamaRecognizer enabled (model=%s)", ollama_model)
+
     return analyzer
 
 
@@ -121,9 +136,17 @@ class PiiGuardEngine:
         self,
         ckip_model: str = "ckiplab/bert-base-chinese-ner",
         score_threshold: float = 0.5,
+        llm_fallback: bool = False,
+        ollama_model: str = "qwen2.5:1.5b",
+        ollama_base_url: str = "http://localhost:11434",
     ) -> None:
         self.score_threshold = score_threshold
-        self._analyzer = _build_analyzer(ckip_model)
+        self._analyzer = _build_analyzer(
+            ckip_model,
+            llm_fallback=llm_fallback,
+            ollama_model=ollama_model,
+            ollama_base_url=ollama_base_url,
+        )
         self._anonymizer = AnonymizerEngine()
 
     # ------------------------------------------------------------------

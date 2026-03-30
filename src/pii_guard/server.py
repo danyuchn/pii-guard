@@ -28,7 +28,10 @@ def _get_engine():
         from pii_guard.pipeline.engine import PiiGuardEngine
 
         model = os.environ.get("PII_GUARD_MODEL", "ckiplab/bert-base-chinese-ner")
-        _engine = PiiGuardEngine(ckip_model=model)
+        llm_fallback = os.environ.get("PII_GUARD_LLM_FALLBACK", "").lower() in (
+            "1", "true", "yes",
+        )
+        _engine = PiiGuardEngine(ckip_model=model, llm_fallback=llm_fallback)
     return _engine
 
 

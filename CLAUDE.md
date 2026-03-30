@@ -57,16 +57,20 @@ uv run ruff check src/
 | 人名、組織、地名 | CKIP NER | BERT 模型推論 |
 | 身分證字號 | Regex | `[A-Z][12]\d{8}` |
 | 外籍居留證 | Regex | `[A-Z][A-D89]\d{8}` |
-| 手機號碼 | Regex | `09\d{8}` |
+| 手機號碼（本地） | Regex | `09\d{8}` |
+| 手機號碼（+886） | Regex | `\+886[-\s]?9\d{2}...` |
 | 市話 | Regex | `0[2-8]\d{7,8}` |
 | 統一編號 | Regex + context | `\d{8}` |
-| Email、信用卡 | Presidio 內建 | — |
+| Email、信用卡 | Presidio 內建（zh 覆寫） | — |
+| 車牌 | Regex + context | `[A-Z]{2,3}-\d{4}` / `\d{3,4}-[A-Z]{2}` |
+| 出生日期 | Regex + context | 民國 `\d{2,3}年...` / 西元 `\d{4}[-/.]` |
+| 銀行帳號 | Regex + context | `\d{12,16}` |
 
 ## Development Roadmap
 
-- **Phase 1 MVP**：Presidio + CKIP NER + 台灣 Regex，CLI 工具
-- **Phase 2**：LangChain `PresidioReversibleAnonymizer`，mapping JSON 可存檔
-- **Phase 3**：Ollama Qwen2.5 fallback 偵測層
+- **Phase 1 MVP** ✅ 2026-03-30：Presidio + 台灣 Regex 8 種，MCP Server 介面，89 tests
+- **Phase 2** ✅ 2026-03-30：CKIP BERT NER（人名/組織/地名）整合驗證，+4 種 PII 類型，MCP smoke test，152 tests total
+- **Phase 3** ✅ 2026-03-30：Ollama Qwen2.5:1.5b LLM fallback 偵測層（opt-in `--llm-fallback`），14 unit tests，167 tests total
 - **Phase 4**：評估集，precision/recall 測試
 - **Phase 5**：Claude Code `PreToolUse` hook 整合（自動攔截讀檔）
 
