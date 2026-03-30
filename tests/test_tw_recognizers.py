@@ -5,9 +5,13 @@ from __future__ import annotations
 import pytest
 
 from pii_guard.recognizers.tw_business_recognizer import TwBusinessIdRecognizer
-from pii_guard.recognizers.tw_id_recognizer import TwArcRecognizer, TwNationalIdRecognizer
+from pii_guard.recognizers.tw_id_recognizer import (
+    TwArcRecognizer,
+    TwNationalIdRecognizer,
+    TwPassportRecognizer,
+)
+from pii_guard.recognizers.tw_misc_recognizers import TwCreditCardRecognizer, TwEmailRecognizer
 from pii_guard.recognizers.tw_phone_recognizer import TwLandlineRecognizer, TwMobileRecognizer
-
 
 # ── TwNationalIdRecognizer ────────────────────────────────────────────────────
 
@@ -49,6 +53,49 @@ class TestTwNationalIdRecognizer:
         results = self.r.analyze(text, entities=["TW_NATIONAL_ID"])
         assert len(results) == 1
         assert text[results[0].start:results[0].end] == "A123456789"
+
+
+# ── TwPassportRecognizer ──────────────────────────────────────────────────────
+
+class TestTwPassportRecognizer:
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.r = TwPassportRecognizer()
+
+    @pytest.mark.parametrize("text,expected_match", [
+        ("A12345678",   True),   # valid: 1 letter + 8 digits
+        ("B87654321",   True),   # valid
+        ("Z00000000",   True),   # valid edge: all zeros
+        ("a12345678",   False),  # lowercase
+        ("1B2345678",   False),  # starts with digit
+        ("A1234567",    False),  # only 8 chars total
+        ("A123456789",  False),  # 10 chars → NID, not passport (lookahead blocks)
+        ("AB12345678",  False),  # 2nd char is letter → ARC, not passport
+    ])
+    def test_pattern(self, text, expected_match):
+        results = self.r.analyze(text, entities=["TW_PASSPORT"])
+        matched = any(r.entity_type == "TW_PASSPORT" for r in results)
+        assert matched == expected_match, f"text={text!r}"
+
+    def test_no_conflict_with_nid(self):
+        """NID (10 chars) must NOT be matched as passport."""
+        r_nid = TwNationalIdRecognizer()
+        nid_text = "A123456789"
+        assert bool(r_nid.analyze(nid_text, entities=["TW_NATIONAL_ID"]))
+        assert not bool(self.r.analyze(nid_text, entities=["TW_PASSPORT"]))
+
+    def test_no_conflict_with_arc(self):
+        """ARC (10 chars, 2nd char letter) must NOT be matched as passport."""
+        r_arc = TwArcRecognizer()
+        arc_text = "AB12345678"
+        assert bool(r_arc.analyze(arc_text, entities=["TW_ARC"]))
+        assert not bool(self.r.analyze(arc_text, entities=["TW_PASSPORT"]))
+
+    def test_span_in_chinese_context(self):
+        text = "護照號碼A12345678入境"
+        results = self.r.analyze(text, entities=["TW_PASSPORT"])
+        assert len(results) == 1
+        assert text[results[0].start:results[0].end] == "A12345678"
 
 
 # ── TwArcRecognizer ───────────────────────────────────────────────────────────
@@ -128,6 +175,10 @@ class TestTwBusinessIdRecognizer:
         ("04595257", True),   # sum=40, 40%10==0
         ("12345678", False),  # sum=42, 42%10==2
         ("00000000", True),   # sum=0, 0%10==0 (edge case)
+        # 7th digit = 7 special rule: total%10 != 0 but (total-1)%10 == 0
+        ("10000070", True),   # d7=7, total=11, (11-1)%10==0 → special rule only
+        ("10000178", True),   # d7=7, total=21, (21-1)%10==0 → special rule only
+        ("10000276", True),   # d7=7, total=21, (21-1)%10==0 → special rule only
     ])
     def test_checksum(self, number, expected_valid):
         assert TwBusinessIdRecognizer._validate_checksum(number) == expected_valid, number
@@ -167,3 +218,58 @@ class TestTwBusinessIdRecognizer:
         results = self.r.analyze(text, entities=["TW_BUSINESS_ID"])
         assert len(results) == 1
         assert text[results[0].start:results[0].end] == "04595257"
+
+
+# ── TwEmailRecognizer ─────────────────────────────────────────────────────────
+
+class TestTwEmailRecognizer:
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.r = TwEmailRecognizer()
+
+    @pytest.mark.parametrize("text,expected_match", [
+        ("john@example.com",                True),   # standalone
+        ("test.user+tag@sub.domain.com",    True),   # complex address
+        ("電子郵件john@example.com以便聯絡",  True),   # no-space Chinese context
+        ("請寄信到 john@example.com 謝謝",    True),   # space-separated Chinese
+        ("notanemail@",                     False),  # missing domain
+        ("@noemail.com",                    False),  # missing local part
+        ("not@valid",                       False),  # missing TLD
+    ])
+    def test_pattern(self, text, expected_match):
+        results = self.r.analyze(text, entities=["EMAIL_ADDRESS"])
+        matched = any(r.entity_type == "EMAIL_ADDRESS" for r in results)
+        assert matched == expected_match, f"text={text!r}"
+
+    def test_span_no_space_chinese(self):
+        """Span must capture only the email, not surrounding Chinese characters."""
+        text = "電子郵件john@example.com以便聯絡"
+        results = self.r.analyze(text, entities=["EMAIL_ADDRESS"])
+        assert len(results) == 1
+        assert text[results[0].start:results[0].end] == "john@example.com"
+
+
+# ── TwCreditCardRecognizer ────────────────────────────────────────────────────
+
+class TestTwCreditCardRecognizer:
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.r = TwCreditCardRecognizer()
+
+    @pytest.mark.parametrize("text,expected_match", [
+        ("4111111111111111",          True),   # Visa test number (Luhn valid)
+        ("5500005555555559",          True),   # Mastercard test number
+        ("信用卡號 4111111111111111",   True),   # Chinese context
+        ("4111111111111112",          False),  # Luhn checksum fails
+        ("1234567890123456",          False),  # invalid prefix
+    ])
+    def test_pattern(self, text, expected_match):
+        results = self.r.analyze(text, entities=["CREDIT_CARD"])
+        matched = any(r.entity_type == "CREDIT_CARD" for r in results)
+        assert matched == expected_match, f"text={text!r}"
+
+    def test_span_in_chinese_context(self):
+        text = "信用卡號 4111111111111111 請保密"
+        results = self.r.analyze(text, entities=["CREDIT_CARD"])
+        assert len(results) == 1
+        assert text[results[0].start:results[0].end] == "4111111111111111"

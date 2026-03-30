@@ -53,3 +53,30 @@ class TwArcRecognizer(PatternRecognizer):
             supported_language="zh",
             global_regex_flags=_FLAGS,
         )
+
+
+class TwPassportRecognizer(PatternRecognizer):
+    """Taiwan passport number: [A-Z]\\d{8} (9 chars), e.g. A12345678.
+
+    Distinct from NationalID ([A-Z][12]\\d{8}, 10 chars) and ARC ([A-Z][A-D89]\\d{8},
+    10 chars): passport has exactly 9 characters and the second character is always
+    a digit (0-9), not a letter.  The trailing lookahead (?![A-Za-z0-9]) prevents
+    matching the first 9 chars of a 10-char NID/ARC.
+    """
+
+    SUPPORTED_ENTITY: ClassVar[str] = "TW_PASSPORT"
+    PATTERNS: ClassVar[list[Pattern]] = [
+        Pattern("TW_PASSPORT", r"(?<![A-Za-z0-9])[A-Z]\d{8}(?![A-Za-z0-9])", 0.6),
+    ]
+    CONTEXT: ClassVar[list[str]] = [
+        "護照", "passport", "護照號碼", "護照號", "出入境",
+    ]
+
+    def __init__(self) -> None:
+        super().__init__(
+            supported_entity=self.SUPPORTED_ENTITY,
+            patterns=self.PATTERNS,
+            context=self.CONTEXT,
+            supported_language="zh",
+            global_regex_flags=_FLAGS,
+        )

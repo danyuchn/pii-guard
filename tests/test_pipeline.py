@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
-
-import pytest
 
 
 class TestPiiGuardEngineAnonymize:
@@ -153,3 +150,61 @@ class TestMappingPersistence:
         loaded_mapping = PiiGuardEngine.load_mapping(save_path)
         restored = PiiGuardEngine.deanonymize(anonymized, loaded_mapping)
         assert restored == original
+
+
+class TestMixedEntityTypes:
+    """Pipeline-level tests for texts containing multiple Taiwan PII types simultaneously."""
+
+    def test_nid_and_arc_same_text(self, spacy_only_engine):
+        """NID and ARC in the same text must be detected independently."""
+        text = "甲的身分證A123456789，乙的居留證AB12345678"
+        anonymized, mapping = spacy_only_engine.anonymize(text)
+
+        nid_keys = [k for k in mapping if "TW_NATIONAL_ID" in k]
+        arc_keys = [k for k in mapping if "TW_ARC" in k]
+        assert len(nid_keys) == 1, "should detect exactly one NID"
+        assert len(arc_keys) == 1, "should detect exactly one ARC"
+        # Placeholders must differ
+        assert nid_keys[0] != arc_keys[0]
+        # Roundtrip
+        assert spacy_only_engine.deanonymize(anonymized, mapping) == text
+
+    def test_nid_and_passport_same_text(self, spacy_only_engine):
+        """NID (10 chars) and passport (9 chars) in the same text."""
+        text = "護照A12345678，身分證A123456789"
+        anonymized, mapping = spacy_only_engine.anonymize(text)
+
+        passport_keys = [k for k in mapping if "TW_PASSPORT" in k]
+        nid_keys = [k for k in mapping if "TW_NATIONAL_ID" in k]
+        assert len(passport_keys) == 1
+        assert len(nid_keys) == 1
+        assert spacy_only_engine.deanonymize(anonymized, mapping) == text
+
+    def test_all_tw_types_roundtrip(self, spacy_only_engine):
+        """Text containing NID, mobile, landline, business ID, email, and passport."""
+        text = (
+            "身分證A123456789，"
+            "護照B12345678，"
+            "手機0912345678，"
+            "電話0212345678，"
+            "統一編號04595257，"
+            "信箱test@example.com"
+        )
+        anonymized, mapping = spacy_only_engine.anonymize(text)
+
+        assert "<TW_NATIONAL_ID_1>" in anonymized
+        assert "<TW_PASSPORT_1>" in anonymized
+        assert "<TW_MOBILE_1>" in anonymized
+        assert "<TW_LANDLINE_1>" in anonymized
+        assert "<TW_BUSINESS_ID_1>" in anonymized
+        assert "<EMAIL_ADDRESS_1>" in anonymized
+        # Roundtrip must be lossless
+        assert spacy_only_engine.deanonymize(anonymized, mapping) == text
+
+    def test_email_and_credit_card_roundtrip(self, spacy_only_engine):
+        text = "信箱john@example.com，信用卡4111111111111111"
+        anonymized, mapping = spacy_only_engine.anonymize(text)
+
+        assert "<EMAIL_ADDRESS_1>" in anonymized
+        assert "<CREDIT_CARD_1>" in anonymized
+        assert spacy_only_engine.deanonymize(anonymized, mapping) == text
