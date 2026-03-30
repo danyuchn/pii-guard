@@ -86,7 +86,9 @@ def _create_nlp_engine(ckip_model: str):
 
         return engine
 
-    except (ImportError, OSError) as exc:
+    except (ImportError, OSError, ValueError) as exc:
+        # ValueError covers "Can't find factory for 'hf_token_pipe'" when
+        # spacy-transformers is not installed.
         logger.warning(
             "TransformersNlpEngine unavailable (%s). "
             "PERSON/ORG/LOCATION detection via CKIP will be disabled. "
