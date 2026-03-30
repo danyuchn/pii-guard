@@ -198,9 +198,8 @@ class TwBankAccountRecognizer(LocalRecognizer):
 
     Raw 12–16 digit strings are extremely ambiguous (timestamps, order numbers,
     credit card PANs, etc.).  A context keyword is required within ±50 chars to
-    avoid false positives.  Note that 16-digit Luhn-valid numbers are handled
-    separately by TwCreditCardRecognizer; this recognizer targets non-Luhn
-    bank account strings.
+    avoid false positives.  Luhn-valid numbers are skipped because they are
+    handled by TwCreditCardRecognizer.
     """
 
     SUPPORTED_ENTITY: ClassVar[str] = "TW_BANK_ACCOUNT"
@@ -230,6 +229,10 @@ class TwBankAccountRecognizer(LocalRecognizer):
             return []
         results: list[RecognizerResult] = []
         for match in self.PATTERN.finditer(text):
+            number = match.group()
+            # Only exclude Luhn-valid numbers at credit card lengths (13-16 digits)
+            if len(number) >= 13 and self._is_luhn_valid(number):
+                continue
             if not _has_context(text, match.start(), match.end(), self.CONTEXT_KEYWORDS):
                 continue
             results.append(
@@ -241,3 +244,16 @@ class TwBankAccountRecognizer(LocalRecognizer):
                 )
             )
         return results
+
+    @staticmethod
+    def _is_luhn_valid(number: str) -> bool:
+        """Return True if *number* passes the Luhn checksum (likely a credit card)."""
+        digits = [int(d) for d in number]
+        checksum = 0
+        for i, d in enumerate(reversed(digits)):
+            if i % 2 == 1:
+                d *= 2
+                if d > 9:
+                    d -= 9
+            checksum += d
+        return checksum % 10 == 0

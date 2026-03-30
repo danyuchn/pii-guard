@@ -6,7 +6,7 @@ import json
 import logging
 from pathlib import Path
 
-from presidio_analyzer import AnalyzerEngine
+from presidio_analyzer import AnalyzerEngine, RecognizerResult
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
 
@@ -53,6 +53,17 @@ def _build_analyzer(
         nlp_engine=nlp_engine,
         supported_languages=["zh"],
     )
+
+    # Remove Presidio built-in recognizers that conflict with our TW variants.
+    # The built-in EmailRecognizer uses \b boundaries which produce wrong spans
+    # in Chinese text (e.g. "信箱user@x.com" matched as full string instead of
+    # just "user@x.com"), and its score=1.0 overrides our TwEmailRecognizer.
+    _remove = {"EmailRecognizer", "CreditCardRecognizer"}
+    analyzer.registry.recognizers = [
+        r for r in analyzer.registry.recognizers
+        if r.name not in _remove
+    ]
+
     for recognizer in get_all_tw_recognizers():
         analyzer.registry.add_recognizer(recognizer)
 
@@ -117,6 +128,51 @@ def _create_nlp_engine(ckip_model: str):
         )
 
 
+def _merge_adjacent_spans(results: list[RecognizerResult]) -> list[RecognizerResult]:
+    """Merge adjacent or overlapping spans of the same entity type.
+
+    CKIP sometimes splits a single entity into multiple tokens
+    (e.g. "台北市信義區" → [4:9] + [9:10]).  This merges them back.
+    """
+    if not results:
+        return results
+    sorted_results = sorted(results, key=lambda r: (r.entity_type, r.start))
+    merged: list[RecognizerResult] = []
+    for r in sorted_results:
+        if (
+            merged
+            and merged[-1].entity_type == r.entity_type
+            and r.start <= merged[-1].end  # adjacent or overlapping
+        ):
+            prev = merged[-1]
+            merged[-1] = RecognizerResult(
+                entity_type=prev.entity_type,
+                start=prev.start,
+                end=max(prev.end, r.end),
+                score=max(prev.score, r.score),
+            )
+        else:
+            merged.append(r)
+    return merged
+
+
+def _filter_person_over_date(results: list[RecognizerResult]) -> list[RecognizerResult]:
+    """Drop PERSON spans that fully overlap a TW_BIRTH_DATE span.
+
+    CKIP sometimes tags Minguo dates (民國85年12月3日) as PERSON.
+    """
+    date_spans = {(r.start, r.end) for r in results if r.entity_type == "TW_BIRTH_DATE"}
+    if not date_spans:
+        return results
+    return [
+        r for r in results
+        if not (
+            r.entity_type == "PERSON"
+            and any(ds <= r.start and r.end <= de for ds, de in date_spans)
+        )
+    ]
+
+
 class PiiGuardEngine:
     """
     Orchestrates PII detection and reversible anonymization for Traditional Chinese text.
@@ -148,6 +204,22 @@ class PiiGuardEngine:
             ollama_base_url=ollama_base_url,
         )
         self._anonymizer = AnonymizerEngine()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _raw_detect(self, text: str) -> list[RecognizerResult]:
+        """Run analyzer + post-processing (merge spans, resolve conflicts)."""
+        results = self._analyzer.analyze(
+            text=text,
+            language="zh",
+            entities=SUPPORTED_ENTITIES,
+            score_threshold=self.score_threshold,
+        )
+        results = _merge_adjacent_spans(results)
+        results = _filter_person_over_date(results)
+        return results
 
     # ------------------------------------------------------------------
     # Public API
@@ -186,12 +258,7 @@ class PiiGuardEngine:
             for et in SUPPORTED_ENTITIES
         }
 
-        results = self._analyzer.analyze(
-            text=text,
-            language="zh",
-            entities=SUPPORTED_ENTITIES,
-            score_threshold=self.score_threshold,
-        )
+        results = self._raw_detect(text)
 
         anonymized_result = self._anonymizer.anonymize(
             text=text,
@@ -203,14 +270,9 @@ class PiiGuardEngine:
         reverse_mapping: dict[str, str] = {v: k for k, v in entity_mapping.items()}
         return anonymized_result.text, reverse_mapping
 
-    def detect(self, text: str) -> list:
+    def detect(self, text: str) -> list[RecognizerResult]:
         """Return raw RecognizerResult list without anonymizing."""
-        return self._analyzer.analyze(
-            text=text,
-            language="zh",
-            entities=SUPPORTED_ENTITIES,
-            score_threshold=self.score_threshold,
-        )
+        return self._raw_detect(text)
 
     @staticmethod
     def deanonymize(text: str, mapping: dict[str, str]) -> str:

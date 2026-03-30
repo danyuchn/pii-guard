@@ -352,7 +352,9 @@
   {
     "id": "clean-002",
     "text": "這份報告分析了台灣半導體產業的趨勢與發展方向。",
-    "annotations": []
+    "annotations": [
+      {"entity_type": "LOCATION", "start": 7, "end": 9, "text": "台灣"}
+    ]
   },
   {
     "id": "clean-003",
