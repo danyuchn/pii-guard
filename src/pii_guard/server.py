@@ -14,13 +14,12 @@ from __future__ import annotations
 
 import os
 import uuid
-from typing import Dict
 
 from mcp.server.fastmcp import FastMCP
 
 # Lazy-init: model loads on first tool call to avoid slow startup
 _engine = None
-_sessions: Dict[str, Dict[str, str]] = {}  # session_id → {placeholder: original}
+_sessions: dict[str, dict[str, str]] = {}  # session_id → {placeholder: original}
 
 
 def _get_engine():

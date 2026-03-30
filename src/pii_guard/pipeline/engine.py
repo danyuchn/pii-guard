@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
@@ -16,7 +15,7 @@ from pii_guard.recognizers.tw_recognizers import TW_ENTITY_TYPES, get_all_tw_rec
 logger = logging.getLogger(__name__)
 
 # All entity types the engine handles
-SUPPORTED_ENTITIES: List[str] = [
+SUPPORTED_ENTITIES: list[str] = [
     "PERSON",
     "ORG",
     "LOCATION",
@@ -26,7 +25,7 @@ SUPPORTED_ENTITIES: List[str] = [
 ]
 
 # CKIP NER label → Presidio entity type mapping
-_CKIP_LABEL_MAP: Dict[str, str] = {
+_CKIP_LABEL_MAP: dict[str, str] = {
     "PERSON": "PERSON",
     "PER": "PERSON",
     "ORG": "ORG",
@@ -130,7 +129,7 @@ class PiiGuardEngine:
     # Public API
     # ------------------------------------------------------------------
 
-    def anonymize(self, text: str) -> Tuple[str, Dict[str, str]]:
+    def anonymize(self, text: str) -> tuple[str, dict[str, str]]:
         """
         Anonymize PII in *text*.
 
@@ -142,11 +141,15 @@ class PiiGuardEngine:
             ``{placeholder: original_value}`` — needed for :meth:`deanonymize`.
         """
         # Shared mutable state for the operator lambdas (closure)
-        entity_mapping: Dict[str, str] = {}   # original_value → placeholder
-        counters: Dict[str, int] = {}          # entity_type → running count
+        entity_mapping: dict[str, str] = {}   # original_value → placeholder
+        counters: dict[str, int] = {}          # entity_type → running count
 
         def make_lambda(entity_type: str):
             def replace_fn(original: str) -> str:
+                # Presidio's Custom.validate() always calls lambda("PII") to type-check
+                # the return value. Skip this sentinel to avoid polluting entity_mapping.
+                if original == "PII":
+                    return "<VALIDATION>"
                 if original not in entity_mapping:
                     counters[entity_type] = counters.get(entity_type, 0) + 1
                     placeholder = f"<{entity_type}_{counters[entity_type]}>"
@@ -168,16 +171,16 @@ class PiiGuardEngine:
 
         anonymized_result = self._anonymizer.anonymize(
             text=text,
-            analyzer_results=results,
+            analyzer_results=results,  # type: ignore[arg-type]
             operators=operators,
         )
 
         # Reverse: placeholder → original (for deanonymize)
-        reverse_mapping: Dict[str, str] = {v: k for k, v in entity_mapping.items()}
+        reverse_mapping: dict[str, str] = {v: k for k, v in entity_mapping.items()}
         return anonymized_result.text, reverse_mapping
 
     @staticmethod
-    def deanonymize(text: str, mapping: Dict[str, str]) -> str:
+    def deanonymize(text: str, mapping: dict[str, str]) -> str:
         """
         Restore anonymized *text* using *mapping*.
 
@@ -198,11 +201,11 @@ class PiiGuardEngine:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def save_mapping(mapping: Dict[str, str], path: Path) -> None:
+    def save_mapping(mapping: dict[str, str], path: Path) -> None:
         """Serialise *mapping* to a JSON file at *path*."""
         path.write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
 
     @staticmethod
-    def load_mapping(path: Path) -> Dict[str, str]:
+    def load_mapping(path: Path) -> dict[str, str]:
         """Load a mapping JSON file previously saved by :meth:`save_mapping`."""
         return json.loads(path.read_text(encoding="utf-8"))

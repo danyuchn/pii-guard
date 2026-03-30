@@ -8,29 +8,34 @@ import pytest
 @pytest.fixture(scope="session")
 def spacy_only_engine():
     """
-    PiiGuardEngine backed by spaCy only (no CKIP download required).
-    Covers all Taiwan regex recognizers; PERSON/ORG/LOCATION detection disabled.
+    PiiGuardEngine with Taiwan regex recognizers only (no CKIP download required).
+    PERSON/ORG/LOCATION detection disabled: registry starts empty so spaCy NER
+    entities (which interfere with regex span tests) are never added.
     """
-    from unittest.mock import patch
-
-    from presidio_analyzer import AnalyzerEngine
+    from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
     from presidio_analyzer.nlp_engine import SpacyNlpEngine
+    from presidio_anonymizer import AnonymizerEngine
 
-    def _mock_build_analyzer(ckip_model: str) -> AnalyzerEngine:
-        nlp_engine = SpacyNlpEngine(
-            models=[{"lang_code": "zh", "model_name": "zh_core_web_sm"}]
-        )
-        analyzer = AnalyzerEngine(
-            nlp_engine=nlp_engine,
-            supported_languages=["zh"],
-        )
-        from pii_guard.recognizers.tw_recognizers import get_all_tw_recognizers
+    from pii_guard.pipeline.engine import PiiGuardEngine
+    from pii_guard.recognizers.tw_recognizers import get_all_tw_recognizers
 
-        for r in get_all_tw_recognizers():
-            analyzer.registry.add_recognizer(r)
-        return analyzer
+    nlp_engine = SpacyNlpEngine(
+        models=[{"lang_code": "zh", "model_name": "zh_core_web_sm"}]
+    )
+    # Empty registry — no built-in Presidio/spaCy recognizers, only Taiwan ones
+    registry = RecognizerRegistry(recognizers=[], supported_languages=["zh"])
+    for r in get_all_tw_recognizers():
+        registry.add_recognizer(r)
 
-    with patch("pii_guard.pipeline.engine._build_analyzer", side_effect=_mock_build_analyzer):
-        from pii_guard.pipeline.engine import PiiGuardEngine
+    analyzer = AnalyzerEngine(
+        registry=registry,
+        nlp_engine=nlp_engine,
+        supported_languages=["zh"],
+    )
 
-        yield PiiGuardEngine()
+    # Construct engine directly without triggering CKIP model download
+    engine = object.__new__(PiiGuardEngine)
+    engine.score_threshold = 0.5
+    engine._analyzer = analyzer
+    engine._anonymizer = AnonymizerEngine()
+    return engine

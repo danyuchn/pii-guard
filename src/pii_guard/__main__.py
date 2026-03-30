@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import sys
 
-
 _SUBCOMMANDS = {"anonymize", "anon", "restore", "serve", "-h", "--help"}
 
 

@@ -30,6 +30,9 @@ pii-guard = "pii_guard.__main__:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/pii_guard"]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import ClassVar, List, Optional
+from typing import ClassVar
 
 from presidio_analyzer import LocalRecognizer, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpArtifacts
@@ -19,13 +19,15 @@ class TwBusinessIdRecognizer(LocalRecognizer):
     """
 
     SUPPORTED_ENTITY: ClassVar[str] = "TW_BUSINESS_ID"
-    PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"\b\d{8}\b")
-    CONTEXT_KEYWORDS: ClassVar[List[str]] = [
+    # Lookaround instead of \b: re.ASCII maps to regex.V1 in Presidio's regex module,
+    # breaking boundary detection in Chinese text.
+    PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"(?<!\d)\d{8}(?!\d)")
+    CONTEXT_KEYWORDS: ClassVar[list[str]] = [
         "統一編號", "統編", "公司", "廠商", "發票", "稅籍", "法人", "營業",
         "企業", "行號", "商號",
     ]
     CONTEXT_WINDOW: ClassVar[int] = 50
-    _WEIGHTS: ClassVar[List[int]] = [1, 2, 1, 2, 1, 2, 4, 1]
+    _WEIGHTS: ClassVar[list[int]] = [1, 2, 1, 2, 1, 2, 4, 1]
 
     def __init__(self) -> None:
         super().__init__(
@@ -40,12 +42,12 @@ class TwBusinessIdRecognizer(LocalRecognizer):
     def analyze(
         self,
         text: str,
-        entities: List[str],
-        nlp_artifacts: Optional[NlpArtifacts] = None,
-    ) -> List[RecognizerResult]:
+        entities: list[str],
+        nlp_artifacts: NlpArtifacts | None = None,
+    ) -> list[RecognizerResult]:
         if self.SUPPORTED_ENTITY not in entities:
             return []
-        results: List[RecognizerResult] = []
+        results: list[RecognizerResult] = []
         for match in self.PATTERN.finditer(text):
             number = match.group()
             if not self._validate_checksum(number):

@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Optional
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -95,7 +94,7 @@ def _read_input(input_path: str) -> str:
     return Path(input_path).read_text(encoding="utf-8")
 
 
-def _write_output(text: str, output: Optional[Path]) -> None:
+def _write_output(text: str, output: Path | None) -> None:
     if output is None:
         sys.stdout.write(text)
         sys.stdout.flush()

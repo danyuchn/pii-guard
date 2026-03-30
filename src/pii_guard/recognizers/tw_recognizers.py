@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import List
-
 from presidio_analyzer import EntityRecognizer
 
 from pii_guard.recognizers.tw_business_recognizer import TwBusinessIdRecognizer
@@ -11,7 +9,7 @@ from pii_guard.recognizers.tw_id_recognizer import TwArcRecognizer, TwNationalId
 from pii_guard.recognizers.tw_phone_recognizer import TwLandlineRecognizer, TwMobileRecognizer
 
 
-def get_all_tw_recognizers() -> List[EntityRecognizer]:
+def get_all_tw_recognizers() -> list[EntityRecognizer]:
     """Return all Taiwan-specific recognizer instances."""
     return [
         TwNationalIdRecognizer(),
@@ -23,7 +21,7 @@ def get_all_tw_recognizers() -> List[EntityRecognizer]:
 
 
 # All entity types provided by Taiwan recognizers
-TW_ENTITY_TYPES: List[str] = [
+TW_ENTITY_TYPES: list[str] = [
     "TW_NATIONAL_ID",
     "TW_ARC",
     "TW_MOBILE",
