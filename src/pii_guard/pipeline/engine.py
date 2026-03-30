@@ -14,13 +14,12 @@ from pii_guard.recognizers.tw_recognizers import TW_ENTITY_TYPES, get_all_tw_rec
 
 logger = logging.getLogger(__name__)
 
-# All entity types the engine handles
+# All entity types the engine handles.
+# PERSON/ORG/LOCATION come from CKIP BERT NER; the rest from TW_ENTITY_TYPES.
 SUPPORTED_ENTITIES: list[str] = [
     "PERSON",
     "ORG",
     "LOCATION",
-    "EMAIL_ADDRESS",
-    "CREDIT_CARD",
     *TW_ENTITY_TYPES,
 ]
 

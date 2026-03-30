@@ -5,6 +5,12 @@ from __future__ import annotations
 import pytest
 
 from pii_guard.recognizers.tw_business_recognizer import TwBusinessIdRecognizer
+from pii_guard.recognizers.tw_extra_recognizers import (
+    TwBankAccountRecognizer,
+    TwBirthDateRecognizer,
+    TwIntlMobileRecognizer,
+    TwLicensePlateRecognizer,
+)
 from pii_guard.recognizers.tw_id_recognizer import (
     TwArcRecognizer,
     TwNationalIdRecognizer,
@@ -273,3 +279,144 @@ class TestTwCreditCardRecognizer:
         results = self.r.analyze(text, entities=["CREDIT_CARD"])
         assert len(results) == 1
         assert text[results[0].start:results[0].end] == "4111111111111111"
+
+
+# ── TwLicensePlateRecognizer ──────────────────────────────────────────────────
+
+class TestTwLicensePlateRecognizer:
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.r = TwLicensePlateRecognizer()
+
+    @pytest.mark.parametrize("text,expected_match", [
+        ("車牌ABC-1234",     True),   # new format (3 letters + 4 digits) with context
+        ("牌照AB-1234",      True),   # new format (2 letters + 4 digits) with context
+        ("車號1234-AB",      True),   # old format (4 digits + 2 letters) with context
+        ("車籍123-AB",       True),   # old format (3 digits + 2 letters) with context
+        ("ABC-1234",         False),  # new format without context → no match
+        ("1234-AB",          False),  # old format without context → no match
+        ("車牌ABCD-1234",    False),  # 4 letters → exceeds new format limit
+        ("車牌ABC-12345",    False),  # 5 digits → exceeds new format limit
+        ("車牌AB-123",       False),  # only 3 digits → old format needs ≥3 before dash
+    ])
+    def test_pattern(self, text, expected_match):
+        results = self.r.analyze(text, entities=["TW_LICENSE_PLATE"])
+        matched = len(results) > 0
+        assert matched == expected_match, f"text={text!r}"
+
+    def test_span_correct(self):
+        text = "車牌號碼ABC-1234請查詢"
+        results = self.r.analyze(text, entities=["TW_LICENSE_PLATE"])
+        assert len(results) == 1
+        assert text[results[0].start:results[0].end] == "ABC-1234"
+
+    def test_context_window_distance(self):
+        # Keyword >50 chars away → no match (use Chinese filler so lookbehind doesn't break)
+        far_text = "車牌" + "啊" * 60 + "ABC-1234"
+        results = self.r.analyze(far_text, entities=["TW_LICENSE_PLATE"])
+        assert len(results) == 0
+
+        # Keyword within 50 chars → match
+        near_text = "車牌" + "啊" * 10 + "ABC-1234"
+        results = self.r.analyze(near_text, entities=["TW_LICENSE_PLATE"])
+        assert len(results) == 1
+
+
+# ── TwBirthDateRecognizer ─────────────────────────────────────────────────────
+
+class TestTwBirthDateRecognizer:
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.r = TwBirthDateRecognizer()
+
+    @pytest.mark.parametrize("text,expected_match", [
+        ("民國90年1月1日",       True),   # Minguo with 民國 anchor (self-contextualizing)
+        ("民國110年12月31日",    True),   # Minguo edge
+        ("民國 90 年 1 月 1 日", True),   # Minguo with spaces
+        ("生日1990-01-01",       True),   # Western ISO with context keyword
+        ("出生日期1990/01/01",   True),   # Western slash with context keyword
+        ("出生年月日1990.01.01", True),   # Western dot with context keyword
+        ("1990-01-01",           False),  # Western without context → hard-filtered
+    ])
+    def test_pattern(self, text, expected_match):
+        results = self.r.analyze(text, entities=["TW_BIRTH_DATE"])
+        matched = len(results) > 0
+        assert matched == expected_match, f"text={text!r}"
+
+    def test_minguo_span_correct(self):
+        text = "出生民國90年1月1日入學"
+        results = self.r.analyze(text, entities=["TW_BIRTH_DATE"])
+        assert any("民國" in text[r.start:r.end] for r in results)
+
+    def test_western_no_context_no_match(self):
+        # LocalRecognizer hard-filters Western dates without context
+        results = self.r.analyze("1990-01-01", entities=["TW_BIRTH_DATE"])
+        assert len(results) == 0
+
+
+# ── TwIntlMobileRecognizer ────────────────────────────────────────────────────
+
+class TestTwIntlMobileRecognizer:
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.r = TwIntlMobileRecognizer()
+
+    @pytest.mark.parametrize("text,expected_match", [
+        ("+886912345678",       True),   # compact
+        ("+886-912-345-678",    True),   # dash-separated
+        ("+886 912 345 678",    True),   # space-separated
+        ("+886-912345678",      True),   # only first separator
+        ("+885912345678",       False),  # wrong country code
+        ("+886812345678",       False),  # 08x is landline, not mobile
+        ("+88691234567",        False),  # only 8 digits (need 9 after +886)
+    ])
+    def test_pattern(self, text, expected_match):
+        results = self.r.analyze(text, entities=["TW_MOBILE"])
+        matched = len(results) > 0
+        assert matched == expected_match, f"text={text!r}"
+
+    def test_span_correct(self):
+        text = "手機+886-912-345-678請聯絡"
+        results = self.r.analyze(text, entities=["TW_MOBILE"])
+        assert len(results) == 1
+        assert text[results[0].start:results[0].end] == "+886-912-345-678"
+
+    def test_entity_type_is_tw_mobile(self):
+        results = self.r.analyze("+886912345678", entities=["TW_MOBILE"])
+        assert results[0].entity_type == "TW_MOBILE"
+
+
+# ── TwBankAccountRecognizer ───────────────────────────────────────────────────
+
+class TestTwBankAccountRecognizer:
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.r = TwBankAccountRecognizer()
+
+    @pytest.mark.parametrize("text,expected_match", [
+        ("帳號123456789012",          True),   # 12 digits with context
+        ("銀行帳號1234567890123456",   True),   # 16 digits with context
+        ("轉帳至123456789012",         True),   # 轉帳 context
+        ("123456789012",              False),  # 12 digits without context
+        ("帳號12345678901",            False),  # 11 digits (< 12)
+        ("帳號12345678901234567",      False),  # 17 digits (> 16)
+    ])
+    def test_pattern(self, text, expected_match):
+        results = self.r.analyze(text, entities=["TW_BANK_ACCOUNT"])
+        matched = len(results) > 0
+        assert matched == expected_match, f"text={text!r}"
+
+    def test_span_correct(self):
+        text = "帳號123456789012請匯款"
+        results = self.r.analyze(text, entities=["TW_BANK_ACCOUNT"])
+        assert len(results) == 1
+        assert text[results[0].start:results[0].end] == "123456789012"
+
+    def test_context_window_distance(self):
+        far_text = "帳號" + "X" * 60 + "123456789012"
+        results = self.r.analyze(far_text, entities=["TW_BANK_ACCOUNT"])
+        assert len(results) == 0
+
+        near_text = "帳號" + "X" * 10 + "123456789012"
+        results = self.r.analyze(near_text, entities=["TW_BANK_ACCOUNT"])
+        assert len(results) == 1
