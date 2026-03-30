@@ -203,6 +203,15 @@ class PiiGuardEngine:
         reverse_mapping: dict[str, str] = {v: k for k, v in entity_mapping.items()}
         return anonymized_result.text, reverse_mapping
 
+    def detect(self, text: str) -> list:
+        """Return raw RecognizerResult list without anonymizing."""
+        return self._analyzer.analyze(
+            text=text,
+            language="zh",
+            entities=SUPPORTED_ENTITIES,
+            score_threshold=self.score_threshold,
+        )
+
     @staticmethod
     def deanonymize(text: str, mapping: dict[str, str]) -> str:
         """

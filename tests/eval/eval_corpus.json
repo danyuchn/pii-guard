@@ -1,0 +1,377 @@
+[
+  {
+    "id": "nid-001",
+    "text": "身分證A123456789是本人的證件",
+    "annotations": [
+      {"entity_type": "TW_NATIONAL_ID", "start": 3, "end": 13, "text": "A123456789"}
+    ]
+  },
+  {
+    "id": "nid-002",
+    "text": "請提供您的身分證字號，如A223456781",
+    "annotations": [
+      {"entity_type": "TW_NATIONAL_ID", "start": 12, "end": 22, "text": "A223456781"}
+    ]
+  },
+  {
+    "id": "nid-003",
+    "text": "員工身分證B121234567到期需更新",
+    "annotations": [
+      {"entity_type": "TW_NATIONAL_ID", "start": 5, "end": 15, "text": "B121234567"}
+    ]
+  },
+  {
+    "id": "arc-001",
+    "text": "外籍居留證號碼為AC12345678",
+    "annotations": [
+      {"entity_type": "TW_ARC", "start": 8, "end": 18, "text": "AC12345678"}
+    ]
+  },
+  {
+    "id": "arc-002",
+    "text": "該外籍員工的居留證AD87654321已到期",
+    "annotations": [
+      {"entity_type": "TW_ARC", "start": 9, "end": 19, "text": "AD87654321"}
+    ]
+  },
+  {
+    "id": "arc-003",
+    "text": "居留證AB98765432過期了",
+    "annotations": [
+      {"entity_type": "TW_ARC", "start": 3, "end": 13, "text": "AB98765432"}
+    ]
+  },
+  {
+    "id": "passport-001",
+    "text": "護照號碼A12345678需要確認",
+    "annotations": [
+      {"entity_type": "TW_PASSPORT", "start": 4, "end": 13, "text": "A12345678"}
+    ]
+  },
+  {
+    "id": "passport-002",
+    "text": "他的passport是B98765432",
+    "annotations": [
+      {"entity_type": "TW_PASSPORT", "start": 11, "end": 20, "text": "B98765432"}
+    ]
+  },
+  {
+    "id": "passport-003",
+    "text": "護照C55667788辦理中",
+    "annotations": [
+      {"entity_type": "TW_PASSPORT", "start": 2, "end": 11, "text": "C55667788"}
+    ]
+  },
+  {
+    "id": "mobile-001",
+    "text": "手機號碼0912345678",
+    "annotations": [
+      {"entity_type": "TW_MOBILE", "start": 4, "end": 14, "text": "0912345678"}
+    ]
+  },
+  {
+    "id": "mobile-002",
+    "text": "請撥打0988-765-432聯繫",
+    "annotations": [
+      {"entity_type": "TW_MOBILE", "start": 3, "end": 15, "text": "0988-765-432"}
+    ]
+  },
+  {
+    "id": "mobile-003",
+    "text": "電話+886912345678也可以",
+    "annotations": [
+      {"entity_type": "TW_MOBILE", "start": 2, "end": 15, "text": "+886912345678"}
+    ]
+  },
+  {
+    "id": "landline-001",
+    "text": "公司電話0212345678",
+    "annotations": [
+      {"entity_type": "TW_LANDLINE", "start": 4, "end": 14, "text": "0212345678"}
+    ]
+  },
+  {
+    "id": "landline-002",
+    "text": "電話(02)2345-6789聯絡我",
+    "annotations": [
+      {"entity_type": "TW_LANDLINE", "start": 2, "end": 15, "text": "(02)2345-6789"}
+    ]
+  },
+  {
+    "id": "landline-003",
+    "text": "辦公室電話07-7654321",
+    "annotations": [
+      {"entity_type": "TW_LANDLINE", "start": 5, "end": 15, "text": "07-7654321"}
+    ]
+  },
+  {
+    "id": "bid-001",
+    "text": "公司統一編號04595257請查詢",
+    "annotations": [
+      {"entity_type": "TW_BUSINESS_ID", "start": 6, "end": 14, "text": "04595257"}
+    ]
+  },
+  {
+    "id": "bid-002",
+    "text": "廠商統編22099131需開發票",
+    "annotations": [
+      {"entity_type": "TW_BUSINESS_ID", "start": 4, "end": 12, "text": "22099131"}
+    ]
+  },
+  {
+    "id": "bid-003",
+    "text": "該企業編號80333992已登記",
+    "annotations": [
+      {"entity_type": "TW_BUSINESS_ID", "start": 5, "end": 13, "text": "80333992"}
+    ]
+  },
+  {
+    "id": "email-001",
+    "text": "信箱chang@example.com可聯繫",
+    "annotations": [
+      {"entity_type": "EMAIL_ADDRESS", "start": 2, "end": 19, "text": "chang@example.com"}
+    ]
+  },
+  {
+    "id": "email-002",
+    "text": "email是test.user@company.tw",
+    "annotations": [
+      {"entity_type": "EMAIL_ADDRESS", "start": 6, "end": 26, "text": "test.user@company.tw"}
+    ]
+  },
+  {
+    "id": "email-003",
+    "text": "請寄到info@taipei.gov.tw",
+    "annotations": [
+      {"entity_type": "EMAIL_ADDRESS", "start": 3, "end": 21, "text": "info@taipei.gov.tw"}
+    ]
+  },
+  {
+    "id": "cc-001",
+    "text": "信用卡4111111111111111號",
+    "annotations": [
+      {"entity_type": "CREDIT_CARD", "start": 3, "end": 19, "text": "4111111111111111"}
+    ]
+  },
+  {
+    "id": "cc-002",
+    "text": "卡號5555555555554444刷卡",
+    "annotations": [
+      {"entity_type": "CREDIT_CARD", "start": 2, "end": 18, "text": "5555555555554444"}
+    ]
+  },
+  {
+    "id": "cc-003",
+    "text": "信用卡號5105105105105100",
+    "annotations": [
+      {"entity_type": "CREDIT_CARD", "start": 4, "end": 20, "text": "5105105105105100"}
+    ]
+  },
+  {
+    "id": "plate-001",
+    "text": "車牌號碼ABC-1234請登記",
+    "annotations": [
+      {"entity_type": "TW_LICENSE_PLATE", "start": 4, "end": 12, "text": "ABC-1234"}
+    ]
+  },
+  {
+    "id": "plate-002",
+    "text": "該車車號為AH-5678",
+    "annotations": [
+      {"entity_type": "TW_LICENSE_PLATE", "start": 5, "end": 12, "text": "AH-5678"}
+    ]
+  },
+  {
+    "id": "plate-003",
+    "text": "機車車牌1234-AB已過戶",
+    "annotations": [
+      {"entity_type": "TW_LICENSE_PLATE", "start": 4, "end": 11, "text": "1234-AB"}
+    ]
+  },
+  {
+    "id": "bdate-001",
+    "text": "出生日期民國90年1月15日",
+    "annotations": [
+      {"entity_type": "TW_BIRTH_DATE", "start": 4, "end": 14, "text": "民國90年1月15日"}
+    ]
+  },
+  {
+    "id": "bdate-002",
+    "text": "生日為1990/01/15請確認",
+    "annotations": [
+      {"entity_type": "TW_BIRTH_DATE", "start": 3, "end": 13, "text": "1990/01/15"}
+    ]
+  },
+  {
+    "id": "bdate-003",
+    "text": "民國85年12月3日出生",
+    "annotations": [
+      {"entity_type": "TW_BIRTH_DATE", "start": 0, "end": 10, "text": "民國85年12月3日"}
+    ]
+  },
+  {
+    "id": "bank-001",
+    "text": "銀行帳號123456789012請匯款",
+    "annotations": [
+      {"entity_type": "TW_BANK_ACCOUNT", "start": 4, "end": 16, "text": "123456789012"}
+    ]
+  },
+  {
+    "id": "bank-002",
+    "text": "轉帳帳號0012345678901234",
+    "annotations": [
+      {"entity_type": "TW_BANK_ACCOUNT", "start": 4, "end": 20, "text": "0012345678901234"}
+    ]
+  },
+  {
+    "id": "bank-003",
+    "text": "存摺帳戶987654321098處理中",
+    "annotations": [
+      {"entity_type": "TW_BANK_ACCOUNT", "start": 4, "end": 16, "text": "987654321098"}
+    ]
+  },
+  {
+    "id": "person-001",
+    "text": "張大明是資深工程師",
+    "annotations": [
+      {"entity_type": "PERSON", "start": 0, "end": 3, "text": "張大明"}
+    ]
+  },
+  {
+    "id": "person-002",
+    "text": "請聯繫業務經理李小華",
+    "annotations": [
+      {"entity_type": "PERSON", "start": 7, "end": 10, "text": "李小華"}
+    ]
+  },
+  {
+    "id": "person-003",
+    "text": "陳志明和王美玲都出席了會議",
+    "annotations": [
+      {"entity_type": "PERSON", "start": 0, "end": 3, "text": "陳志明"},
+      {"entity_type": "PERSON", "start": 4, "end": 7, "text": "王美玲"}
+    ]
+  },
+  {
+    "id": "org-001",
+    "text": "台積電是全球最大晶圓代工廠",
+    "annotations": [
+      {"entity_type": "ORG", "start": 0, "end": 3, "text": "台積電"}
+    ]
+  },
+  {
+    "id": "org-002",
+    "text": "他在鴻海精密工作了十年",
+    "annotations": [
+      {"entity_type": "ORG", "start": 2, "end": 6, "text": "鴻海精密"}
+    ]
+  },
+  {
+    "id": "org-003",
+    "text": "中華電信提供網路服務",
+    "annotations": [
+      {"entity_type": "ORG", "start": 0, "end": 4, "text": "中華電信"}
+    ]
+  },
+  {
+    "id": "loc-001",
+    "text": "公司位於台北市信義區",
+    "annotations": [
+      {"entity_type": "LOCATION", "start": 4, "end": 10, "text": "台北市信義區"}
+    ]
+  },
+  {
+    "id": "loc-002",
+    "text": "他住在新竹科學園區附近",
+    "annotations": [
+      {"entity_type": "LOCATION", "start": 3, "end": 9, "text": "新竹科學園區"}
+    ]
+  },
+  {
+    "id": "loc-003",
+    "text": "高雄港是重要的國際港口",
+    "annotations": [
+      {"entity_type": "LOCATION", "start": 0, "end": 3, "text": "高雄港"}
+    ]
+  },
+  {
+    "id": "mixed-001",
+    "text": "員工陳雅琳的身分證A223456781，手機0912345678，統一編號04595257。",
+    "annotations": [
+      {"entity_type": "PERSON", "start": 2, "end": 5, "text": "陳雅琳"},
+      {"entity_type": "TW_NATIONAL_ID", "start": 9, "end": 19, "text": "A223456781"},
+      {"entity_type": "TW_MOBILE", "start": 22, "end": 32, "text": "0912345678"},
+      {"entity_type": "TW_BUSINESS_ID", "start": 37, "end": 45, "text": "04595257"}
+    ]
+  },
+  {
+    "id": "mixed-002",
+    "text": "客戶王大明的email是wang@test.com，電話0988-123-456，車號AB-9999。",
+    "annotations": [
+      {"entity_type": "PERSON", "start": 2, "end": 5, "text": "王大明"},
+      {"entity_type": "EMAIL_ADDRESS", "start": 12, "end": 25, "text": "wang@test.com"},
+      {"entity_type": "TW_MOBILE", "start": 28, "end": 40, "text": "0988-123-456"},
+      {"entity_type": "TW_LICENSE_PLATE", "start": 43, "end": 50, "text": "AB-9999"}
+    ]
+  },
+  {
+    "id": "mixed-003",
+    "text": "護照B55667788，居留證AC11223344，生日民國75年6月1日。",
+    "annotations": [
+      {"entity_type": "TW_PASSPORT", "start": 2, "end": 11, "text": "B55667788"},
+      {"entity_type": "TW_ARC", "start": 15, "end": 25, "text": "AC11223344"},
+      {"entity_type": "TW_BIRTH_DATE", "start": 28, "end": 37, "text": "民國75年6月1日"}
+    ]
+  },
+  {
+    "id": "mixed-004",
+    "text": "台積電統編22099131，信用卡4111111111111111，帳號123456789012。",
+    "annotations": [
+      {"entity_type": "ORG", "start": 0, "end": 3, "text": "台積電"},
+      {"entity_type": "TW_BUSINESS_ID", "start": 5, "end": 13, "text": "22099131"},
+      {"entity_type": "CREDIT_CARD", "start": 17, "end": 33, "text": "4111111111111111"},
+      {"entity_type": "TW_BANK_ACCOUNT", "start": 36, "end": 48, "text": "123456789012"}
+    ]
+  },
+  {
+    "id": "mixed-005",
+    "text": "張大明身分證A123456789住台北市，手機0912345678，信箱chang@example.com",
+    "annotations": [
+      {"entity_type": "PERSON", "start": 0, "end": 3, "text": "張大明"},
+      {"entity_type": "TW_NATIONAL_ID", "start": 6, "end": 16, "text": "A123456789"},
+      {"entity_type": "LOCATION", "start": 17, "end": 20, "text": "台北市"},
+      {"entity_type": "TW_MOBILE", "start": 23, "end": 33, "text": "0912345678"},
+      {"entity_type": "EMAIL_ADDRESS", "start": 36, "end": 53, "text": "chang@example.com"}
+    ]
+  },
+  {
+    "id": "clean-001",
+    "text": "今天天氣很好，我們去公園散步吧。",
+    "annotations": []
+  },
+  {
+    "id": "clean-002",
+    "text": "這份報告分析了台灣半導體產業的趨勢與發展方向。",
+    "annotations": []
+  },
+  {
+    "id": "clean-003",
+    "text": "會議時間定在下午三點，請準時出席。",
+    "annotations": []
+  },
+  {
+    "id": "neg-001",
+    "text": "客服案件04595257處理中",
+    "annotations": []
+  },
+  {
+    "id": "neg-002",
+    "text": "報告日期2024-03-15已提交",
+    "annotations": []
+  },
+  {
+    "id": "neg-003",
+    "text": "產品型號AB-1234請確認",
+    "annotations": []
+  }
+]

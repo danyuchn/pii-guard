@@ -46,6 +46,7 @@ select = ["E", "F", "I", "UP"]
 [tool.pytest.ini_options]
 markers = [
     "slow: marks tests that require model download (e.g. CKIP BERT ~500MB)",
+    "eval: marks evaluation tests (precision/recall/F1 against annotated corpus)",
 ]
 
 [tool.mypy]
