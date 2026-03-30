@@ -1,4 +1,4 @@
-"""Tests for the PreToolUse hook system (hook_engine + hook_anonymize)."""
+"""Tests for the PreToolUse hook system (hook_engine + hook_detect)."""
 
 from __future__ import annotations
 
@@ -77,16 +77,15 @@ class TestRegexOnlyEngine:
 
 
 # ---------------------------------------------------------------------------
-# hook_anonymize tests (subprocess invocation)
+# hook_detect tests (subprocess invocation)
 # ---------------------------------------------------------------------------
 
 
-class TestHookAnonymize:
-    """Test hook_anonymize.py as a subprocess (simulating hook invocation)."""
+class TestHookDetect:
+    """Test hook_detect.py as a subprocess (simulating hook invocation)."""
 
     @pytest.fixture()
     def pii_file(self, tmp_path: Path) -> Path:
-        """Create a temp file with PII content."""
         f = tmp_path / "data.txt"
         f.write_text(
             "客戶張大明，身分證A123456789，手機0912345678，"
@@ -97,7 +96,6 @@ class TestHookAnonymize:
 
     @pytest.fixture()
     def no_pii_file(self, tmp_path: Path) -> Path:
-        """Create a temp file without PII."""
         f = tmp_path / "clean.txt"
         f.write_text("這是一段沒有個人資料的文字。", encoding="utf-8")
         return f
@@ -114,42 +112,52 @@ class TestHookAnonymize:
         f.write_bytes(b"\x00\x01\x02\xff\xfe\xfd")
         return f
 
-    def _run_hook(self, file_path: str, offset: int | None = None, limit: int | None = None) -> subprocess.CompletedProcess:
-        tool_input: dict = {"file_path": file_path}
-        if offset is not None:
-            tool_input["offset"] = offset
-        if limit is not None:
-            tool_input["limit"] = limit
-
+    def _run_hook(self, file_path: str) -> subprocess.CompletedProcess:
         hook_input = json.dumps({
             "tool_name": "Read",
-            "tool_input": tool_input,
+            "tool_input": {"file_path": file_path},
         })
         return subprocess.run(
-            [sys.executable, "-m", "pii_guard.hook_anonymize"],
+            [sys.executable, "-m", "pii_guard.hook_detect"],
             input=hook_input,
             capture_output=True,
             text=True,
             timeout=30,
         )
 
-    def test_basic_anonymize(self, pii_file: Path):
+    def test_pii_detected_returns_ask(self, pii_file: Path):
+        """When PII is found, hook returns permissionDecision: ask."""
         result = self._run_hook(str(pii_file))
         assert result.returncode == 0
         assert result.stdout.strip()
 
         response = json.loads(result.stdout)
         hook_output = response["hookSpecificOutput"]
-        assert "updatedInput" in hook_output
-        assert "additionalContext" in hook_output
-        assert "PII GUARD" in hook_output["additionalContext"]
+        assert hook_output["permissionDecision"] == "ask"
+        assert "PII GUARD" in hook_output["permissionDecisionReason"]
 
-        # Verify temp file exists and is anonymized
-        temp_path = Path(hook_output["updatedInput"]["file_path"])
-        assert temp_path.exists()
-        content = temp_path.read_text(encoding="utf-8")
-        assert "A123456789" not in content
-        assert "0912345678" not in content
+    def test_pii_detected_shows_entity_counts(self, pii_file: Path):
+        """Review prompt includes entity type breakdown."""
+        result = self._run_hook(str(pii_file))
+        response = json.loads(result.stdout)
+        reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "TW_NATIONAL_ID" in reason
+        assert "TW_MOBILE" in reason
+        assert "EMAIL_ADDRESS" in reason
+
+    def test_pii_detected_no_updated_input(self, pii_file: Path):
+        """Hook must NOT redirect Read — no updatedInput."""
+        result = self._run_hook(str(pii_file))
+        response = json.loads(result.stdout)
+        assert "updatedInput" not in response["hookSpecificOutput"]
+
+    def test_pii_detected_no_temp_files(self, pii_file: Path):
+        """Hook must NOT create temp files in /tmp/pii-guard-hook/."""
+        import glob
+        before = set(glob.glob("/tmp/pii-guard-hook/*"))
+        self._run_hook(str(pii_file))
+        after = set(glob.glob("/tmp/pii-guard-hook/*"))
+        assert before == after
 
     def test_no_pii_produces_no_output(self, no_pii_file: Path):
         result = self._run_hook(str(no_pii_file))
@@ -171,35 +179,9 @@ class TestHookAnonymize:
         assert result.returncode == 0
         assert result.stdout.strip() == ""
 
-    def test_preserves_offset_limit(self, pii_file: Path):
-        result = self._run_hook(str(pii_file), offset=10, limit=50)
-        assert result.returncode == 0
-        assert result.stdout.strip()
-
-        response = json.loads(result.stdout)
-        updated = response["hookSpecificOutput"]["updatedInput"]
-        assert updated["offset"] == 10
-        assert updated["limit"] == 50
-
-    def test_mapping_roundtrip(self, pii_file: Path):
-        result = self._run_hook(str(pii_file))
-        response = json.loads(result.stdout)
-        hook_output = response["hookSpecificOutput"]
-
-        temp_path = Path(hook_output["updatedInput"]["file_path"])
-        anonymized = temp_path.read_text(encoding="utf-8")
-
-        # Find the mapping file (same hash prefix, .mapping.json)
-        mapping_path = temp_path.with_suffix("").with_suffix(".mapping.json")
-        mapping = PiiGuardEngine.load_mapping(mapping_path)
-
-        restored = PiiGuardEngine.deanonymize(anonymized, mapping)
-        original = pii_file.read_text(encoding="utf-8")
-        assert restored == original
-
     def test_empty_stdin_exits_cleanly(self):
         result = subprocess.run(
-            [sys.executable, "-m", "pii_guard.hook_anonymize"],
+            [sys.executable, "-m", "pii_guard.hook_detect"],
             input="",
             capture_output=True,
             text=True,
@@ -210,7 +192,7 @@ class TestHookAnonymize:
 
     def test_invalid_json_exits_cleanly(self):
         result = subprocess.run(
-            [sys.executable, "-m", "pii_guard.hook_anonymize"],
+            [sys.executable, "-m", "pii_guard.hook_detect"],
             input="not json",
             capture_output=True,
             text=True,

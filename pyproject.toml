@@ -28,7 +28,7 @@ dev = [
 
 [project.scripts]
 pii-guard = "pii_guard.__main__:main"
-pii-guard-hook = "pii_guard.hook_anonymize:main"
+pii-guard-detect = "pii_guard.hook_detect:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pii_guard"]

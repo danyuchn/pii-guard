@@ -1,8 +1,8 @@
 """MCP Server smoke tests.
 
-Tests the four tool functions (anonymize_text, restore_text, save_mapping,
-restore_from_file) by calling them directly as Python functions — no MCP
-protocol layer required.
+Tests the five tool functions (anonymize_text, anonymize_file, restore_text,
+save_mapping, restore_from_file) by calling them directly as Python functions
+— no MCP protocol layer required.
 
 The _engine global in server.py is replaced via monkeypatch to inject
 spacy_only_engine, avoiding CKIP model download in the normal test run.
@@ -54,6 +54,53 @@ class TestAnonymizeText:
         session_id = result["session_id"]
         assert session_id in srv._sessions
         assert "<TW_NATIONAL_ID_1>" in srv._sessions[session_id]
+
+
+# ── anonymize_file ───────────────────────────────────────────────────────────
+
+class TestAnonymizeFile:
+
+    def test_returns_expected_fields(self, tmp_path):
+        f = tmp_path / "data.txt"
+        f.write_text("身分證A123456789", encoding="utf-8")
+        result = srv.anonymize_file(str(f))
+        assert "anonymized_text" in result
+        assert "session_id" in result
+        assert "entity_count" in result
+        assert "original_path" in result
+
+    def test_pii_replaced(self, tmp_path):
+        f = tmp_path / "data.txt"
+        f.write_text("身分證A123456789，手機0912345678", encoding="utf-8")
+        result = srv.anonymize_file(str(f))
+        assert "A123456789" not in result["anonymized_text"]
+        assert "0912345678" not in result["anonymized_text"]
+        assert result["entity_count"] == 2
+
+    def test_roundtrip_with_restore(self, tmp_path):
+        f = tmp_path / "data.txt"
+        original = "身分證A123456789，email: test@example.com"
+        f.write_text(original, encoding="utf-8")
+        result = srv.anonymize_file(str(f))
+        restored = srv.restore_text(result["anonymized_text"], result["session_id"])
+        assert restored == original
+
+    def test_file_not_found_raises(self):
+        with pytest.raises(FileNotFoundError):
+            srv.anonymize_file("/tmp/definitely_does_not_exist_pii_guard.txt")
+
+    def test_no_pii_file(self, tmp_path):
+        f = tmp_path / "clean.txt"
+        f.write_text("今天天氣很好。", encoding="utf-8")
+        result = srv.anonymize_file(str(f))
+        assert result["entity_count"] == 0
+        assert result["anonymized_text"] == "今天天氣很好。"
+
+    def test_original_path_preserved(self, tmp_path):
+        f = tmp_path / "data.txt"
+        f.write_text("身分證A123456789", encoding="utf-8")
+        result = srv.anonymize_file(str(f))
+        assert result["original_path"] == str(f)
 
 
 # ── restore_text ──────────────────────────────────────────────────────────────

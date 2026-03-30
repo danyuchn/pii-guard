@@ -68,6 +68,38 @@ def anonymize_text(text: str) -> dict:
 
 
 @app.tool()
+def anonymize_file(file_path: str) -> dict:
+    """
+    讀取檔案並去識別化。直接吃檔案路徑，不需先 Read 再貼文字。
+    適合搭配 PreToolUse hook：hook 偵測到 PII 後使用者拒絕直接讀取，
+    改用此工具安全地取得匿名化版本。
+
+    Returns:
+        anonymized_text: 去識別化後的文本
+        session_id: 用於 restore_text 的 session ID
+        entity_count: 偵測到的 PII 實體數量
+        original_path: 原始檔案路徑（供參考）
+    """
+    from pathlib import Path as _Path
+
+    path = _Path(file_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    content = path.read_text(encoding="utf-8")
+    engine = _get_engine()
+    anonymized, mapping = engine.anonymize(content)
+    session_id = str(uuid.uuid4())
+    _sessions[session_id] = mapping
+    return {
+        "anonymized_text": anonymized,
+        "session_id": session_id,
+        "entity_count": len(mapping),
+        "original_path": file_path,
+    }
+
+
+@app.tool()
 def restore_text(anonymized_text: str, session_id: str) -> str:
     """
     還原去識別化文本。需提供 anonymize_text 回傳的 session_id。

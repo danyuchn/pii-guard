@@ -72,17 +72,27 @@ uv run ruff check src/
 - **Phase 2** ✅ 2026-03-30：CKIP BERT NER（人名/組織/地名）整合驗證，+4 種 PII 類型，MCP smoke test，152 tests total
 - **Phase 3** ✅ 2026-03-30：Ollama Qwen2.5:1.5b LLM fallback 偵測層（opt-in `--llm-fallback`），14 unit tests，167 tests total
 - **Phase 4** ✅ 2026-03-30：eval corpus 53 筆標註語料 + precision/recall/F1 框架，修復 5 個偵測問題，Regex F1=100%、Full CKIP F1=97.6%
-- **Phase 5** ✅ 2026-03-30：Claude Code `PreToolUse` hook 整合，雙層架構（Bash filter + regex-only Python worker），20 tests，173 tests total
+- **Phase 5** ✅ 2026-03-30：Claude Code PreToolUse hook（審核模式）+ anonymize_file MCP 工具，180 tests total
 
-## Phase 5: PreToolUse Hook
+## Phase 5: PreToolUse Hook + anonymize_file
 
 ### How it works
 ```
-Claude Read(file) → Bash filter（跳過 .py/.json/etc）→ Python regex-only engine
-  → 建立 /tmp/pii-guard-hook/{hash}.txt（匿名化版）
-  → updatedInput redirect → Claude 只看到佔位符
-  → mapping 存 /tmp/pii-guard-hook/{hash}.mapping.json
+Claude Read(file)
+  → Bash filter（跳過 .py/.json/etc）
+  → Python regex-only engine 偵測 PII
+  → 有 PII → permissionDecision: "ask"（使用者審核）
+    → 使用者允許 → Claude 讀原檔（知情同意）
+    → 使用者拒絕 → Claude 改用 anonymize_file MCP 工具
+  → 無 PII → 靜默放行
 ```
+
+### MCP Tools（5 個）
+- `anonymize_text(text)` — 文字去識別化
+- `anonymize_file(file_path)` — 讀檔 + 去識別化（不需先 Read）
+- `restore_text(anonymized_text, session_id)` — 還原
+- `save_mapping(session_id, path)` — 匯出 mapping
+- `restore_from_file(anonymized_text, mapping_path)` — 跨 session 還原
 
 ### Configuration
 - Hook 設定：`.claude/settings.json`（project-level）
@@ -90,12 +100,6 @@ Claude Read(file) → Bash filter（跳過 .py/.json/etc）→ Python regex-only
   - `enabled`: 開關
   - `protected_paths`: 只處理這些目錄下的檔案（空 = 全部）
   - `protected_extensions`: 只處理這些副檔名（`.txt`, `.csv`, `.tsv`, `.log`, `.dat`）
-- Hook scripts：`.claude/hooks/pii-guard-read.sh`
-
-### Restore anonymized content
-```bash
-pii-guard restore <anonymized-file> -m /tmp/pii-guard-hook/<hash>.mapping.json
-```
 
 ## Key Reference Files
 

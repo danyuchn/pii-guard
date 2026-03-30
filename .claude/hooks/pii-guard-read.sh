@@ -52,5 +52,5 @@ if [ -n "$PROTECTED_EXT" ]; then
   [ "$EXT_MATCH" = "false" ] && exit 0
 fi
 
-# Delegate to Python anonymizer
-echo "$INPUT" | uv run --project "$PROJECT_PATH" python -m pii_guard.hook_anonymize
+# Delegate to Python PII detector
+echo "$INPUT" | uv run --project "$PROJECT_PATH" python -m pii_guard.hook_detect
