@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/pii-guard-read.sh",
+            "statusMessage": "Checking PII protection..."
+          }
+        ]
+      }
+    ]
+  }
+}

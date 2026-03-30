@@ -71,8 +71,31 @@ uv run ruff check src/
 - **Phase 1 MVP** ✅ 2026-03-30：Presidio + 台灣 Regex 8 種，MCP Server 介面，89 tests
 - **Phase 2** ✅ 2026-03-30：CKIP BERT NER（人名/組織/地名）整合驗證，+4 種 PII 類型，MCP smoke test，152 tests total
 - **Phase 3** ✅ 2026-03-30：Ollama Qwen2.5:1.5b LLM fallback 偵測層（opt-in `--llm-fallback`），14 unit tests，167 tests total
-- **Phase 4**：評估集，precision/recall 測試
-- **Phase 5**：Claude Code `PreToolUse` hook 整合（自動攔截讀檔）
+- **Phase 4** ✅ 2026-03-30：eval corpus 53 筆標註語料 + precision/recall/F1 框架，修復 5 個偵測問題，Regex F1=100%、Full CKIP F1=97.6%
+- **Phase 5** ✅ 2026-03-30：Claude Code `PreToolUse` hook 整合，雙層架構（Bash filter + regex-only Python worker），20 tests，173 tests total
+
+## Phase 5: PreToolUse Hook
+
+### How it works
+```
+Claude Read(file) → Bash filter（跳過 .py/.json/etc）→ Python regex-only engine
+  → 建立 /tmp/pii-guard-hook/{hash}.txt（匿名化版）
+  → updatedInput redirect → Claude 只看到佔位符
+  → mapping 存 /tmp/pii-guard-hook/{hash}.mapping.json
+```
+
+### Configuration
+- Hook 設定：`.claude/settings.json`（project-level）
+- 行為設定：`~/.config/pii-guard/hook-config.json`
+  - `enabled`: 開關
+  - `protected_paths`: 只處理這些目錄下的檔案（空 = 全部）
+  - `protected_extensions`: 只處理這些副檔名（`.txt`, `.csv`, `.tsv`, `.log`, `.dat`）
+- Hook scripts：`.claude/hooks/pii-guard-read.sh`
+
+### Restore anonymized content
+```bash
+pii-guard restore <anonymized-file> -m /tmp/pii-guard-hook/<hash>.mapping.json
+```
 
 ## Key Reference Files
 

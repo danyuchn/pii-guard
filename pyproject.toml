@@ -28,6 +28,7 @@ dev = [
 
 [project.scripts]
 pii-guard = "pii_guard.__main__:main"
+pii-guard-hook = "pii_guard.hook_anonymize:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pii_guard"]
@@ -52,3 +53,9 @@ markers = [
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-cov>=7.1.0",
+]
