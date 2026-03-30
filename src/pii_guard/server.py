@@ -70,9 +70,9 @@ def anonymize_text(text: str) -> dict:
 @app.tool()
 def anonymize_file(file_path: str) -> dict:
     """
-    讀取檔案並去識別化。直接吃檔案路徑，不需先 Read 再貼文字。
-    適合搭配 PreToolUse hook：hook 偵測到 PII 後使用者拒絕直接讀取，
-    改用此工具安全地取得匿名化版本。
+    讀取檔案並去識別化。支援多種格式：
+    純文字（.txt/.csv/.tsv/.log）、Excel（.xlsx）、Word（.docx）、PDF（.pdf）。
+    直接吃檔案路徑，不需先 Read 再貼文字。
 
     Returns:
         anonymized_text: 去識別化後的文本
@@ -80,15 +80,19 @@ def anonymize_file(file_path: str) -> dict:
         entity_count: 偵測到的 PII 實體數量
         original_path: 原始檔案路徑（供參考）
     """
-    from pathlib import Path as _Path
+    from pii_guard.file_handlers import read_file, is_supported, SUPPORTED_EXTENSIONS
 
-    path = _Path(file_path)
-    if not path.is_file():
-        raise FileNotFoundError(f"File not found: {file_path}")
+    if not is_supported(file_path):
+        from pathlib import Path as _Path
+        ext = _Path(file_path).suffix
+        raise ValueError(
+            f"Unsupported file type: {ext}. "
+            f"Supported: {sorted(SUPPORTED_EXTENSIONS)}"
+        )
 
-    content = path.read_text(encoding="utf-8")
+    content = read_file(file_path)
     engine = _get_engine()
-    anonymized, mapping = engine.anonymize(content)
+    anonymized, mapping = engine.anonymize(content.text)
     session_id = str(uuid.uuid4())
     _sessions[session_id] = mapping
     return {
@@ -96,6 +100,7 @@ def anonymize_file(file_path: str) -> dict:
         "session_id": session_id,
         "entity_count": len(mapping),
         "original_path": file_path,
+        "file_type": content.file_type,
     }
 
 

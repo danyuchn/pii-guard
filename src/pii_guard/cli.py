@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -23,13 +24,13 @@ def build_parser() -> argparse.ArgumentParser:
     anon.add_argument(
         "input",
         type=str,
-        help="輸入檔案路徑或 - (stdin)",
+        help="輸入檔案路徑或 - (stdin，僅純文字)",
     )
     anon.add_argument(
         "-o", "--output",
         type=Path,
         default=None,
-        help="去識別化文本輸出路徑（預設：stdout）",
+        help="去識別化輸出路徑（預設：stdout for text, <input>.anon.<ext> for files）",
     )
     anon.add_argument(
         "-m", "--mapping",
@@ -70,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument(
         "input",
         type=str,
-        help="去識別化文本檔案路徑或 - (stdin)",
+        help="去識別化文本檔案路徑或 - (stdin，僅純文字)",
     )
     restore.add_argument(
         "-m", "--mapping",
@@ -120,10 +121,20 @@ def _write_output(text: str, output: Path | None) -> None:
         output.write_text(text, encoding="utf-8")
 
 
+def _default_output_path(input_path: str) -> Path:
+    """Generate default output path: <stem>.anon.<ext>."""
+    p = Path(input_path)
+    from pii_guard.file_handlers import get_output_extension, PDF_EXTENSIONS
+    out_ext = get_output_extension(p)
+    return p.with_stem(p.stem + ".anon").with_suffix(out_ext)
+
+
 def cmd_anonymize(args: argparse.Namespace) -> int:
     from pii_guard.pipeline.engine import PiiGuardEngine
+    from pii_guard.file_handlers import read_file, write_file, is_supported, PLAIN_TEXT_EXTENSIONS
 
-    text = _read_input(args.input)
+    is_stdin = args.input == "-"
+
     print("[pii-guard] 載入模型中，首次執行需要下載 CKIP 模型…", file=sys.stderr)
     engine = PiiGuardEngine(
         ckip_model=args.model,
@@ -131,23 +142,77 @@ def cmd_anonymize(args: argparse.Namespace) -> int:
         llm_fallback=args.llm_fallback,
         ollama_model=args.ollama_model,
     )
-    anonymized, mapping = engine.anonymize(text)
 
-    _write_output(anonymized, args.output)
+    if is_stdin:
+        # stdin: plain text only
+        text = sys.stdin.read()
+        anonymized, mapping = engine.anonymize(text)
+        _write_output(anonymized, args.output)
+        engine.save_mapping(mapping, args.mapping)
+        print(f"\n[pii-guard] 偵測到 {len(mapping)} 個 PII 實體", file=sys.stderr)
+        print(f"[pii-guard] mapping 已儲存至：{args.mapping}", file=sys.stderr)
+        return 0
+
+    # File input: use file_handlers for multi-format support
+    input_path = Path(args.input)
+    if not is_supported(input_path):
+        print(f"[pii-guard] 不支援的檔案格式：{input_path.suffix}", file=sys.stderr)
+        print(f"[pii-guard] 支援的格式：.txt .csv .tsv .xlsx .docx .pdf 等", file=sys.stderr)
+        return 1
+
+    content = read_file(input_path)
+    anonymized_text, mapping = engine.anonymize(content.text)
+
+    output_path = args.output or _default_output_path(args.input)
+
+    if content.file_type == "plain" or content.file_type == "pdf":
+        _write_output(anonymized_text, output_path)
+    else:
+        # Structured format: write back with per-cell anonymization
+        write_file(content, anonymized_text, mapping, output_path)
+
     engine.save_mapping(mapping, args.mapping)
 
-    print(f"\n[pii-guard] 偵測到 {len(mapping)} 個 PII 實體", file=sys.stderr)
+    entity_count = len(mapping)
+    print(f"\n[pii-guard] 偵測到 {entity_count} 個 PII 實體", file=sys.stderr)
+    print(f"[pii-guard] 去識別化檔案：{output_path}", file=sys.stderr)
     print(f"[pii-guard] mapping 已儲存至：{args.mapping}", file=sys.stderr)
     return 0
 
 
 def cmd_restore(args: argparse.Namespace) -> int:
     from pii_guard.pipeline.engine import PiiGuardEngine
+    from pii_guard.file_handlers import read_file, write_file, is_supported
 
-    text = _read_input(args.input)
     mapping = PiiGuardEngine.load_mapping(args.mapping)
-    restored = PiiGuardEngine.deanonymize(text, mapping)
-    _write_output(restored, args.output)
+    is_stdin = args.input == "-"
+
+    if is_stdin:
+        text = sys.stdin.read()
+        restored = PiiGuardEngine.deanonymize(text, mapping)
+        _write_output(restored, args.output)
+        return 0
+
+    input_path = Path(args.input)
+
+    if is_supported(input_path) and input_path.suffix.lower() not in {".pdf"}:
+        content = read_file(input_path)
+
+        if content.file_type == "plain":
+            restored = PiiGuardEngine.deanonymize(content.text, mapping)
+            output_path = args.output or Path(args.input)
+            _write_output(restored, output_path)
+        else:
+            # Structured format: reverse mapping to restore per-cell
+            reverse_mapping = {v: k for k, v in mapping.items()}
+            output_path = args.output or Path(args.input)
+            write_file(content, "", reverse_mapping, output_path)
+    else:
+        # Fallback: treat as plain text
+        text = _read_input(args.input)
+        restored = PiiGuardEngine.deanonymize(text, mapping)
+        _write_output(restored, args.output)
+
     return 0
 
 
