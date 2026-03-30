@@ -37,6 +37,7 @@ _CKIP_LABEL_MAP: dict[str, str] = {
 def _build_analyzer(
     ckip_model: str,
     *,
+    english_ner: bool = True,
     llm_fallback: bool = False,
     ollama_model: str = "qwen2.5:1.5b",
     ollama_base_url: str = "http://localhost:11434",
@@ -46,7 +47,7 @@ def _build_analyzer(
     plus Taiwan-specific PatternRecognizers.
 
     Falls back gracefully if transformers/spaCy models are unavailable.
-    Optionally registers an Ollama LLM fallback recognizer.
+    Optionally registers an English NER recognizer and/or Ollama LLM fallback.
     """
     nlp_engine = _create_nlp_engine(ckip_model)
     analyzer = AnalyzerEngine(
@@ -66,6 +67,15 @@ def _build_analyzer(
 
     for recognizer in get_all_tw_recognizers():
         analyzer.registry.add_recognizer(recognizer)
+
+    if english_ner:
+        try:
+            from pii_guard.recognizers.english_ner_recognizer import EnglishNerRecognizer
+
+            analyzer.registry.add_recognizer(EnglishNerRecognizer())
+            logger.info("EnglishNerRecognizer enabled (en_core_web_sm)")
+        except Exception as exc:
+            logger.warning("EnglishNerRecognizer unavailable (%s)", exc)
 
     if llm_fallback:
         from pii_guard.recognizers.ollama_recognizer import OllamaRecognizer
@@ -192,6 +202,7 @@ class PiiGuardEngine:
         self,
         ckip_model: str = "ckiplab/bert-base-chinese-ner",
         score_threshold: float = 0.5,
+        english_ner: bool = True,
         llm_fallback: bool = False,
         ollama_model: str = "qwen2.5:1.5b",
         ollama_base_url: str = "http://localhost:11434",
@@ -199,6 +210,7 @@ class PiiGuardEngine:
         self.score_threshold = score_threshold
         self._analyzer = _build_analyzer(
             ckip_model,
+            english_ner=english_ner,
             llm_fallback=llm_fallback,
             ollama_model=ollama_model,
             ollama_base_url=ollama_base_url,
