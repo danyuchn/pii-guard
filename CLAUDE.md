@@ -73,6 +73,14 @@ uv run ruff check src/
 - **Phase 3** ✅ 2026-03-30：Ollama Qwen2.5:1.5b LLM fallback 偵測層（opt-in `--llm-fallback`），14 unit tests，167 tests total
 - **Phase 4** ✅ 2026-03-30：eval corpus 53 筆標註語料 + precision/recall/F1 框架，修復 5 個偵測問題，Regex F1=100%、Full CKIP F1=97.6%
 - **Phase 5** ✅ 2026-03-30：Claude Code PreToolUse hook（審核模式）+ anonymize_file MCP 工具，180 tests total
+- **Phase 6** ✅ 2026-03-31：多格式檔案支援（xlsx/docx/pdf）CLI + MCP，file_handlers 模組，MIT LICENSE
+
+### Recall Benchmark（2026-03-31 真實文件測試）
+- 格式化 PII（身分證/手機/Email/市話/車牌/生日/銀行帳號）：~95%
+- 中文人名/組織：~75%
+- 英文人名/組織（需 `en_core_web_sm`）：~80%
+- 整體 recall（68 項 PII）：82.4%
+- 已知弱點：暱稱（龍哥/寶哥）、非典型英文名（Ema/Proco）、統編 context 觸發
 
 ## Phase 5: PreToolUse Hook + anonymize_file
 
