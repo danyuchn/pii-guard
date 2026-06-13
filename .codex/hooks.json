@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/Users/danyuchn/tools/pii-guard/.codex/hooks/pii-guard-read.sh'",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
