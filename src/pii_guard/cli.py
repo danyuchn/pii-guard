@@ -129,6 +129,14 @@ def _default_output_path(input_path: str) -> Path:
     return p.with_stem(p.stem + ".anon").with_suffix(out_ext)
 
 
+def _default_restore_output_path(input_path: str) -> Path:
+    """Generate default restore output path for structured formats: <stem>.restored.<ext>."""
+    p = Path(input_path)
+    from pii_guard.file_handlers import get_output_extension
+    out_ext = get_output_extension(p)
+    return p.with_stem(p.stem + ".restored").with_suffix(out_ext)
+
+
 def cmd_anonymize(args: argparse.Namespace) -> int:
     from pii_guard.pipeline.engine import PiiGuardEngine
     from pii_guard.file_handlers import read_file, write_file, is_supported, PLAIN_TEXT_EXTENSIONS
@@ -200,12 +208,14 @@ def cmd_restore(args: argparse.Namespace) -> int:
 
         if content.file_type == "plain":
             restored = PiiGuardEngine.deanonymize(content.text, mapping)
-            output_path = args.output or Path(args.input)
-            _write_output(restored, output_path)
+            _write_output(restored, args.output)
         else:
-            # Structured format: reverse mapping to restore per-cell
+            # Structured format: reverse mapping to restore per-cell.
+            # Binary formats can't go to stdout, so fall back to a derived
+            # filename (never the input path itself) rather than silently
+            # overwriting the de-identified file the caller passed in.
             reverse_mapping = {v: k for k, v in mapping.items()}
-            output_path = args.output or Path(args.input)
+            output_path = args.output or _default_restore_output_path(args.input)
             write_file(content, "", reverse_mapping, output_path)
     else:
         # Fallback: treat as plain text

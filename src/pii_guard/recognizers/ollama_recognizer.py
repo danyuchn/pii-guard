@@ -62,7 +62,12 @@ class OllamaRecognizer(LocalRecognizer):
     DEFAULT_MODEL: ClassVar[str] = "qwen2.5:1.5b"
     DEFAULT_BASE_URL: ClassVar[str] = "http://localhost:11434"
     DEFAULT_CONFIDENCE: ClassVar[float] = 0.75
-    DEFAULT_TIMEOUT: ClassVar[float] = 30.0
+    # Thinking-capable models (e.g. qwen3.6) burn hundreds-to-thousands of
+    # tokens on chain-of-thought before emitting the final JSON — confirmed
+    # 2026-07-22: a real detection prompt needed ~3800 tokens / ~80s to reach
+    # done_reason="stop" instead of getting cut off mid-thought at 1024/30s.
+    DEFAULT_TIMEOUT: ClassVar[float] = 120.0
+    DEFAULT_NUM_PREDICT: ClassVar[int] = 8192
 
     def __init__(
         self,
@@ -142,23 +147,37 @@ class OllamaRecognizer(LocalRecognizer):
         return self._available
 
     def _call_ollama(self, text: str) -> str:
-        """Call Ollama /api/generate and return raw response text."""
+        """Call Ollama /api/generate and return raw response text.
+
+        Deliberately omits `"format": "json"`. Thinking-capable models (e.g.
+        qwen3.6) route grammar-constrained output into the `thinking` field
+        instead of `response` under that flag, leaving `response` empty —
+        confirmed via direct /api/generate comparison (2026-07-22). Plain
+        prompting plus the markdown-fence strip in `_parse_response` is more
+        reliable across both thinking and non-thinking models.
+        """
         resp = httpx.post(
             f"{self._base_url}/api/generate",
             json={
                 "model": self._model,
                 "prompt": _PROMPT_TEMPLATE.format(text=text),
                 "stream": False,
-                "format": "json",
                 "options": {
                     "temperature": 0,
-                    "num_predict": 1024,
+                    "num_predict": self.DEFAULT_NUM_PREDICT,
                 },
             },
             timeout=self._timeout,
         )
         resp.raise_for_status()
-        return resp.json().get("response", "")
+        data = resp.json()
+        response = data.get("response", "")
+        if not response.strip():
+            # Fallback for thinking models that still leave response empty
+            # for other reasons — the reasoning trace usually contains the
+            # answer too.
+            response = data.get("thinking", "")
+        return response
 
     def _parse_response(self, raw: str) -> list[dict]:
         """Parse LLM JSON response into a list of entity dicts."""
