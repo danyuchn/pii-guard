@@ -8,7 +8,7 @@ from pathlib import Path
 
 from presidio_analyzer import AnalyzerEngine, RecognizerResult
 from presidio_anonymizer import AnonymizerEngine
-from presidio_anonymizer.entities import OperatorConfig
+from presidio_anonymizer.entities import ConflictResolutionStrategy, OperatorConfig
 
 from pii_guard.recognizers.tw_recognizers import TW_ENTITY_TYPES, get_all_tw_recognizers
 
@@ -276,6 +276,13 @@ class PiiGuardEngine:
             text=text,
             analyzer_results=results,  # type: ignore[arg-type]
             operators=operators,
+            # Default MERGE_SIMILAR_OR_CONTAINED only merges same-type spans and
+            # drops fully-contained ones; it leaves partially overlapping spans of
+            # DIFFERENT entity types untouched, which double-writes placeholders
+            # into the anonymized text and corrupts restore (e.g. "IL" duplicated
+            # into "ILIL" when a LOCATION span and an ORG span partially overlap).
+            # REMOVE_INTERSECTIONS additionally clips such partial overlaps by score.
+            conflict_resolution=ConflictResolutionStrategy.REMOVE_INTERSECTIONS,
         )
 
         # Reverse: placeholder → original (for deanonymize)

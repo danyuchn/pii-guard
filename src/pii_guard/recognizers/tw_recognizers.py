@@ -6,10 +6,15 @@ from presidio_analyzer import EntityRecognizer
 
 from pii_guard.recognizers.tw_business_recognizer import TwBusinessIdRecognizer
 from pii_guard.recognizers.tw_extra_recognizers import (
+    TwAddressRecognizer,
     TwBankAccountRecognizer,
     TwBirthDateRecognizer,
+    TwCryptoSeedRecognizer,
     TwIntlMobileRecognizer,
     TwLicensePlateRecognizer,
+    TwPasswordRecognizer,
+    TwPrivateKeyRecognizer,
+    TwVerificationCodeRecognizer,
 )
 from pii_guard.recognizers.tw_id_recognizer import (
     TwArcRecognizer,
@@ -35,6 +40,11 @@ def get_all_tw_recognizers() -> list[EntityRecognizer]:
         TwLicensePlateRecognizer(),
         TwBirthDateRecognizer(),
         TwBankAccountRecognizer(),
+        TwAddressRecognizer(),
+        TwVerificationCodeRecognizer(),
+        TwPasswordRecognizer(),
+        TwCryptoSeedRecognizer(),
+        TwPrivateKeyRecognizer(),
     ]
 
 
@@ -51,4 +61,9 @@ TW_ENTITY_TYPES: list[str] = [
     "TW_LICENSE_PLATE",
     "TW_BIRTH_DATE",
     "TW_BANK_ACCOUNT",
+    "TW_ADDRESS",
+    "TW_VERIFICATION_CODE",
+    "TW_PASSWORD",
+    "TW_CRYPTO_SEED",
+    "TW_PRIVATE_KEY",
 ]
