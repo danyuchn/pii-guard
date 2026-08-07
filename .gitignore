@@ -71,3 +71,6 @@ htmlcov/
 # Logs
 *.log
 logs/
+
+# python 3.13 migration backups
+*.bak-py311
