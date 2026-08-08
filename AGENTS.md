@@ -72,7 +72,7 @@ uv run ruff check src/
 - **Phase 2** ✅ 2026-03-30：CKIP BERT NER（人名/組織/地名）整合驗證，+4 種 PII 類型，MCP smoke test，152 tests total
 - **Phase 3** ✅ 2026-03-30：Ollama Qwen2.5:1.5b LLM fallback 偵測層（opt-in `--llm-fallback`），14 unit tests，167 tests total
 - **Phase 4** ✅ 2026-03-30：eval corpus 53 筆標註語料 + precision/recall/F1 框架，修復 5 個偵測問題，Regex F1=100%、Full CKIP F1=97.6%
-- **Phase 5** ✅ 2026-03-30：Codex/Claude PreToolUse hook（審核模式）+ anonymize_file MCP 工具，180 tests total
+- **Phase 5** ✅ 2026-03-30：Claude PreToolUse hook（審核模式）+ anonymize_file MCP 工具，180 tests total；Codex 目前改由 `pii-safe-documents` skill 明確觸發
 - **Phase 6** ✅ 2026-03-31：多格式檔案支援（xlsx/docx/pdf）CLI + MCP，file_handlers 模組，MIT LICENSE
 
 ### Recall Benchmark（2026-03-31 真實文件測試）
@@ -82,17 +82,13 @@ uv run ruff check src/
 - 整體 recall（68 項 PII）：82.4%
 - 已知弱點：暱稱（龍哥/寶哥）、非典型英文名（Ema/Proco）、統編 context 觸發
 
-## Phase 5: PreToolUse Hook + anonymize_file
+## Phase 5: Claude PreToolUse Hook + Codex safe workflow
 
 ### How it works
 ```
-Codex Read(file)
-  → Bash filter（跳過 .py/.json/etc）
-  → Python regex-only engine 偵測 PII
-  → 有 PII → permissionDecision: "ask"（使用者審核）
-    → 使用者允許 → Codex 讀原檔（知情同意）
-    → 使用者拒絕 → Codex 改用 anonymize_file MCP 工具
-  → 無 PII → 靜默放行
+Claude Read(file) → PreToolUse filter → Python regex-only engine 偵測 PII
+
+Codex 處理敏感文件時必須先使用 `pii-safe-documents` skill 或 `anonymize_file` MCP 工具，不可直接讀原檔。Codex 現行 PreToolUse 沒有通用 `Read` tool，且不支援 `permissionDecision: "ask"`，所以不保留一個會失敗後繼續放行的假保護 hook。
 ```
 
 ### MCP Tools（5 個）
@@ -103,7 +99,8 @@ Codex Read(file)
 - `restore_from_file(anonymized_text, mapping_path)` — 跨 session 還原
 
 ### Configuration
-- Hook 設定：`.codex/hooks.json`（project-level）
+- Claude hook 設定：`.claude/settings.json`（Claude source，保持唯讀）
+- Codex：使用 `pii-safe-documents` skill；目前無 project Read hook
 - 行為設定：`~/.config/pii-guard/hook-config.json`
   - `enabled`: 開關
   - `protected_paths`: 只處理這些目錄下的檔案（空 = 全部）
