@@ -83,13 +83,56 @@ PII_GUARD_LLM_FALLBACK=1 uv run python -m pii_guard serve
 
 LLM confidence 設為 0.75（低於 regex 0.85 和 CKIP 0.85），確保確定性偵測結果優先。Ollama 不可用時自動降級，不影響既有功能。
 
+## 安裝
+
+需要 Python 3.13、[uv](https://docs.astral.sh/uv/)、以及 [Ollama](https://ollama.com/)。
+
+```bash
+git clone https://github.com/danyuchn/pii-guard.git
+cd pii-guard
+uv sync
+
+# 需要 CLI 直接處理 .docx / .xlsx / .pdf 時再加裝（skill 目前不需要）
+uv sync --extra formats
+```
+
+首次執行會下載 CKIP BERT NER 模型（約 500MB）。未加裝 `formats` 時，`tests/test_file_handlers.py` 的 10 個測試會因缺少 `openpyxl` / `python-docx` / `pdfplumber` 而跳不過，屬預期行為。
+
+## Claude Code Skill（推薦用法）
+
+本 repo 內含 `pii-safe-documents` skill，位於 `.agents/skills/pii-safe-documents/`。它在 CLI 之外多做一件事：**讓主 agent 全程看不到原始文件、對照表與還原結果**——主 agent 只拿到路徑與「成功／失敗」回執，讀檔、呼叫模型、還原都在一個獨立的本地行程裡完成。
+
+安裝方式是把它連結進 skills 目錄，不要複製：
+
+```bash
+# Claude Code（user level）
+ln -s "$(pwd)/.agents/skills/pii-safe-documents" ~/.claude/skills/pii-safe-documents
+
+# 稽核模型
+ollama pull ornith-1.5:9b
+```
+
+用連結而非複製，是因為 skill 需要找到它所屬的 repo 才能呼叫 pii-guard 本體。若你的環境只能複製，改設環境變數 `PII_GUARD_HOME` 指向 clone 出來的路徑。
+
+裝好後在 Claude Code 裡直接說「幫我把這份檔案去識別化」即可。
+
+### 使用前必讀的三個限制
+
+1. **支援格式有限**：目前只吃 64 KiB 以內的 UTF-8 純文字（`.txt` `.md` `.csv` `.tsv` `.log` `.dat`）。`.docx` `.xlsx` `.pdf` 尚未提供保證隔離的解析器，改副檔名繞過會被擋。
+2. **很慢**：稽核層開啟推理並對每個視窗取樣三次，單份文件實測 10–50 分鐘。這是為了偵測召回率付的代價（關閉推理時模型會漏掉判決書簽名欄的人名）。**批次處理上百份文件在此設定下不可行。**
+3. **這是個資遮蔽，不是機密分級**。金額、病情、行程、合約條款只要不指向特定個人就會留著。不要單憑本工具宣稱「整份文件可以對外」。
+
+隔離性的正確描述是：**防止意外把原文餵給雲端模型的強保護，不是作業系統層級的安全邊界**。同一個使用者身分下的惡意行程仍可讀到檔案；真正的敵意隔離需要獨立權限的本地 broker 或另開系統帳號。
+
 ## 開發路線圖
 
 - [x] Phase 1 MVP：Presidio + CKIP NER + 台灣 Regex，MCP Server 介面
 - [x] Phase 2：CKIP BERT NER 整合，+4 種 PII 類型（車牌/出生日期/國際手機/銀行帳號）
 - [x] Phase 3：Ollama Qwen2.5:1.5b LLM fallback 偵測層（`--llm-fallback` 啟用）
-- [ ] Phase 4：評估集建立，precision/recall 測試
-- [ ] Phase 5：Claude Code PreToolUse hook 整合（自動攔截讀檔）
+- [x] Phase 4：評估集建立，precision/recall 測試
+- [x] Phase 5：`pii-safe-documents` skill（主 agent 隔離的可逆去識別化工作流）
+- [ ] Phase 6：人工補標介面（讓使用者補遮模型漏掉的詞、放回被過度遮蔽的組織名，全程不經過主 agent）
+- [ ] Phase 7：效能——先用決定性規則篩出可疑段落再送模型，讓批次處理可行
 
 ## 參考資料
 
@@ -98,5 +141,3 @@ LLM confidence 設為 0.75（低於 regex 0.85 和 CKIP 0.85），確保確定�
 - [Presidio TransformersRecognizer](https://microsoft.github.io/presidio/samples/python/transformers_recognizer/)
 - [CKIP Transformers（中研院）](https://github.com/ckiplab/ckip-transformers)
 - [LangChain PresidioReversibleAnonymizer](https://python.langchain.com/docs/guides/privacy/presidio_data_anonymization/reversible)
-- 調研筆記：`~/knowledge-base/bookmarks/presidio-pii-deidentification.md`
-- 課程研究：`~/claude-course/official/research-pii-anonymization.md`

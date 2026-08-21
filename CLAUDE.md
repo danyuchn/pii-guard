@@ -109,7 +109,3 @@ Claude Read(file)
   - `protected_paths`: 只處理這些目錄下的檔案（空 = 全部）
   - `protected_extensions`: 只處理這些副檔名（`.txt`, `.csv`, `.tsv`, `.log`, `.dat`）
 
-## Key Reference Files
-
-- 調研筆記：`~/knowledge-base/bookmarks/presidio-pii-deidentification.md`
-- 課程研究：`~/claude-course/official/research-pii-anonymization.md`
