@@ -72,6 +72,8 @@
 - 個人信箱帳號在網址路徑中殘留（`http://example.edu/~xiaoming/`）。
 
 ### 已知限制
+- 工作目錄（`~/.local/share/pii-safe-documents/jobs/`）沒有自動保留期限，只能手動 `purge`；
+  長期使用會累積含真實對照表的目錄。
 
 - 只支援 64 KiB 以內的 UTF-8 純文字。
 - 單份文件 10–50 分鐘，批次處理上百份在此設定下不可行。
