@@ -49,7 +49,7 @@ ANNOTATE_WORKER_TIMEOUT_SECONDS: Final[int] = 60
 # carefully is the normal case, so this is generous; edits are persisted as
 # they happen, so a timeout loses nothing already done.
 ANNOTATE_UI_TIMEOUT_SECONDS: Final[int] = 3600
-DEFAULT_MODEL: Final[str] = "qwen3.6:35b-a3b"
+DEFAULT_MODEL: Final[str] = "ornith-1.5:9b"
 DEFAULT_OLLAMA_URL: Final[str] = "http://127.0.0.1:11434"
 PRIVATE_MAP_NAME: Final[str] = "mapping.private.json"
 MANIFEST_NAME: Final[str] = "manifest.safe.json"
