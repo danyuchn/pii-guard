@@ -32,6 +32,16 @@
 - `uv.lock` 改為納入版控，讓 clone 的人裝到相同版本。
 - 環境需求文字統一為 Python 3.13（`requires-python` 仍為 >=3.11）。
 
+### 文件與定位
+
+- README 重寫：改以「為什麼還要一個」開場，明確主張**繁中／台灣個資 + 產出可留存的檔案**，
+  並附一組**真實跑出來、刻意保留兩處漏遮**的 before/after 示範。
+- 新增「這不是什麼」段，把需要透明批量的使用者指向 LiteLLM + Presidio 與 PrivAiTe。
+- 準確率改以可重現者為主：`tests/eval/eval_corpus.json`（53 條合成語料，`pytest tests/eval -m eval` 可跑）
+  打頭陣，私有真實語料的 71 項人工檢查降為註腳並標明無法外部驗證。
+- 補英文摘要區塊（維持繁中為主體）、作者段、GitHub description 與 topics。
+- `CLAUDE.md` 改為 `AGENTS.md` 的 symlink，兩檔不再各自漂移。
+
 ### 移除
 
 - **`--llm-fallback` 與 `OllamaRecognizer`**（原 Phase 3，預設 `qwen2.5:1.5b`）。
@@ -41,6 +51,13 @@
 
   > **破壞性變更**：若你的腳本帶了 `--llm-fallback`、`--ollama-model`，
   > 或設了 `PII_GUARD_LLM_FALLBACK`，請直接刪除；其餘偵測行為不變。
+
+- **Claude Code PreToolUse hook** 移至 `examples/claude-code-hook/`，附退役理由說明，不再維護。
+  它原本以攔截讀檔的方式隱式遮蔽，四個問題使其被 skill 取代：靜默失敗時使用者以為有防護、
+  熱路徑載不動 CKIP 故只能用 regex（而繁中人名正是 regex 抓不到的）、不可逆、且涵蓋不到 `Bash`。
+
+  > 這不影響 clone 的人：該 hook 找不到 `~/.config/pii-guard/hook-config.json` 就直接結束，預設為惰性。
+
 
 ### 修正
 
