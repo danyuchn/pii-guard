@@ -447,5 +447,255 @@ class EndpointValidationTests(unittest.TestCase):
             WORKFLOW._redact_worker(args)
 
 
+class ChineseCorpusRegressionTests(unittest.TestCase):
+    """Regressions from three real Taiwanese judgments, 2026-08-19.
+
+    All three were refused by the wrapper before these fixes: CKIP split the
+    full-width-padded 中　　華　　民　　國 date line into single-character
+    entities, and PII Guard replaces detected spans rather than every occurrence
+    of the value it reports, so the leakage check could never be satisfied.
+    """
+
+    def test_single_character_detections_are_reverted(self) -> None:
+        job = "deadbeef00"
+        text = f"[[PII-{job}-LOCATION-1]]泰世紀產物保險 中[[PII-{job}-ORG-1]]民國"
+        mapping = {
+            f"[[PII-{job}-LOCATION-1]]": "國",
+            f"[[PII-{job}-ORG-1]]": "華",
+        }
+        output, kept = WORKFLOW._drop_degenerate_detections(text, mapping)
+        self.assertEqual(output, "國泰世紀產物保險 中華民國")
+        self.assertEqual(kept, {})
+
+    def test_multi_character_detections_survive_the_degeneracy_filter(self) -> None:
+        job = "deadbeef00"
+        mapping = {f"[[PII-{job}-PERSON-1]]": "王大明"}
+        output, kept = WORKFLOW._drop_degenerate_detections(
+            f"被告[[PII-{job}-PERSON-1]]到庭", mapping
+        )
+        self.assertEqual(output, f"被告[[PII-{job}-PERSON-1]]到庭")
+        self.assertEqual(kept, mapping)
+
+    def test_sweep_redacts_occurrences_the_detector_missed(self) -> None:
+        job = "deadbeef00"
+        placeholder = f"[[PII-{job}-PERSON-1]]"
+        text = f"被告{placeholder}到庭。證人稱王大明當時在場，王大明否認。"
+        output = WORKFLOW._sweep_remaining_occurrences(text, {placeholder: "王大明"})
+        self.assertNotIn("王大明", output)
+        self.assertEqual(output.count(placeholder), 3)
+
+    def test_sweep_prefers_the_longer_value_on_overlap(self) -> None:
+        job = "deadbeef00"
+        long_ph = f"[[PII-{job}-ORG-1]]"
+        short_ph = f"[[PII-{job}-LOCATION-1]]"
+        mapping = {long_ph: "新竹市中正路", short_ph: "中正路"}
+        output = WORKFLOW._sweep_remaining_occurrences("地址為新竹市中正路一段", mapping)
+        self.assertEqual(output, f"地址為{long_ph}一段")
+
+    def test_sweep_keeps_restoration_exact(self) -> None:
+        job = "deadbeef00"
+        placeholder = f"[[PII-{job}-PERSON-1]]"
+        original = "王大明與王大明對話"
+        mapping = {placeholder: "王大明"}
+        swept = WORKFLOW._sweep_remaining_occurrences(original, mapping)
+        self.assertEqual(WORKFLOW._replace_all(swept, mapping), original)
+
+    def test_email_handle_is_redacted_inside_a_personal_site_url(self) -> None:
+        job = "deadbeef00"
+        email_ph = f"[[PII-{job}-EMAIL_ADDRESS-1]]"
+        text = f"電子郵件: {email_ph} 個人網站: http://www.csie.example.tw/~xiaoming/"
+        output, mapping = WORKFLOW._redact_email_handles_in_urls(
+            text, {email_ph: "xiaoming@csie.example.tw"}, job
+        )
+        self.assertNotIn("~xiaoming", output)
+        self.assertIn(f"[[PII-{job}-URL_HANDLE-1]]", output)
+        self.assertEqual(mapping[f"[[PII-{job}-URL_HANDLE-1]]"], "xiaoming")
+
+    def test_email_handle_outside_a_url_is_left_alone(self) -> None:
+        job = "deadbeef00"
+        email_ph = f"[[PII-{job}-EMAIL_ADDRESS-1]]"
+        text = f"{email_ph} 的研究主題是 xiaoming 這個字的用法"
+        output, mapping = WORKFLOW._redact_email_handles_in_urls(
+            text, {email_ph: "xiaoming@csie.example.tw"}, job
+        )
+        self.assertEqual(output, text)
+        self.assertEqual(len(mapping), 1)
+
+    def test_generic_mailbox_handles_are_not_propagated(self) -> None:
+        job = "deadbeef00"
+        email_ph = f"[[PII-{job}-EMAIL_ADDRESS-1]]"
+        text = f"{email_ph} https://example.edu/info/index.html"
+        output, mapping = WORKFLOW._redact_email_handles_in_urls(
+            text, {email_ph: "info@example.edu"}, job
+        )
+        self.assertEqual(output, text)
+        self.assertEqual(len(mapping), 1)
+
+    def test_url_handle_restoration_is_exact(self) -> None:
+        job = "deadbeef00"
+        email_ph = f"[[PII-{job}-EMAIL_ADDRESS-1]]"
+        original = "個人網站: http://example.edu/~lihua/index.html"
+        output, mapping = WORKFLOW._redact_email_handles_in_urls(
+            original, {email_ph: "lihua@example.edu"}, job
+        )
+        restored = WORKFLOW._replace_all(
+            output, {key: value for key, value in mapping.items() if key != email_ph}
+        )
+        self.assertEqual(restored, original)
+
+    def test_one_bad_audit_sample_is_discarded(self) -> None:
+        calls = {"n": 0}
+
+        def flaky(chunk, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise WORKFLOW.SafeFailure("LOCAL_AUDIT_INVALID", "bad draw")
+            return [("PERSON", "王小明")]
+
+        with patch.object(WORKFLOW, "_call_local_audit", flaky):
+            found = WORKFLOW._local_alias_audit(
+                "書記官　王小明", "書記官　王小明",
+                model="m", base_url=WORKFLOW.DEFAULT_OLLAMA_URL, allowlist=(),
+            )
+        self.assertEqual(found, [("PERSON", "王小明")])
+        self.assertEqual(calls["n"], WORKFLOW.AUDIT_SAMPLES_PER_CHUNK)
+
+    def test_windows_before_a_change_stay_identical(self) -> None:
+        # Line alignment only promises the windows up to the changed line; the
+        # greedy packing re-packs everything after it. Assert exactly that.
+        lines = [f"第{index:02d}行 內容內容內容內容\n" for index in range(60)]
+        before = "".join(lines)
+        lines[55] = "第55行 [[PII-deadbeef00-PERSON-1]]內容內容內容內容內容內容\n"
+        after = "".join(lines)
+        windows_before = WORKFLOW._text_chunks(before, limit=400, overlap=80)
+        windows_after = WORKFLOW._text_chunks(after, limit=400, overlap=80)
+        shared = set(windows_before) & set(windows_after)
+        self.assertTrue(shared, "windows ahead of the change should be reusable")
+        self.assertLess(len(shared), len(windows_before),
+                        "the changed window itself must not be reused")
+
+    def test_already_audited_windows_are_skipped(self) -> None:
+        calls: list[str] = []
+
+        def record(chunk, **kwargs):
+            calls.append(chunk)
+            return []
+
+        text = "".join(f"第{index}行\n" for index in range(30))
+        seen: set[str] = set()
+        with patch.object(WORKFLOW, "_call_local_audit", record):
+            WORKFLOW._local_alias_audit(
+                text, text, model="m", base_url=WORKFLOW.DEFAULT_OLLAMA_URL,
+                allowlist=(), already_audited=seen,
+            )
+            first_round = len(calls)
+            WORKFLOW._local_alias_audit(
+                text, text, model="m", base_url=WORKFLOW.DEFAULT_OLLAMA_URL,
+                allowlist=(), already_audited=seen,
+            )
+        self.assertGreater(first_round, 0)
+        self.assertEqual(len(calls), first_round, "identical text must not be re-audited")
+
+    def test_windows_are_still_audited_without_a_cache(self) -> None:
+        calls: list[str] = []
+
+        def record(chunk, **kwargs):
+            calls.append(chunk)
+            return []
+
+        text = "".join(f"第{index}行\n" for index in range(30))
+        with patch.object(WORKFLOW, "_call_local_audit", record):
+            WORKFLOW._local_alias_audit(
+                text, text, model="m", base_url=WORKFLOW.DEFAULT_OLLAMA_URL, allowlist=(),
+            )
+            before = len(calls)
+            WORKFLOW._local_alias_audit(
+                text, text, model="m", base_url=WORKFLOW.DEFAULT_OLLAMA_URL, allowlist=(),
+            )
+        self.assertEqual(len(calls), before * 2)
+
+    def test_a_non_terminating_window_is_split_and_retried(self) -> None:
+        seen: list[int] = []
+
+        def runaway_on_long_windows(chunk, **kwargs):
+            seen.append(len(chunk))
+            if len(chunk) > 1200:
+                raise WORKFLOW.SafeFailure(
+                    "LOCAL_AUDIT_INVALID", "Local audit ended before completion."
+                )
+            return [("PERSON", "王小明")] if "王小明" in chunk else []
+
+        text = ("甲" * 1500) + "書記官　王小明" + ("乙" * 1500)
+        with patch.object(WORKFLOW, "_call_local_audit", runaway_on_long_windows):
+            found = WORKFLOW._local_alias_audit(
+                text, text, model="m", base_url=WORKFLOW.DEFAULT_OLLAMA_URL, allowlist=(),
+            )
+        self.assertEqual(found, [("PERSON", "王小明")])
+        self.assertGreater(max(seen), 1200, "the full window should be tried first")
+        self.assertLessEqual(min(seen), 1200, "a failing window should be split")
+
+    def test_splitting_stops_at_the_floor(self) -> None:
+        def always_runaway(chunk, **kwargs):
+            raise WORKFLOW.SafeFailure(
+                "LOCAL_AUDIT_INVALID", "Local audit ended before completion."
+            )
+
+        text = "書記官　王小明" * 40
+        with patch.object(WORKFLOW, "_call_local_audit", always_runaway):
+            with self.assertRaisesRegex(WORKFLOW.SafeFailure, "LOCAL_AUDIT_INVALID"):
+                WORKFLOW._local_alias_audit(
+                    text, text, model="m", base_url=WORKFLOW.DEFAULT_OLLAMA_URL, allowlist=(),
+                )
+
+    def test_all_samples_failing_is_still_a_refusal(self) -> None:
+        def always_bad(chunk, **kwargs):
+            raise WORKFLOW.SafeFailure("LOCAL_AUDIT_INVALID", "bad draw")
+
+        with patch.object(WORKFLOW, "_call_local_audit", always_bad):
+            with self.assertRaisesRegex(WORKFLOW.SafeFailure, "LOCAL_AUDIT_INVALID"):
+                WORKFLOW._local_alias_audit(
+                    "書記官　王小明", "書記官　王小明",
+                    model="m", base_url=WORKFLOW.DEFAULT_OLLAMA_URL, allowlist=(),
+                )
+
+    def test_a_non_transient_failure_still_propagates(self) -> None:
+        def unresolved(chunk, **kwargs):
+            raise WORKFLOW.SafeFailure("LOCAL_AUDIT_UNRESOLVED", "cannot align")
+
+        with patch.object(WORKFLOW, "_call_local_audit", unresolved):
+            with self.assertRaisesRegex(WORKFLOW.SafeFailure, "LOCAL_AUDIT_UNRESOLVED"):
+                WORKFLOW._local_alias_audit(
+                    "書記官　王小明", "書記官　王小明",
+                    model="m", base_url=WORKFLOW.DEFAULT_OLLAMA_URL, allowlist=(),
+                )
+
+    def test_two_character_chinese_name_can_be_aligned(self) -> None:
+        text = "新竹簡易庭　法　官　王大明\n書記官　李真\n"
+        self.assertEqual(WORKFLOW._align_model_value("李 真", text), "李真")
+        self.assertEqual(WORKFLOW._align_model_value("王 大 明", text), "王大明")
+
+    def test_latin_fragments_still_need_four_characters(self) -> None:
+        self.assertEqual(WORKFLOW._minimum_alignment_length("abc"), 4)
+        self.assertEqual(WORKFLOW._minimum_alignment_length("李真"), 2)
+        with self.assertRaisesRegex(WORKFLOW.SafeFailure, "LOCAL_AUDIT_UNRESOLVED"):
+            WORKFLOW._align_model_value("A B", "contact Amy Bell today")
+
+    def test_ambiguous_chinese_match_is_still_refused(self) -> None:
+        # Two source spans normalize to the same needle, so there is no single
+        # span to redact and the wrapper must refuse rather than pick one.
+        with self.assertRaisesRegex(WORKFLOW.SafeFailure, "LOCAL_AUDIT_UNRESOLVED"):
+            WORKFLOW._align_model_value("李 真", "李真是一筆，李　真是另一筆")
+
+    def test_boilerplate_pattern_spans_full_width_padding(self) -> None:
+        line = "中　　華　　民　　國　 115　　年"
+        match = WORKFLOW.BOILERPLATE_PATTERN.search(line)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(0), "中　　華　　民　　國")
+        self.assertEqual(
+            WORKFLOW.BOILERPLATE_PATTERN.search("中華民國刑法第276條").group(0),
+            "中華民國",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

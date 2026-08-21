@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import http.client
 import json
@@ -27,6 +28,9 @@ SUPPORTED_SUFFIXES: Final[frozenset[str]] = frozenset(
 )
 PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(r"<[A-Z][A-Z0-9_]*_\d+>")
 NAMESPACED_PATTERN: Final[re.Pattern[str]] = re.compile(r"\[\[PII-[^\]\r\n]+\]\]")
+# 中華民國, however many full-width spaces the document pads it with. It opens the
+# date line of essentially every Taiwanese judgment, official letter, and公告.
+BOILERPLATE_PATTERN: Final[re.Pattern[str]] = re.compile(r"中\s*華\s*民\s*國")
 SAFE_JOB_ID: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{32}$")
 DEFAULT_MODEL: Final[str] = "qwen3.6:35b-a3b"
 DEFAULT_OLLAMA_URL: Final[str] = "http://127.0.0.1:11434"
@@ -37,7 +41,29 @@ MAX_INPUT_BYTES: Final[int] = 64 * 1024
 MAX_MODEL_RESPONSE_BYTES: Final[int] = 1024 * 1024
 AUDIT_CHUNK_CHARS: Final[int] = 3600
 AUDIT_CHUNK_OVERLAP: Final[int] = 256
-MAX_AUDIT_PASSES: Final[int] = 3
+# Raised from 3 when the release rule became "two consecutive clean passes":
+# a document that legitimately needs two rounds of redaction would otherwise
+# spend its whole budget before it could ever confirm itself clean.
+MAX_AUDIT_PASSES: Final[int] = 6
+# One clean pass, because the insurance now lives inside the pass: every chunk is
+# sampled AUDIT_SAMPLES_PER_CHUNK times and the union is taken. Requiring two
+# clean passes on top of that multiplies an already slow reasoning audit for a
+# far smaller marginal gain than the sampling itself provides.
+REQUIRED_CLEAN_AUDIT_PASSES: Final[int] = 1
+AUDIT_HTTP_TIMEOUT_SECONDS: Final[int] = 900
+AUDIT_SAMPLES_PER_CHUNK: Final[int] = 3
+REDACT_WORKER_TIMEOUT_SECONDS: Final[int] = 5400
+# Floor for splitting a window the model will not terminate on. Below this a
+# window carries too little context to judge a name by, so a failure there is a
+# real failure rather than something to subdivide further.
+AUDIT_MIN_CHUNK_CHARS: Final[int] = 400
+MAX_AUDIT_SPLIT_DEPTH: Final[int] = 3
+# Response-level problems that say nothing about the document: a dropped
+# connection, a truncated generation, a reply that did not match the schema.
+# Discardable only because each chunk is sampled several times.
+TRANSIENT_AUDIT_FAILURES: Final[frozenset[str]] = frozenset({
+    "LOCAL_AUDIT_INVALID", "LOCAL_AUDIT_UNAVAILABLE",
+})
 PROMPT_INJECTION_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(
         r"\b(?:ignore|disregard|override|forget)\b.{0,100}"
@@ -239,13 +265,43 @@ def _validate_loopback_url(value: str) -> str:
     return DEFAULT_OLLAMA_URL
 
 
+def _is_pii_guard_project(candidate: Path) -> bool:
+    return (candidate / "pyproject.toml").is_file() and (candidate / "src/pii_guard").is_dir()
+
+
 def _find_pii_guard_project() -> Path:
-    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    candidate = home / "tools/pii-guard"
-    pyproject = candidate / "pyproject.toml"
-    if pyproject.is_file() and (candidate / "src/pii_guard").is_dir():
-        return candidate.resolve()
-    raise SafeFailure("PII_GUARD_NOT_FOUND", "Local PII Guard project was not found.")
+    """Locate the PII Guard checkout this skill belongs to.
+
+    This file ships inside the repository it drives, at
+    `<repo>/.agents/skills/pii-safe-documents/scripts/`, so the checkout is
+    four levels up from its own directory. That is the path that works for
+    someone who cloned the repository anywhere, and it keeps working when the
+    skill is installed by symlinking this directory into a skills folder,
+    because `resolve()` follows the link back into the checkout.
+
+    The environment variable is for the one case relative resolution cannot
+    cover: a skills folder holding a *copy* rather than a link, which severs
+    the relationship between this file and its repository.
+    """
+
+    candidates: list[Path] = []
+    here = Path(__file__).resolve()
+    if len(here.parents) > 4:
+        candidates.append(here.parents[4])
+    override = os.environ.get("PII_GUARD_HOME", "").strip()
+    if override:
+        candidates.append(Path(override).expanduser())
+    candidates.append(Path(pwd.getpwuid(os.getuid()).pw_dir) / "tools/pii-guard")
+
+    for candidate in candidates:
+        if _is_pii_guard_project(candidate):
+            return candidate.resolve()
+    raise SafeFailure(
+        "PII_GUARD_NOT_FOUND",
+        "Local PII Guard project was not found. Install the skill by linking "
+        "it out of a PII Guard checkout, or set PII_GUARD_HOME to that "
+        "checkout's path.",
+    )
 
 
 def _minimal_worker_environment() -> dict[str, str]:
@@ -271,7 +327,9 @@ def _pii_guard_python(project: Path) -> Path:
     interpreter = project / ".venv/bin/python"
     if not interpreter.is_file():
         raise SafeFailure(
-            "PII_GUARD_ENV_NOT_FOUND", "PII Guard's existing local environment was not found."
+            "PII_GUARD_ENV_NOT_FOUND",
+            "PII Guard's local environment was not found. Run `uv sync` in the "
+            f"checkout at {project} to create it.",
         )
     # Preserve the .venv path. Resolving the symlink would launch the base
     # interpreter without the project's installed dependencies.
@@ -370,6 +428,56 @@ def _replace_all(text: str, replacements: dict[str, str]) -> str:
     for source in sorted(replacements, key=len, reverse=True):
         text = text.replace(source, replacements[source])
     return text
+
+
+def _drop_degenerate_detections(
+    redacted: str, mapping: dict[str, str]
+) -> tuple[str, dict[str, str]]:
+    """Revert detections whose value is a single character.
+
+    CKIP segments Chinese without spaces, so a run padded with full-width
+    spaces -- the 中　　華　　民　　國 date line every Taiwanese official
+    document ends with -- comes back as fragments: one entity for 中, one for
+    華, one for 國. Those single characters then occur all over the document,
+    which both mangles the text and makes the leakage check unsatisfiable.
+
+    A one-character value cannot identify a natural person, so reverting it is
+    not a redaction loss. Anything two characters or longer is left alone and
+    handled by the occurrence sweep instead.
+    """
+
+    output = redacted
+    kept: dict[str, str] = {}
+    for placeholder, value in mapping.items():
+        if len(value.strip()) <= 1:
+            output = output.replace(placeholder, value)
+            continue
+        kept[placeholder] = value
+    return output, kept
+
+
+def _sweep_remaining_occurrences(
+    redacted: str, mapping: dict[str, str]
+) -> str:
+    """Redact every remaining literal occurrence of an already-mapped value.
+
+    PII Guard replaces the spans its detector reported, not every occurrence of
+    the string it reported. A name appearing six times and detected four times
+    therefore leaves two copies visible, and the wrapper's own leakage check
+    then refuses to release the document. Reusing the same placeholder for the
+    remaining copies is strictly more redaction and keeps restoration exact,
+    since restoration maps one placeholder to one value regardless of count.
+
+    Longest value first: a shorter value that is a substring of a longer one
+    must not consume the longer one's occurrences.
+    """
+
+    output = redacted
+    for placeholder in sorted(mapping, key=lambda key: len(mapping[key]), reverse=True):
+        value = mapping[placeholder]
+        if value and value in output:
+            output = output.replace(value, placeholder)
+    return output
 
 
 def _parse_entity_type(placeholder: str) -> str:
@@ -488,6 +596,68 @@ def _redact_labeled_identifiers(
     return identifier.sub(replace, redacted), expanded_mapping
 
 
+GENERIC_MAILBOX_HANDLES: Final[frozenset[str]] = frozenset({
+    "admin", "contact", "help", "info", "mail", "master", "news", "office",
+    "sales", "service", "support", "webmaster",
+})
+
+
+def _redact_email_handles_in_urls(
+    redacted: str,
+    mapping: dict[str, str],
+    job_id: str,
+    allowlist: tuple[str, ...] = (),
+) -> tuple[str, dict[str, str]]:
+    """Redact a personal mailbox handle where it reappears inside a URL.
+
+    A staff directory lists both `xiaoming@example.edu` and
+    `http://example.edu/~xiaoming/`. Detecting the address does nothing for the
+    slug, which names the same person just as plainly -- and the personal-site
+    URL is often the more durable identifier of the two.
+
+    Scoped to URLs on purpose. A handle like `plin` is a fine slug and a
+    terrible thing to blanket-replace in prose, so occurrences outside a URL are
+    left alone. Generic mailbox names are skipped for the same reason.
+    """
+
+    handles: list[str] = []
+    for value in mapping.values():
+        local, separator, _ = value.partition("@")
+        if not separator or not local:
+            continue
+        if len(local) < 4 or local.casefold() in GENERIC_MAILBOX_HANDLES:
+            continue
+        handles.append(local)
+    if not handles:
+        return redacted, mapping
+
+    expanded_mapping = dict(mapping)
+    counter = 0
+    url_pattern = re.compile(r"(?:https?://|www\.)\S+")
+
+    def redact_url(url_match: re.Match[str]) -> str:
+        nonlocal counter
+        url = url_match.group(0)
+        for handle in sorted(set(handles), key=len, reverse=True):
+            pattern = re.compile(
+                rf"(?<![A-Za-z0-9]){re.escape(handle)}(?![A-Za-z0-9])", re.IGNORECASE
+            )
+
+            def replace(match: re.Match[str]) -> str:
+                nonlocal counter
+                if match.group(0) in allowlist:
+                    return match.group(0)
+                counter += 1
+                placeholder = f"[[PII-{job_id[:10]}-URL_HANDLE-{counter}]]"
+                expanded_mapping[placeholder] = match.group(0)
+                return placeholder
+
+            url = pattern.sub(replace, url)
+        return url
+
+    return url_pattern.sub(redact_url, redacted), expanded_mapping
+
+
 def _redact_casefold_person_aliases(
     redacted: str,
     mapping: dict[str, str],
@@ -561,19 +731,78 @@ def _text_chunks(
     limit: int = AUDIT_CHUNK_CHARS,
     overlap: int = AUDIT_CHUNK_OVERLAP,
 ) -> list[str]:
-    """Create bounded overlapping windows so identifiers cannot straddle a gap."""
+    """Create bounded overlapping windows so identifiers cannot straddle a gap.
+
+    Windows end on line boundaries wherever a line fits. That is not cosmetic:
+    the audit runs again after each round of redaction, and a replacement makes
+    the document longer, so raw character windows slide and *every* later window
+    becomes a different string, even where nothing changed. Line alignment buys
+    back the windows up to the first changed line: they stay byte-identical, so
+    a later pass can skip them.
+
+    It does not buy back the windows after it. Packing is greedy by character
+    count, so a line that grew re-packs everything downstream of itself. The
+    saving is real but partial, and it is largest when a pass redacts near the
+    end of a document. Making it total would mean pinning windows to line
+    indices, which breaks on documents whose lines are whole paragraphs.
+
+    A single line longer than the limit is still cut by character count, since
+    the window has to stay bounded.
+    """
 
     if limit <= 0 or overlap < 0 or overlap >= limit:
         raise ValueError("Chunk limit and overlap are invalid.")
+    lines = text.splitlines(keepends=True)
     chunks: list[str] = []
-    start = 0
-    while start < len(text):
-        end = min(start + limit, len(text))
-        chunks.append(text[start:end])
-        if end == len(text):
-            break
-        start = end - overlap
-    return chunks
+    current: list[str] = []
+    current_length = 0
+    for line in lines:
+        if len(line) > limit:
+            if current:
+                chunks.append("".join(current))
+                current, current_length = [], 0
+            start = 0
+            while start < len(line):
+                end = min(start + limit, len(line))
+                chunks.append(line[start:end])
+                if end == len(line):
+                    break
+                start = end - overlap
+            continue
+        if current_length + len(line) > limit and current:
+            chunks.append("".join(current))
+            # Carry the tail of the previous window forward so a name split
+            # across the seam is still seen whole by one of the two windows.
+            carried: list[str] = []
+            carried_length = 0
+            for previous in reversed(current):
+                if carried_length + len(previous) > overlap:
+                    break
+                carried.insert(0, previous)
+                carried_length += len(previous)
+            current, current_length = carried, carried_length
+        current.append(line)
+        current_length += len(line)
+    if current:
+        chunks.append("".join(current))
+    return chunks or ([text] if text else [])
+
+
+def _minimum_alignment_length(needle: str) -> int:
+    """How many characters an inexact match must carry before it is trusted.
+
+    Four is the right floor for Latin text, where a three-character fragment
+    matches half the document. It is the wrong floor for Chinese: a full
+    personal name is two or three characters, so the Latin threshold refuses to
+    align every Chinese name the local audit echoes back with a stray space --
+    and a refusal fails the whole job. Two characters of CJK is already a
+    specific enough span to demand a unique match, which the caller still
+    enforces.
+    """
+
+    if any("㐀" <= character <= "鿿" for character in needle):
+        return 2
+    return 4
 
 
 def _align_model_value(value: str, text: str) -> str:
@@ -582,7 +811,7 @@ def _align_model_value(value: str, text: str) -> str:
     if value in text:
         return value
     needle = "".join(character.casefold() for character in value if character.isalnum())
-    if len(needle) < 4:
+    if len(needle) < _minimum_alignment_length(needle):
         raise SafeFailure(
             "LOCAL_AUDIT_UNRESOLVED",
             "Local audit reported PII that could not be matched exactly.",
@@ -658,7 +887,16 @@ DATA END
                 {"role": "user", "content": user_data},
             ],
             "stream": False,
-            "think": False,
+            # Reasoning on. Measured 2026-08-20 against a judgment signature
+            # block: with thinking off the audit returned {"entities":[]} and the
+            # clerk's name shipped visible; with it on the same model, same
+            # temperature, same fragment returned the name. The audit is the only
+            # net under CKIP's misses, so its recall is worth the extra seconds.
+            # Thinking lands in message.thinking, which this parser ignores --
+            # but it draws from the same num_predict budget, hence the raise
+            # below. Too small a budget spends the whole allowance on reasoning
+            # and returns empty content.
+            "think": True,
             "format": {
                 "type": "object",
                 "properties": {
@@ -678,14 +916,38 @@ DATA END
                 "required": ["entities"],
                 "additionalProperties": False,
             },
-            "options": {"temperature": 0, "num_predict": 2048},
+            # Thinking draws from this same budget, and a dense chunk has been
+            # measured spending over 11,000 characters of reasoning before it
+            # writes a single character of JSON. When the budget runs out the
+            # reply comes back with done_reason "length", which the parser
+            # correctly refuses -- and because reasoning length is a property of
+            # the chunk rather than of the draw, every sample for that chunk
+            # fails the same way, turning a tunable into a hard document
+            # failure. The model carries a 131k context, so the budget is the
+            # cheap side of this trade.
+            # This budget is bounded from both sides. Too small and a chunk that
+            # legitimately reasons at length comes back with done_reason
+            # "length" on every sample, which fails the document. Too large and
+            # the model's known non-termination mode -- Ornith burning tens of
+            # thousands of tokens without answering -- gets room to run past the
+            # HTTP timeout, which fails the document in the other direction; at
+            # 32768 a runaway sample needs about 820s at the observed decode
+            # rate, against a 900s timeout. A healthy call on this corpus
+            # finishes in 1,400 tokens, so 16384 leaves an order of magnitude of
+            # headroom for real work while capping a runaway near 470s.
+            "options": {"temperature": 0, "num_predict": 16384},
         }
     ).encode("utf-8")
     parsed_url = urllib.parse.urlparse(base_url)
     connection = http.client.HTTPConnection(
         parsed_url.hostname,
         parsed_url.port or 11434,
-        timeout=180,
+        # 180s was sized for a non-reasoning audit. With thinking on, a dense
+        # 3,600-character chunk can spend longer than that before it emits its
+        # first content token, and the timeout surfaces as
+        # LOCAL_AUDIT_UNAVAILABLE -- indistinguishable, from the outside, from
+        # Ollama being down. Two documents failed that way on 2026-08-20.
+        timeout=AUDIT_HTTP_TIMEOUT_SECONDS,
     )
     try:
         connection.request(
@@ -745,20 +1007,86 @@ def _local_alias_audit(
     model: str,
     base_url: str,
     allowlist: tuple[str, ...],
+    already_audited: set[str] | None = None,
 ) -> list[tuple[str, str]]:
+    def audit_chunk(chunk: str, focus: str, depth: int = 0) -> list[tuple[str, str]]:
+        """Audit one window, splitting it if the model will not terminate on it.
+
+        Some inputs put the model into a non-terminating generation: a dense
+        staff directory, once most of it is placeholders, made every sample run
+        to the token cap and return done_reason "length" -- at 16k tokens, and
+        at 32k it ran past the HTTP timeout instead. That is not a budget to be
+        tuned, it is the model failing to stop, and it reproduces on every
+        sample because it is a property of the input rather than of the draw.
+
+        Halving the window is the response that treats the actual cause. A
+        shorter window ends the runaway, and recall does not depend on window
+        size: replaying one document's signature block at 3,600, 1,800 and 900
+        characters found the same name every time.
+        """
+
+        found: list[tuple[str, str]] = []
+        successes = 0
+        last_transient: SafeFailure | None = None
+
+        def one_sample() -> list[tuple[str, str]]:
+            return _call_local_audit(
+                chunk,
+                alignment_text=redacted,
+                model=model,
+                base_url=base_url,
+                allowlist=allowlist,
+                focus=focus,
+            )
+
+        # The samples are independent by construction, so they are issued
+        # together rather than one after another. Same requests, same union,
+        # a third of the wall clock when the local server has slots free -- and
+        # no worse than sequential when it does not, since it queues them.
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=AUDIT_SAMPLES_PER_CHUNK
+        ) as pool:
+            futures = [
+                pool.submit(one_sample) for _ in range(AUDIT_SAMPLES_PER_CHUNK)
+            ]
+            for future in futures:
+                try:
+                    found.extend(future.result())
+                except SafeFailure as failure:
+                    if failure.code not in TRANSIENT_AUDIT_FAILURES:
+                        raise
+                    last_transient = failure
+                    continue
+                successes += 1
+        if successes or last_transient is None:
+            return found
+        if depth >= MAX_AUDIT_SPLIT_DEPTH or len(chunk) <= AUDIT_MIN_CHUNK_CHARS:
+            # Out of ways to make the window easier; the chunk really has not
+            # been inspected, so refuse rather than release it unexamined.
+            raise last_transient
+        middle = len(chunk) // 2
+        halves = (
+            chunk[: middle + AUDIT_CHUNK_OVERLAP],
+            chunk[max(0, middle - AUDIT_CHUNK_OVERLAP) :],
+        )
+        for half in halves:
+            found.extend(audit_chunk(half, focus, depth + 1))
+        return found
+
     result: list[tuple[str, str]] = []
     for focus in ("all",):
         for chunk in _text_chunks(redacted):
-            result.extend(
-                _call_local_audit(
-                    chunk,
-                    alignment_text=redacted,
-                    model=model,
-                    base_url=base_url,
-                    allowlist=allowlist,
-                    focus=focus,
-                )
-            )
+            # A later pass exists because an earlier one redacted something
+            # somewhere. Windows whose text is byte-identical to a window this
+            # job has already sampled have not become more suspicious in the
+            # meantime, and they were already read AUDIT_SAMPLES_PER_CHUNK
+            # times. Re-reading the whole document every pass was most of the
+            # runtime on multi-pass documents and bought nothing.
+            if already_audited is not None:
+                if chunk in already_audited:
+                    continue
+                already_audited.add(chunk)
+            result.extend(audit_chunk(chunk, focus))
     placeholders = NAMESPACED_PATTERN.findall(redacted)
     verified: set[tuple[str, str]] = set()
     for entity_type, value in result:
@@ -802,6 +1130,13 @@ def _redact_worker(args: argparse.Namespace) -> None:
     protected, allow_tokens = _protect_literals(original, allowlist, f"ALLOW{args.job_id[:8]}")
     protected, literal_tokens = _protect_literals(
         protected, literal_placeholders, f"LITERAL{args.job_id[:8]}"
+    )
+    # Boilerplate that is never personal data but that CKIP repeatedly reports as
+    # LOCATION/ORG once full-width padding splits it. Hiding it from the detector
+    # is both safer and more faithful to the spec, which requires dates to stay.
+    boilerplate = [match.group(0) for match in BOILERPLATE_PATTERN.finditer(protected)]
+    protected, boilerplate_tokens = _protect_literals(
+        protected, boilerplate, f"BOILER{args.job_id[:8]}"
     )
 
     private_input = job_dir / ".input.private.txt"
@@ -858,19 +1193,33 @@ def _redact_worker(args: argparse.Namespace) -> None:
             "PII Guard redaction markers and private mapping do not match.",
         )
     redacted, mapping = _namespace_mapping(redacted, mapping, args.job_id)
-    protected_tokens = {**allow_tokens, **literal_tokens}
+    protected_tokens = {**allow_tokens, **literal_tokens, **boilerplate_tokens}
     redacted, mapping = _expand_protected_spans(
         redacted, mapping, protected_tokens, args.job_id
     )
     redacted = _replace_all(redacted, protected_tokens)
+    redacted, mapping = _drop_degenerate_detections(redacted, mapping)
+    redacted = _sweep_remaining_occurrences(redacted, mapping)
     redacted, mapping = _redact_location_suffixes(redacted, mapping, args.job_id)
     redacted, mapping = _redact_labeled_identifiers(redacted, mapping, args.job_id)
     redacted, mapping = _redact_casefold_person_aliases(
         redacted, mapping, args.job_id, allowlist
     )
-
+    redacted, mapping = _redact_email_handles_in_urls(
+        redacted, mapping, args.job_id, allowlist
+    )
     counters: dict[str, int] = {}
     audit_passes = 0
+    audited_windows: set[str] = set()
+    # Counts consecutive clean passes against REQUIRED_CLEAN_AUDIT_PASSES. The
+    # local audit is not deterministic in practice: on 2026-08-20 the same
+    # penalty table came back with four employer names on one run and none on
+    # the next, and a reporter's byline was found on one run and missed on the
+    # next. That is why one pass cannot be taken at face value -- but the
+    # repetition that answers it now lives inside the pass, in the
+    # AUDIT_SAMPLES_PER_CHUNK union, so the requirement here is one. Raise
+    # REQUIRED_CLEAN_AUDIT_PASSES to demand confirming passes on top of it.
+    clean_streak = 0
     for audit_passes in range(1, MAX_AUDIT_PASSES + 1):
         misses = _local_alias_audit(
             original,
@@ -878,9 +1227,14 @@ def _redact_worker(args: argparse.Namespace) -> None:
             model=args.model,
             base_url=args.ollama_url,
             allowlist=allowlist,
+            already_audited=audited_windows,
         )
         if not misses:
-            break
+            clean_streak += 1
+            if clean_streak >= REQUIRED_CLEAN_AUDIT_PASSES:
+                break
+            continue
+        clean_streak = 0
         for entity_type, value in sorted(
             set(misses), key=lambda item: len(item[1]), reverse=True
         ):
@@ -1127,7 +1481,12 @@ def _public_redact(args: argparse.Namespace) -> None:
                 json.dumps(tuple(args.allow), ensure_ascii=False),
             ],
             status_path=job_dir / ".worker.safe.json",
-            timeout=900,
+            # A reasoning audit sampled several times per chunk turns a
+            # 10,000-character document into tens of minutes of local inference.
+            # 900s was sized for a single non-reasoning pass and now expires
+            # mid-document, which surfaces as LOCAL_PROCESS_TIMEOUT and throws
+            # away completed work.
+            timeout=REDACT_WORKER_TIMEOUT_SECONDS,
         )
         manifest = json.loads(_read_utf8(job_dir / MANIFEST_NAME))
         redacted_path = job_dir / REDACTED_NAME

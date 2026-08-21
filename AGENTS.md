@@ -14,7 +14,6 @@ This file provides guidance to Codex when working with code in this repository.
 - **Chinese NER**: `ckiplab/bert-base-chinese-ner`（中研院，繁體中文）
 - **Taiwan PII Regex**: 自建 `PatternRecognizer`（身分證、手機、市話、統一編號）
 - **Pipeline**: LangChain `PresidioReversibleAnonymizer`（mapping table 序列化/還原）
-- **LLM fallback（Phase 3）**: Qwen2.5 via Ollama
 
 ## Architecture
 
@@ -70,7 +69,7 @@ uv run ruff check src/
 
 - **Phase 1 MVP** ✅ 2026-03-30：Presidio + 台灣 Regex 8 種，MCP Server 介面，89 tests
 - **Phase 2** ✅ 2026-03-30：CKIP BERT NER（人名/組織/地名）整合驗證，+4 種 PII 類型，MCP smoke test，152 tests total
-- **Phase 3** ✅ 2026-03-30：Ollama Qwen2.5:1.5b LLM fallback 偵測層（opt-in `--llm-fallback`），14 unit tests，167 tests total
+- **Phase 3** ✅ 2026-03-30，**2026-08-21 移除**：Ollama Qwen2.5:1.5b LLM fallback 偵測層。改由 `pii-safe-documents` skill 的多次取樣稽核取代；舊層無語料證據且與新層並存會讓使用者選錯。要在 CLI 端補回稽核，做法是下沉 skill 那套，不是重新啟用這個。
 - **Phase 4** ✅ 2026-03-30：eval corpus 53 筆標註語料 + precision/recall/F1 框架，修復 5 個偵測問題，Regex F1=100%、Full CKIP F1=97.6%
 - **Phase 5** ✅ 2026-03-30：Claude PreToolUse hook（審核模式）+ anonymize_file MCP 工具，180 tests total；Codex 目前改由 `pii-safe-documents` skill 明確觸發
 - **Phase 6** ✅ 2026-03-31：多格式檔案支援（xlsx/docx/pdf）CLI + MCP，file_handlers 模組，MIT LICENSE
@@ -106,7 +105,3 @@ Codex 處理敏感文件時必須先使用 `pii-safe-documents` skill 或 `anony
   - `protected_paths`: 只處理這些目錄下的檔案（空 = 全部）
   - `protected_extensions`: 只處理這些副檔名（`.txt`, `.csv`, `.tsv`, `.log`, `.dat`）
 
-## Key Reference Files
-
-- 調研筆記：`~/knowledge-base/bookmarks/presidio-pii-deidentification.md`
-- 課程研究：`~/claude-course/official/research-pii-anonymization.md`

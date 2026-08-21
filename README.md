@@ -17,7 +17,7 @@
 ```
 原始文件
     ↓
-[偵測層] CKIP NER + 台灣 Regex + (可選) Ollama LLM
+[偵測層] CKIP NER + 台灣 Regex
     → 輸出 JSON 實體列表
     ↓
 [替換層] 程式碼建立 mapping table
@@ -32,7 +32,7 @@ AI 回答（含佔位符）
 還原後的 AI 回答
 ```
 
-**關鍵設計原則**：LLM 只做偵測輔助，替換與還原全部由程式碼完成，decode 可靠性 100%。
+**關鍵設計原則**：偵測層可以是機率性的，但**替換與還原全部由程式碼完成**，所以還原一定精確。skill 在這條管線之後另外加一層本地模型稽核，見下方說明。
 
 ## 技術棧
 
@@ -41,9 +41,8 @@ AI 回答（含佔位符）
 | PII 框架 | [Microsoft Presidio](https://github.com/microsoft/presidio) | 偵測 + 匿名化 + 還原，MIT 授權 |
 | 繁中 NER | [ckiplab/bert-base-chinese-ner](https://huggingface.co/ckiplab/bert-base-chinese-ner) | 中研院，繁體中文人名/組織，102M |
 | 台灣 PII Regex | 自建 PatternRecognizer | 身分證、統一編號、手機、市話 |
-| LLM fallback（可選） | Qwen2.5:1.5b via Ollama | `--llm-fallback` 啟用，補充 NER 漏掉的非結構化 PII |
 | Pipeline 整合 | LangChain PresidioReversibleAnonymizer | mapping table 序列化/還原 |
-| 語言 | Python 3.11+ | |
+| 語言 | Python 3.13（`requires-python >=3.11`） | |
 | 套件管理 | uv | |
 
 ## 支援的 PII 類型
@@ -61,35 +60,60 @@ AI 回答（含佔位符）
 - 統一編號：`\d{8}`（搭配 context 詞過濾）
 - Email、信用卡號（Presidio 內建）
 
-## LLM Fallback（可選）
+## 安裝
 
-啟用 Ollama Qwen2.5 作為輔助偵測層，補抓 regex/CKIP 遺漏的邊緣案例：
+需要 Python 3.13（3.11 以上可跑）、[uv](https://docs.astral.sh/uv/)、以及 [Ollama](https://ollama.com/)。
 
 ```bash
-# 前置：安裝 Ollama 並拉取模型
-ollama pull qwen2.5:1.5b
+git clone https://github.com/danyuchn/pii-guard.git
+cd pii-guard
+uv sync
 
-# CLI 使用
-uv run python -m pii_guard --llm-fallback input.txt -o output.txt
-
-# 指定其他模型
-uv run python -m pii_guard --llm-fallback --ollama-model qwen2.5:3b input.txt
-
-# MCP Server 啟用
-uv run python -m pii_guard serve --llm-fallback
-# 或透過環境變數
-PII_GUARD_LLM_FALLBACK=1 uv run python -m pii_guard serve
+# 需要 CLI 直接處理 .docx / .xlsx / .pdf 時再加裝（skill 目前不需要）
+uv sync --extra formats
 ```
 
-LLM confidence 設為 0.75（低於 regex 0.85 和 CKIP 0.85），確保確定性偵測結果優先。Ollama 不可用時自動降級，不影響既有功能。
+首次執行會下載 CKIP BERT NER 模型（約 500MB）。未加裝 `formats` 時，`tests/test_file_handlers.py` 的 10 個測試會因缺少 `openpyxl` / `python-docx` / `pdfplumber` 而跳不過，屬預期行為。
+
+## Claude Code Skill（推薦用法）
+
+本 repo 內含 `pii-safe-documents` skill，位於 `.agents/skills/pii-safe-documents/`。它在 CLI 之外多做一件事：**讓主 agent 全程看不到原始文件、對照表與還原結果**——主 agent 只拿到路徑與「成功／失敗」回執，讀檔、呼叫模型、還原都在一個獨立的本地行程裡完成。
+
+安裝方式是把它連結進 skills 目錄，不要複製：
+
+```bash
+# Claude Code（user level）
+ln -s "$(pwd)/.agents/skills/pii-safe-documents" ~/.claude/skills/pii-safe-documents
+
+# 稽核模型
+ollama pull ornith-1.5:9b
+```
+
+用連結而非複製，是因為 skill 需要找到它所屬的 repo 才能呼叫 pii-guard 本體。若你的環境只能複製，改設環境變數 `PII_GUARD_HOME` 指向 clone 出來的路徑。
+
+裝好後在 Claude Code 裡直接說「幫我把這份檔案去識別化」即可。
+
+### 使用前必讀的三個限制
+
+1. **支援格式有限**：目前只吃 64 KiB 以內的 UTF-8 純文字（`.txt` `.md` `.csv` `.tsv` `.log` `.dat`）。`.docx` `.xlsx` `.pdf` 尚未提供保證隔離的解析器，改副檔名繞過會被擋。
+2. **很慢**：稽核層開啟推理並對每個視窗取樣三次，單份文件實測 10–50 分鐘。這是為了偵測召回率付的代價（關閉推理時模型會漏掉判決書簽名欄的人名）。**批次處理上百份文件在此設定下不可行。**
+3. **這是個資遮蔽，不是機密分級**。金額、病情、行程、合約條款只要不指向特定個人就會留著。不要單憑本工具宣稱「整份文件可以對外」。
+
+隔離性的正確描述是：**防止意外把原文餵給雲端模型的強保護，不是作業系統層級的安全邊界**。同一個使用者身分下的惡意行程仍可讀到檔案；真正的敵意隔離需要獨立權限的本地 broker 或另開系統帳號。
 
 ## 開發路線圖
 
 - [x] Phase 1 MVP：Presidio + CKIP NER + 台灣 Regex，MCP Server 介面
 - [x] Phase 2：CKIP BERT NER 整合，+4 種 PII 類型（車牌/出生日期/國際手機/銀行帳號）
-- [x] Phase 3：Ollama Qwen2.5:1.5b LLM fallback 偵測層（`--llm-fallback` 啟用）
-- [ ] Phase 4：評估集建立，precision/recall 測試
-- [ ] Phase 5：Claude Code PreToolUse hook 整合（自動攔截讀檔）
+- [x] Phase 3：~~Ollama Qwen2.5:1.5b LLM fallback 偵測層~~（2026-08-21 移除，見下方說明）
+- [x] Phase 4：評估集建立，precision/recall 測試
+- [x] Phase 5：`pii-safe-documents` skill（主 agent 隔離的可逆去識別化工作流）
+- [ ] Phase 6：人工補標介面（讓使用者補遮模型漏掉的詞、放回被過度遮蔽的組織名，全程不經過主 agent）
+- [ ] Phase 7：效能——先用決定性規則篩出可疑段落再送模型，讓批次處理可行
+
+### 關於已移除的 LLM fallback 偵測層
+
+Phase 3 曾在 Presidio 內掛一個 Ollama recognizer（`--llm-fallback`，預設 `qwen2.5:1.5b`）。2026-08-21 移除，原因是 `pii-safe-documents` skill 用**取樣多次取聯集**的方式做本地模型稽核，在真實文件上量測有效，而舊的單次 1.5B 呼叫沒有任何語料證明它有效，卻讓使用者面對兩個看起來在做同一件事的開關。留著會讓人選錯。要在 CLI 端補回模型稽核，正確做法是把 skill 那套下沉，不是把舊的打開。
 
 ## 參考資料
 
@@ -98,5 +122,3 @@ LLM confidence 設為 0.75（低於 regex 0.85 和 CKIP 0.85），確保確定�
 - [Presidio TransformersRecognizer](https://microsoft.github.io/presidio/samples/python/transformers_recognizer/)
 - [CKIP Transformers（中研院）](https://github.com/ckiplab/ckip-transformers)
 - [LangChain PresidioReversibleAnonymizer](https://python.langchain.com/docs/guides/privacy/presidio_data_anonymization/reversible)
-- 調研筆記：`~/knowledge-base/bookmarks/presidio-pii-deidentification.md`
-- 課程研究：`~/claude-course/official/research-pii-anonymization.md`
