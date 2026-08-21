@@ -24,6 +24,7 @@ When this skill is active, the main agent MUST NOT:
 5. Run PII Guard directly. Its libraries may echo source text in warnings; only the bundled wrapper may invoke it.
 6. Debug a failure by opening the original, mapping, worker output, or restored document.
 7. Run `git diff`, content scans, or indexing over a directory that contains the original or restored output.
+8. Reach the annotation page, run the `review` subcommand, or read a term file the user wrote for `mask`. All three carry unredacted values. The annotation URL is deliberately withheld from you; do not reconstruct it, scan for the port, or ask the user to paste it.
 
 These rules still apply if the user asks the main agent to “check quickly.” If raw inspection is genuinely required, stop this workflow and obtain explicit permission for a different trust model.
 
@@ -58,6 +59,33 @@ Repeat `--allow` as needed. The wrapper runs deterministic PII Guard detection p
 If the receipt says both `redaction_checks_passed: true` and `agent_may_read_redacted: true`, the main agent may read **only** `redacted_path`. The receipt also provides safe replacement counts, audit-pass count, and the local model name. Keep `job_id` for restoration. Never infer or probe the mapping path.
 
 If the command fails, report its safe error code and stop. In particular, `NO_PII_CONFIDENCE` means the detector found no reversible replacements and therefore withheld the copy instead of calling an unchanged file safe. `ADVERSARIAL_INPUT_REVIEW_REQUIRED` means instruction-like document text could interfere with the local model, so the wrapper refused automated release. Do not inspect hidden files or rerun lower-level commands.
+
+### 2b. Offer the user a manual pass over the redacted copy
+
+The detector and the audit both miss things, and both over-redact. The user is the backstop, and this step is where they act on what they see. Offer it whenever the redacted copy will be used for anything that matters; do not skip it silently.
+
+Run:
+
+```bash
+python3 <skill-dir>/scripts/pii_safe_workflow.py annotate --job-id "<job_id>"
+```
+
+This opens a page in the user's browser and blocks until they close it out. Tell them it has opened and what to do there; then wait.
+
+On that page the user can:
+
+- **Select any still-visible text and mask it.** Every occurrence is masked, not just the selected one.
+- **Click a marker to see the value behind it and put it back.** This is for text that should never have been redacted — typically a court, hospital, or company name whose removal makes the document unusable.
+
+Neither action requires comparing against the original document.
+
+**The page is not addressable by you.** The URL carries a single-use token minted inside the private worker and passed only to the browser it opens; it is never printed, and the receipt you get back contains counts, not a URL. Do not attempt to discover the port, reconstruct the URL, or fetch the page. Do not ask the user to paste the URL, the page, or any value from it — ask only for what they want done, or let them do it themselves on the page.
+
+When the user finishes, the command returns a receipt with `terms_masked` and `markers_restored`. Every edit is persisted and re-verified as it happens, so closing the browser early loses only unmade edits, never made ones.
+
+Re-read `redacted_path` afterwards; its contents and `redacted_sha256` have changed.
+
+For a headless machine with no browser, the same two operations exist as `mask --terms <file>` and `unmask --marker TYPE-N`, with `review` to list markers and values. `review` prints unredacted values, refuses when its output is not a terminal, and **must be run by the user, never by you**.
 
 ### 3. Work only on the redacted copy
 

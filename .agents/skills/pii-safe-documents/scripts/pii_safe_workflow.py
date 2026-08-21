@@ -7,17 +7,21 @@ import argparse
 import concurrent.futures
 import hashlib
 import http.client
+import http.server
 import json
 import os
 import pwd
 import re
+import secrets
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.parse
 import uuid
+import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Iterable, NoReturn
@@ -32,6 +36,19 @@ NAMESPACED_PATTERN: Final[re.Pattern[str]] = re.compile(r"\[\[PII-[^\]\r\n]+\]\]
 # date line of essentially every Taiwanese judgment, official letter, and公告.
 BOILERPLATE_PATTERN: Final[re.Pattern[str]] = re.compile(r"中\s*華\s*民\s*國")
 SAFE_JOB_ID: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{32}$")
+# The tail of a placeholder, as a person reads it off the redacted file:
+# TYPE-N out of [[PII-<job>-TYPE-N]]. Constrained so an unmask request cannot
+# smuggle anything but a marker.
+SAFE_MARKER_SUFFIX: Final[re.Pattern[str]] = re.compile(r"^[A-Z][A-Z0-9_]*-\d{1,6}$")
+MANUAL_ENTITY_TYPE: Final[str] = "MANUAL"
+MAX_ANNOTATION_TERMS: Final[int] = 500
+# Annotation is literal string work over an already-bounded document, with no
+# model in the loop; a minute is generous.
+ANNOTATE_WORKER_TIMEOUT_SECONDS: Final[int] = 60
+# How long the browser page may stay open. A person reading a long document
+# carefully is the normal case, so this is generous; edits are persisted as
+# they happen, so a timeout loses nothing already done.
+ANNOTATE_UI_TIMEOUT_SECONDS: Final[int] = 3600
 DEFAULT_MODEL: Final[str] = "qwen3.6:35b-a3b"
 DEFAULT_OLLAMA_URL: Final[str] = "http://127.0.0.1:11434"
 PRIVATE_MAP_NAME: Final[str] = "mapping.private.json"
@@ -1621,6 +1638,798 @@ def _public_purge(args: argparse.Namespace) -> None:
     _emit({"ok": True, "job_id": args.job_id, "purged": True})
 
 
+ANNOTATION_PAGE: Final[str] = """<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>人工補標</title>
+<style>
+:root { color-scheme: light dark; --line: #8883; --accent: #C8371E; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 15px/1.7 ui-sans-serif, system-ui, "PingFang TC", sans-serif; }
+header { position: sticky; top: 0; padding: 12px 20px; border-bottom: 1px solid var(--line);
+  background: Canvas; display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; }
+h1 { font-size: 15px; margin: 0; font-weight: 600; }
+.muted { opacity: .65; font-size: 13px; }
+main { padding: 20px; max-width: 68rem; margin: 0 auto; }
+#doc { white-space: pre-wrap; word-break: break-word; border: 1px solid var(--line);
+  border-radius: 6px; padding: 16px; min-height: 40vh; }
+.chip { display: inline; border-radius: 4px; padding: 1px 5px; cursor: pointer;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  font-size: .88em; font-family: ui-monospace, monospace; }
+.chip:hover { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+.chip.manual { --accent: #2563eb; }
+button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line);
+  background: Canvas; color: inherit; cursor: pointer; }
+button.primary { background: var(--accent); color: #fff; border-color: transparent; }
+button:disabled { opacity: .4; cursor: default; }
+#float { position: fixed; display: none; z-index: 9; }
+#panel { position: fixed; display: none; z-index: 9; background: Canvas; padding: 12px;
+  border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 24px #0003; max-width: 22rem; }
+#panel .val { font-weight: 600; margin: 4px 0 10px; word-break: break-all; }
+#log { margin-top: 14px; font-size: 13px; min-height: 1.7em; }
+#done { padding: 20px 0 40px; }
+</style></head><body>
+<header>
+  <h1>人工補標</h1>
+  <span class="muted" id="stat"></span>
+  <span class="muted">選取文字可補遮，點彩色標記可放回</span>
+</header>
+<main>
+  <div id="doc"></div>
+  <div id="log" class="muted"></div>
+  <div id="done"><button class="primary" id="finish">完成並關閉</button></div>
+</main>
+<div id="float"><button class="primary" id="maskbtn">遮蔽選取的文字</button></div>
+<div id="panel">
+  <div class="muted" id="ptype"></div>
+  <div class="val" id="pval"></div>
+  <button id="unmaskbtn">放回原文</button>
+  <button id="closebtn">取消</button>
+</div>
+<script>
+const BASE = location.pathname.replace(/\\/$/, "");
+const doc = document.getElementById("doc"), stat = document.getElementById("stat");
+const log = document.getElementById("log"), float = document.getElementById("float");
+const panel = document.getElementById("panel");
+let entries = {}, active = null, busy = false;
+
+async function call(path, body) {
+  if (busy) return null;
+  busy = true;
+  try {
+    const res = await fetch(BASE + path, {
+      method: body ? "POST" : "GET",
+      headers: body ? {"content-type": "application/json"} : {},
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await res.json();
+    if (!res.ok) { log.textContent = "失敗：" + (data.message || res.status); return null; }
+    return data;
+  } catch (err) { log.textContent = "無法連線，伺服器可能已關閉。"; return null; }
+  finally { busy = false; }
+}
+
+function render(state) {
+  entries = {};
+  for (const item of state.entries) entries[item.marker] = item;
+  stat.textContent = `${state.entries.length} 個遮蔽 · 已補遮 ${state.masked} · 已放回 ${state.unmasked}`;
+  doc.textContent = "";
+  const parts = state.redacted.split(/(\\[\\[PII-[^\\]\\r\\n]+\\]\\])/);
+  for (const part of parts) {
+    const marker = state.markers[part];
+    if (marker) {
+      const chip = document.createElement("span");
+      chip.className = "chip" + (marker.startsWith("MANUAL-") ? " manual" : "");
+      chip.textContent = marker;
+      chip.dataset.marker = marker;
+      doc.appendChild(chip);
+    } else if (part) {
+      doc.appendChild(document.createTextNode(part));
+    }
+  }
+}
+
+doc.addEventListener("click", (event) => {
+  const chip = event.target.closest(".chip");
+  if (!chip) return;
+  active = chip.dataset.marker;
+  const item = entries[active], box = chip.getBoundingClientRect();
+  document.getElementById("ptype").textContent = active;
+  document.getElementById("pval").textContent = item ? item.value : "";
+  panel.style.display = "block";
+  panel.style.left = Math.min(box.left, innerWidth - 360) + "px";
+  panel.style.top = (box.bottom + 8) + "px";
+  float.style.display = "none";
+});
+
+document.addEventListener("selectionchange", () => {
+  const selection = getSelection();
+  if (!selection.rangeCount || selection.isCollapsed) { float.style.display = "none"; return; }
+  const range = selection.getRangeAt(0);
+  if (!doc.contains(range.commonAncestorContainer)) { float.style.display = "none"; return; }
+  const text = selection.toString();
+  if (!text.trim() || text.includes("[[")) { float.style.display = "none"; return; }
+  const box = range.getBoundingClientRect();
+  float.style.display = "block";
+  float.style.left = Math.min(box.left, innerWidth - 200) + "px";
+  float.style.top = (box.bottom + 8) + "px";
+});
+
+document.getElementById("maskbtn").addEventListener("click", async () => {
+  const term = getSelection().toString().trim();
+  if (!term) return;
+  float.style.display = "none";
+  const state = await call("/mask", {terms: [term]});
+  if (!state) return;
+  log.textContent = state.last_masked
+    ? `已遮蔽「${term}」，共 ${state.last_occurrences} 處。`
+    : `文件中找不到「${term}」，未變更。`;
+  render(state);
+});
+
+document.getElementById("unmaskbtn").addEventListener("click", async () => {
+  if (!active) return;
+  const marker = active;
+  panel.style.display = "none"; active = null;
+  const state = await call("/unmask", {markers: [marker]});
+  if (!state) return;
+  log.textContent = `已放回 ${marker}，該內容從此對 AI 可見。`;
+  render(state);
+});
+
+document.getElementById("closebtn").addEventListener("click", () => {
+  panel.style.display = "none"; active = null;
+});
+
+document.getElementById("finish").addEventListener("click", async () => {
+  document.getElementById("finish").disabled = true;
+  await call("/done", {});
+  document.body.innerHTML =
+    "<main><p>已完成，可以關閉這個分頁，回到對話繼續。</p></main>";
+});
+
+call("/state").then((state) => { if (state) render(state); });
+</script></body></html>
+"""
+
+
+def _split_namespaced(placeholder: str) -> tuple[str, int] | None:
+    """Split `[[PII-<job>-<TYPE>-<n>]]` into its type and index."""
+
+    match = re.fullmatch(r"\[\[PII-[^-\]]+-(.+)-(\d+)\]\]", placeholder)
+    if match is None:
+        return None
+    return match.group(1), int(match.group(2))
+
+
+def _shield_placeholders(text: str, mapping: dict[str, str]) -> tuple[str, dict[str, str]]:
+    """Hide existing placeholders behind sentinels before a literal edit.
+
+    A manually supplied term is matched literally against the whole document,
+    and placeholders are part of that document. Without this, masking the term
+    `PII` would eat into every `[[PII-...]]` marker and destroy the mapping.
+    The sentinel carries no characters a user could plausibly type.
+    """
+
+    shielded = text
+    sentinels: dict[str, str] = {}
+    for index, placeholder in enumerate(sorted(mapping, key=len, reverse=True)):
+        sentinel = f"\x00SHIELD{index}\x00"
+        sentinels[sentinel] = placeholder
+        shielded = shielded.replace(placeholder, sentinel)
+    return shielded, sentinels
+
+
+def _load_job_state(job_dir: Path, job_id: str) -> tuple[str, dict[str, str], dict, str]:
+    """Read a job's redacted text, mapping, manifest and original document.
+
+    The original is re-read from the path the job recorded, and its digest is
+    checked, because every edit below has to prove it still round-trips. A
+    manual annotation that quietly broke restoration would be worse than the
+    leak it was correcting.
+    """
+
+    manifest = json.loads(_read_utf8(job_dir / MANIFEST_NAME))
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("kind") != "pii-safe-documents-private-job"
+        or manifest.get("job_id") != job_id
+    ):
+        raise SafeFailure("INVALID_JOB", "Private job provenance check failed.")
+    redacted = _read_utf8(job_dir / REDACTED_NAME)
+    mapping_data = json.loads(_read_utf8(job_dir / PRIVATE_MAP_NAME))
+    if not isinstance(mapping_data, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in mapping_data.items()
+    ):
+        raise SafeFailure("INVALID_MAPPING", "Private mapping is invalid.")
+    original_path = Path(str(manifest.get("original_path", "")))
+    if not original_path.is_file():
+        raise SafeFailure(
+            "ORIGINAL_UNAVAILABLE",
+            "The original document is no longer at the path this job recorded, "
+            "so an annotation cannot be proven reversible.",
+        )
+    original = _read_utf8(original_path)
+    if hashlib.sha256(original.encode("utf-8")).hexdigest() != manifest.get("original_sha256"):
+        raise SafeFailure(
+            "ORIGINAL_CHANGED",
+            "The original document changed since redaction; refusing to annotate.",
+        )
+    return redacted, dict(mapping_data), manifest, original
+
+
+def _commit_job_state(
+    job_dir: Path,
+    redacted: str,
+    mapping: dict[str, str],
+    manifest: dict,
+    original: str,
+    *,
+    annotation: dict[str, object],
+) -> None:
+    """Verify the edited job still restores exactly, then persist it."""
+
+    markers = set(NAMESPACED_PATTERN.findall(redacted))
+    if not markers.issuperset(mapping):
+        raise SafeFailure(
+            "INVALID_MAPPING", "A mapping entry has no corresponding marker after annotation."
+        )
+    if _replace_all(redacted, mapping) != original:
+        raise SafeFailure(
+            "ROUNDTRIP_INTEGRITY_FAILED",
+            "The annotated document no longer reproduces the original input.",
+        )
+
+    redacted_path = job_dir / REDACTED_NAME
+    mapping_path = job_dir / PRIVATE_MAP_NAME
+    redacted_path.unlink(missing_ok=True)
+    mapping_path.unlink(missing_ok=True)
+    _private_write(redacted_path, redacted)
+    _private_write(mapping_path, json.dumps(mapping, ensure_ascii=False, sort_keys=True))
+
+    entity_counts: dict[str, int] = {}
+    for placeholder in mapping:
+        parsed = _split_namespaced(placeholder)
+        entity_type = parsed[0] if parsed else "OTHER"
+        entity_counts[entity_type] = entity_counts.get(entity_type, 0) + 1
+    history = list(manifest.get("manual_annotations", []))
+    history.append(annotation)
+    manifest.update(
+        {
+            "replacement_count": len(mapping),
+            "entity_counts": entity_counts,
+            "redacted_sha256": _sha256(redacted_path),
+            "placeholder_counts": {
+                placeholder: redacted.count(placeholder) for placeholder in mapping
+            },
+            "placeholder_sequence": [
+                placeholder
+                for placeholder in NAMESPACED_PATTERN.findall(redacted)
+                if placeholder in mapping
+            ],
+            "manual_annotations": history,
+        }
+    )
+    manifest_path = job_dir / MANIFEST_NAME
+    manifest_path.unlink(missing_ok=True)
+    _private_write(manifest_path, json.dumps(manifest, sort_keys=True))
+
+
+def _parse_term_file(text: str) -> list[str]:
+    """One term per line; blank lines and `#` comments ignored."""
+
+    terms: list[str] = []
+    for line in text.splitlines():
+        term = line.strip()
+        if not term or term.startswith("#"):
+            continue
+        if "[[" in term or "]]" in term:
+            raise SafeFailure(
+                "INVALID_TERM", "A term may not contain placeholder brackets."
+            )
+        if term not in terms:
+            terms.append(term)
+    if not terms:
+        raise SafeFailure("NO_TERMS", "The term file contained no usable terms.")
+    if len(terms) > MAX_ANNOTATION_TERMS:
+        raise SafeFailure(
+            "TOO_MANY_TERMS",
+            f"A single annotation is limited to {MAX_ANNOTATION_TERMS} terms.",
+        )
+    return terms
+
+
+def _apply_mask(
+    redacted: str, mapping: dict[str, str], job_id: str, terms: Iterable[str]
+) -> tuple[str, dict[str, str], int, int, int]:
+    """Mask every occurrence of each term. Returns the new state and counts."""
+
+    shielded, sentinels = _shield_placeholders(redacted, mapping)
+    used = {
+        index
+        for placeholder in mapping
+        if (parsed := _split_namespaced(placeholder)) and parsed[0] == MANUAL_ENTITY_TYPE
+        for index in (parsed[1],)
+    }
+    counter = max(used, default=0)
+    applied = 0
+    missing = 0
+    occurrences = 0
+    # Longest first, so a term that contains a shorter one keeps its own
+    # occurrences instead of losing them to the shorter term's placeholder.
+    for term in sorted(terms, key=len, reverse=True):
+        found = shielded.count(term)
+        if not found:
+            missing += 1
+            continue
+        counter += 1
+        placeholder = f"[[PII-{job_id[:10]}-{MANUAL_ENTITY_TYPE}-{counter}]]"
+        shielded = shielded.replace(term, placeholder)
+        mapping[placeholder] = term
+        applied += 1
+        occurrences += found
+    return _replace_all(shielded, sentinels), mapping, applied, missing, occurrences
+
+
+def _apply_unmask(
+    redacted: str, mapping: dict[str, str], job_id: str, markers: Iterable[str]
+) -> tuple[str, dict[str, str], int, int]:
+    """Put the values behind the given markers back inline."""
+
+    restored = 0
+    unknown = 0
+    for marker in markers:
+        placeholder = f"[[PII-{job_id[:10]}-{marker}]]"
+        if placeholder not in mapping:
+            unknown += 1
+            continue
+        redacted = redacted.replace(placeholder, mapping[placeholder])
+        del mapping[placeholder]
+        restored += 1
+    return redacted, mapping, restored, unknown
+
+
+def _mask_worker(args: argparse.Namespace) -> None:
+    job_dir = Path(args.job_dir)
+    redacted, mapping, manifest, original = _load_job_state(job_dir, args.job_id)
+    terms = _parse_term_file(_read_utf8(Path(args.terms)))
+    redacted, mapping, applied, missing, _ = _apply_mask(
+        redacted, mapping, args.job_id, terms
+    )
+    _commit_job_state(
+        job_dir,
+        redacted,
+        mapping,
+        manifest,
+        original,
+        annotation={"action": "mask", "applied": applied, "not_found": missing},
+    )
+    _private_write(
+        Path(args.receipt_path),
+        json.dumps(
+            {"terms_masked": applied, "terms_not_found": missing}, sort_keys=True
+        ),
+    )
+
+
+def _unmask_worker(args: argparse.Namespace) -> None:
+    job_dir = Path(args.job_dir)
+    redacted, mapping, manifest, original = _load_job_state(job_dir, args.job_id)
+    requested = json.loads(args.markers_json)
+    if not isinstance(requested, list) or not all(
+        isinstance(item, str) for item in requested
+    ):
+        raise SafeFailure("INVALID_MARKERS", "Marker list is invalid.")
+    redacted, mapping, restored, unknown = _apply_unmask(
+        redacted, mapping, args.job_id, requested
+    )
+    _commit_job_state(
+        job_dir,
+        redacted,
+        mapping,
+        manifest,
+        original,
+        annotation={"action": "unmask", "restored": restored, "unknown": unknown},
+    )
+    _private_write(
+        Path(args.receipt_path),
+        json.dumps({"markers_restored": restored, "markers_unknown": unknown}, sort_keys=True),
+    )
+
+
+class _AnnotationSession:
+    """Job state plus the tallies the page shows, guarded by one lock.
+
+    Every mutation goes through `mask`/`unmask`, which persist and re-verify
+    the round trip before returning. There is no in-memory-only state to lose
+    if the browser is closed mid-edit.
+    """
+
+    def __init__(self, job_dir: Path, job_id: str) -> None:
+        self._job_dir = job_dir
+        self._job_id = job_id
+        self._lock = threading.Lock()
+        self.finished = threading.Event()
+        self.masked = 0
+        self.unmasked = 0
+        self.last_masked = 0
+        self.last_occurrences = 0
+        self._redacted, self._mapping, self._manifest, self._original = _load_job_state(
+            job_dir, job_id
+        )
+
+    def _commit(self, annotation: dict[str, object]) -> None:
+        _commit_job_state(
+            self._job_dir,
+            self._redacted,
+            self._mapping,
+            self._manifest,
+            self._original,
+            annotation=annotation,
+        )
+
+    def state(self) -> dict[str, object]:
+        with self._lock:
+            markers = {}
+            entries = []
+            for placeholder, value in self._mapping.items():
+                parsed = _split_namespaced(placeholder)
+                marker = f"{parsed[0]}-{parsed[1]}" if parsed else placeholder
+                markers[placeholder] = marker
+                entries.append({"marker": marker, "value": value})
+            entries.sort(key=lambda item: item["marker"])
+            return {
+                "redacted": self._redacted,
+                "markers": markers,
+                "entries": entries,
+                "masked": self.masked,
+                "unmasked": self.unmasked,
+                "last_masked": self.last_masked,
+                "last_occurrences": self.last_occurrences,
+            }
+
+    def mask(self, terms: list[str]) -> None:
+        cleaned = _parse_term_file("\n".join(terms))
+        with self._lock:
+            redacted, mapping, applied, _, occurrences = _apply_mask(
+                self._redacted, dict(self._mapping), self._job_id, cleaned
+            )
+            if applied:
+                self._redacted, self._mapping = redacted, mapping
+                self._commit({"action": "mask", "applied": applied, "not_found": 0})
+                self.masked += applied
+            self.last_masked = applied
+            self.last_occurrences = occurrences
+
+    def unmask(self, markers: list[str]) -> None:
+        for marker in markers:
+            if not SAFE_MARKER_SUFFIX.fullmatch(marker):
+                raise SafeFailure("INVALID_MARKERS", "Marker name is invalid.")
+        with self._lock:
+            redacted, mapping, restored, _ = _apply_unmask(
+                self._redacted, dict(self._mapping), self._job_id, markers
+            )
+            if restored:
+                self._redacted, self._mapping = redacted, mapping
+                self._commit({"action": "unmask", "restored": restored, "unknown": 0})
+                self.unmasked += restored
+
+
+def _annotation_handler(session: _AnnotationSession, token: str, port: int):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args: object) -> None:
+            # Request lines would carry nothing sensitive, but the whole point
+            # of this workflow is that this process writes no readable log.
+            return
+
+        def _authorised(self) -> str | None:
+            # Host is pinned because a name that resolves to 127.0.0.1 would
+            # otherwise let a page in another tab reach this server.
+            host = self.headers.get("Host", "")
+            if host not in {f"127.0.0.1:{port}", f"localhost:{port}"}:
+                return None
+            path = urllib.parse.urlparse(self.path).path
+            prefix = f"/{token}"
+            if not path.startswith(prefix + "/") and path != prefix:
+                return None
+            return path[len(prefix):] or "/"
+
+        def _send(self, payload: bytes, content_type: str, status: int = 200) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+                "connect-src 'self'; base-uri 'none'; form-action 'none'",
+            )
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _json(self, data: dict[str, object], status: int = 200) -> None:
+            self._send(
+                json.dumps(data, ensure_ascii=False).encode("utf-8"),
+                "application/json; charset=utf-8",
+                status,
+            )
+
+        def do_GET(self) -> None:  # noqa: N802 - stdlib naming
+            route = self._authorised()
+            if route is None:
+                self._send(b"not found", "text/plain; charset=utf-8", 404)
+                return
+            if route == "/":
+                self._send(
+                    ANNOTATION_PAGE.encode("utf-8"), "text/html; charset=utf-8"
+                )
+                return
+            if route == "/state":
+                self._json(session.state())
+                return
+            self._send(b"not found", "text/plain; charset=utf-8", 404)
+
+        def do_POST(self) -> None:  # noqa: N802 - stdlib naming
+            route = self._authorised()
+            if route is None:
+                self._send(b"not found", "text/plain; charset=utf-8", 404)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if length > MAX_INPUT_BYTES:
+                self._json({"message": "payload too large"}, 413)
+                return
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self._json({"message": "invalid request"}, 400)
+                return
+            if not isinstance(body, dict):
+                self._json({"message": "invalid request"}, 400)
+                return
+            try:
+                if route == "/mask":
+                    terms = body.get("terms")
+                    if not isinstance(terms, list) or not all(
+                        isinstance(term, str) for term in terms
+                    ):
+                        raise SafeFailure("INVALID_TERM", "Terms must be strings.")
+                    session.mask(terms)
+                elif route == "/unmask":
+                    markers = body.get("markers")
+                    if not isinstance(markers, list) or not all(
+                        isinstance(marker, str) for marker in markers
+                    ):
+                        raise SafeFailure("INVALID_MARKERS", "Markers must be strings.")
+                    session.unmask(markers)
+                elif route == "/done":
+                    session.finished.set()
+                    self._json({"ok": True})
+                    return
+                else:
+                    self._send(b"not found", "text/plain; charset=utf-8", 404)
+                    return
+            except SafeFailure as failure:
+                self._json({"message": failure.message, "code": failure.code}, 400)
+                return
+            self._json(session.state())
+
+    return Handler
+
+
+def _annotate_ui_worker(args: argparse.Namespace) -> None:
+    """Serve the annotation page on loopback and wait for the user to finish.
+
+    The token is minted here and never leaves this process except into the
+    browser this process opens. That is deliberate: the calling agent receives
+    a receipt with counts and no URL, so it has no address to fetch even though
+    it could reach the port. The rule in SKILL.md still applies, but this is
+    the part that does not depend on the rule being followed.
+    """
+
+    job_dir = Path(args.job_dir)
+    session = _AnnotationSession(job_dir, args.job_id)
+    token = secrets.token_urlsafe(32)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), None)
+    server.RequestHandlerClass = _annotation_handler(
+        session, token, server.server_address[1]
+    )
+    server.daemon_threads = True
+    port = server.server_address[1]
+    url = f"http://127.0.0.1:{port}/{token}/"
+
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        opened = webbrowser.open(url)
+        if not opened:
+            # No browser to open means the user cannot reach the page, and
+            # printing the URL here would hand it to whoever reads this
+            # process's output. Fail instead of silently waiting forever.
+            raise SafeFailure(
+                "BROWSER_UNAVAILABLE",
+                "No browser could be opened for the annotation page.",
+            )
+        if not session.finished.wait(timeout=ANNOTATE_UI_TIMEOUT_SECONDS):
+            raise SafeFailure(
+                "ANNOTATION_TIMED_OUT",
+                "The annotation page was not completed in time; edits already "
+                "made were saved.",
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    _private_write(
+        Path(args.receipt_path),
+        json.dumps(
+            {"terms_masked": session.masked, "markers_restored": session.unmasked},
+            sort_keys=True,
+        ),
+    )
+
+
+def _run_annotation(
+    args: argparse.Namespace,
+    worker_arguments: list[str],
+    *,
+    timeout: int = ANNOTATE_WORKER_TIMEOUT_SECONDS,
+) -> dict:
+    """Drive an annotation worker and return only its counts."""
+
+    root = _prepare_jobs_root(_default_jobs_root())
+    job_dir = _resolve_job_dir(root, args.job_id)
+    receipt_path = job_dir / f".annotate-receipt-{uuid.uuid4().hex}.safe.json"
+    try:
+        _run_private_worker(
+            [
+                *worker_arguments,
+                "--job-dir",
+                str(job_dir),
+                "--job-id",
+                args.job_id,
+                "--receipt-path",
+                str(receipt_path),
+            ],
+            status_path=job_dir / ".worker.safe.json",
+            timeout=timeout,
+        )
+        counts = json.loads(_read_utf8(receipt_path))
+        if not isinstance(counts, dict) or not all(
+            isinstance(value, int) for value in counts.values()
+        ):
+            raise SafeFailure("INVALID_RECEIPT", "Annotation receipt was not counts-only.")
+        for artifact in (
+            job_dir / REDACTED_NAME,
+            job_dir / PRIVATE_MAP_NAME,
+            job_dir / MANIFEST_NAME,
+        ):
+            _assert_private_file(artifact)
+        return counts
+    finally:
+        receipt_path.unlink(missing_ok=True)
+
+
+def _public_annotate(args: argparse.Namespace) -> None:
+    counts = _run_annotation(args, ["annotate"], timeout=ANNOTATE_UI_TIMEOUT_SECONDS + 60)
+    root = _prepare_jobs_root(_default_jobs_root())
+    job_dir = _resolve_job_dir(root, args.job_id)
+    manifest = json.loads(_read_utf8(job_dir / MANIFEST_NAME))
+    _emit(
+        {
+            "ok": True,
+            "job_id": args.job_id,
+            "redacted_path": str(job_dir / REDACTED_NAME),
+            "redacted_sha256": manifest["redacted_sha256"],
+            "replacement_count": manifest["replacement_count"],
+            "roundtrip_verified": True,
+            **counts,
+        }
+    )
+
+
+def _public_mask(args: argparse.Namespace) -> None:
+    root = _prepare_jobs_root(_default_jobs_root())
+    job_dir = _resolve_job_dir(root, args.job_id)
+    validated_terms = _validate_input(Path(args.terms))
+    snapshot = job_dir / f".terms-{uuid.uuid4().hex}.private.txt"
+    _snapshot_input(
+        validated_terms.path,
+        snapshot,
+        expected_device=validated_terms.device,
+        expected_inode=validated_terms.inode,
+    )
+    try:
+        counts = _run_annotation(args, ["mask", "--terms", str(snapshot)])
+    finally:
+        snapshot.unlink(missing_ok=True)
+    manifest = json.loads(_read_utf8(job_dir / MANIFEST_NAME))
+    _emit(
+        {
+            "ok": True,
+            "job_id": args.job_id,
+            "redacted_path": str(job_dir / REDACTED_NAME),
+            "redacted_sha256": manifest["redacted_sha256"],
+            "replacement_count": manifest["replacement_count"],
+            "roundtrip_verified": True,
+            **counts,
+        }
+    )
+
+
+def _public_unmask(args: argparse.Namespace) -> None:
+    for marker in args.marker:
+        if not SAFE_MARKER_SUFFIX.fullmatch(marker):
+            raise SafeFailure(
+                "INVALID_MARKERS",
+                "A marker is written as TYPE-N, exactly as it appears in the "
+                "redacted file between [[PII-<job>- and ]].",
+            )
+    counts = _run_annotation(
+        args, ["unmask", "--markers-json", json.dumps(list(args.marker))]
+    )
+    root = _prepare_jobs_root(_default_jobs_root())
+    job_dir = _resolve_job_dir(root, args.job_id)
+    manifest = json.loads(_read_utf8(job_dir / MANIFEST_NAME))
+    _emit(
+        {
+            "ok": True,
+            "job_id": args.job_id,
+            "redacted_path": str(job_dir / REDACTED_NAME),
+            "redacted_sha256": manifest["redacted_sha256"],
+            "replacement_count": manifest["replacement_count"],
+            "roundtrip_verified": True,
+            **counts,
+        }
+    )
+
+
+def _public_review(args: argparse.Namespace) -> None:
+    """Print every placeholder with the value behind it, for the human only.
+
+    Unlike every other command here, this one's output *is* the private data.
+    It is the only way a person can decide that `[[PII-...-ORG-3]]` is a court
+    name worth putting back, so it has to exist -- but an agent that ran it and
+    captured the output would have defeated the entire workflow.
+
+    Requiring a terminal is what makes that a control rather than a request: a
+    captured pipe is not a TTY, so the command refuses instead of printing. It
+    stops the accident, not a determined caller who allocates a pty; the rule
+    in SKILL.md is still the primary defence.
+    """
+
+    if not sys.stdout.isatty():
+        raise SafeFailure(
+            "REVIEW_REQUIRES_TERMINAL",
+            "This command prints unredacted values and only runs on a terminal. "
+            "Run it yourself; do not let an agent run it for you.",
+        )
+    root = _prepare_jobs_root(_default_jobs_root())
+    job_dir = _resolve_job_dir(root, args.job_id)
+    _, mapping, _, _ = _load_job_state(job_dir, args.job_id)
+
+    def sort_key(placeholder: str) -> tuple[str, int]:
+        parsed = _split_namespaced(placeholder)
+        return parsed if parsed else ("OTHER", 0)
+
+    print(f"job {args.job_id} — {len(mapping)} redactions")
+    print("Anything you unmask becomes visible to the agent. Values are private.\n")
+    for placeholder in sorted(mapping, key=sort_key):
+        parsed = _split_namespaced(placeholder)
+        marker = f"{parsed[0]}-{parsed[1]}" if parsed else placeholder
+        print(f"  {marker:<24} {mapping[placeholder]}")
+    print("\nPut one back with:")
+    print(f"  pii_safe_workflow.py unmask --job-id {args.job_id} --marker TYPE-N")
+    raise SystemExit(0)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Isolated reversible PII redaction")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1635,6 +2444,20 @@ def _build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--job-id", required=True)
     restore.add_argument("--input", required=True)
     restore.add_argument("--output", required=True)
+
+    mask = subparsers.add_parser("mask")
+    mask.add_argument("--job-id", required=True)
+    mask.add_argument("--terms", required=True)
+
+    unmask = subparsers.add_parser("unmask")
+    unmask.add_argument("--job-id", required=True)
+    unmask.add_argument("--marker", action="append", required=True)
+
+    annotate = subparsers.add_parser("annotate")
+    annotate.add_argument("--job-id", required=True)
+
+    review = subparsers.add_parser("review")
+    review.add_argument("--job-id", required=True)
 
     purge = subparsers.add_parser("purge")
     purge.add_argument("--job-id", required=True)
@@ -1657,6 +2480,23 @@ def _build_parser() -> argparse.ArgumentParser:
     worker_restore.add_argument("--job-id", required=True)
     worker_restore.add_argument("--receipt-path", required=True)
     worker_restore.add_argument("--status-path", required=True)
+    worker_mask = worker_subparsers.add_parser("mask")
+    worker_mask.add_argument("--terms", required=True)
+    worker_mask.add_argument("--job-dir", required=True)
+    worker_mask.add_argument("--job-id", required=True)
+    worker_mask.add_argument("--receipt-path", required=True)
+    worker_mask.add_argument("--status-path", required=True)
+    worker_unmask = worker_subparsers.add_parser("unmask")
+    worker_unmask.add_argument("--markers-json", required=True)
+    worker_unmask.add_argument("--job-dir", required=True)
+    worker_unmask.add_argument("--job-id", required=True)
+    worker_unmask.add_argument("--receipt-path", required=True)
+    worker_unmask.add_argument("--status-path", required=True)
+    worker_ui = worker_subparsers.add_parser("annotate")
+    worker_ui.add_argument("--job-dir", required=True)
+    worker_ui.add_argument("--job-id", required=True)
+    worker_ui.add_argument("--receipt-path", required=True)
+    worker_ui.add_argument("--status-path", required=True)
     return parser
 
 
@@ -1668,6 +2508,14 @@ def main() -> None:
             _public_redact(args)
         if args.command == "restore":
             _public_restore(args)
+        if args.command == "annotate":
+            _public_annotate(args)
+        if args.command == "mask":
+            _public_mask(args)
+        if args.command == "unmask":
+            _public_unmask(args)
+        if args.command == "review":
+            _public_review(args)
         if args.command == "purge":
             _public_purge(args)
         if args.command == "_worker" and args.worker_command == "redact":
@@ -1675,6 +2523,15 @@ def main() -> None:
             return
         if args.command == "_worker" and args.worker_command == "restore":
             _restore_worker(args)
+            return
+        if args.command == "_worker" and args.worker_command == "mask":
+            _mask_worker(args)
+            return
+        if args.command == "_worker" and args.worker_command == "unmask":
+            _unmask_worker(args)
+            return
+        if args.command == "_worker" and args.worker_command == "annotate":
+            _annotate_ui_worker(args)
             return
         raise SafeFailure("INVALID_COMMAND", "Unsupported command.")
     except SafeFailure as exc:
