@@ -1211,13 +1211,14 @@ def _redact_worker(args: argparse.Namespace) -> None:
     counters: dict[str, int] = {}
     audit_passes = 0
     audited_windows: set[str] = set()
-    # Two consecutive clean passes, not one. The local audit is not
-    # deterministic in practice: on 2026-08-20 the same penalty table came back
-    # with four employer names on one run and none on the next, and a reporter's
-    # byline was found on one run and missed on the next. A single clean pass is
-    # therefore evidence of one sample, not of a clean document; a second
-    # confirming pass is the cheapest way to stop a coin flip from deciding
-    # whether a name ships.
+    # Counts consecutive clean passes against REQUIRED_CLEAN_AUDIT_PASSES. The
+    # local audit is not deterministic in practice: on 2026-08-20 the same
+    # penalty table came back with four employer names on one run and none on
+    # the next, and a reporter's byline was found on one run and missed on the
+    # next. That is why one pass cannot be taken at face value -- but the
+    # repetition that answers it now lives inside the pass, in the
+    # AUDIT_SAMPLES_PER_CHUNK union, so the requirement here is one. Raise
+    # REQUIRED_CLEAN_AUDIT_PASSES to demand confirming passes on top of it.
     clean_streak = 0
     for audit_passes in range(1, MAX_AUDIT_PASSES + 1):
         misses = _local_alias_audit(
