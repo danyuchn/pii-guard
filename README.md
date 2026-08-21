@@ -165,6 +165,10 @@ library 端已能讀 `.docx` / `.xlsx` / `.pdf`（`formats` 相依套件）。�
 
 Phase 3 曾在 Presidio 內掛一個 Ollama recognizer（`--llm-fallback`，預設 `qwen2.5:1.5b`）。2026-08-21 移除，原因是 `pii-safe-documents` skill 用**取樣多次取聯集**的方式做本地模型稽核，在真實文件上量測有效，而舊的單次 1.5B 呼叫沒有任何語料證明它有效，卻讓使用者面對兩個看起來在做同一件事的開關。留著會讓人選錯。要在 CLI 端補回模型稽核，正確做法是把 skill 那套下沉，不是把舊的打開。
 
+## 變更紀錄
+
+見 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 參考資料
 
 - [Microsoft Presidio 官方文件](https://microsoft.github.io/presidio/)
