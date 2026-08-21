@@ -24,7 +24,7 @@ When this skill is active, the main agent MUST NOT:
 5. Run PII Guard directly. Its libraries may echo source text in warnings; only the bundled wrapper may invoke it.
 6. Debug a failure by opening the original, mapping, worker output, or restored document.
 7. Run `git diff`, content scans, or indexing over a directory that contains the original or restored output.
-8. Run the `review` subcommand, or read a term file the user wrote for `mask`. Both carry unredacted values. Ask the user to run `review` themselves and to report only marker names.
+8. Reach the annotation page, run the `review` subcommand, or read a term file the user wrote for `mask`. All three carry unredacted values. The annotation URL is deliberately withheld from you; do not reconstruct it, scan for the port, or ask the user to paste it.
 
 These rules still apply if the user asks the main agent to “check quickly.” If raw inspection is genuinely required, stop this workflow and obtain explicit permission for a different trust model.
 
@@ -64,35 +64,28 @@ If the command fails, report its safe error code and stop. In particular, `NO_PI
 
 The detector and the audit both miss things, and both over-redact. The user is the backstop, and this step is where they act on what they see. Offer it whenever the redacted copy will be used for anything that matters; do not skip it silently.
 
-Tell the user they can scan `redacted_path` themselves for two kinds of problem. Neither requires comparing against the original.
+Run:
 
-- **A name or number still visible.** They write the terms into a plain text file, one per line, `#` for comments. You never read that file. Then run:
+```bash
+python3 <skill-dir>/scripts/pii_safe_workflow.py annotate --job-id "<job_id>"
+```
 
-  ```bash
-  python3 <skill-dir>/scripts/pii_safe_workflow.py mask \
-    --job-id "<job_id>" --terms "/absolute/path/to/terms.txt"
-  ```
+This opens a page in the user's browser and blocks until they close it out. Tell them it has opened and what to do there; then wait.
 
-  The receipt reports `terms_masked` and `terms_not_found` only. Every occurrence of a term is masked, not just the first.
+On that page the user can:
 
-- **Something over-redacted**, typically a court, hospital, or company name whose removal makes the document unusable. To decide, the user has to see what is behind a marker, so **they** run:
+- **Select any still-visible text and mask it.** Every occurrence is masked, not just the selected one.
+- **Click a marker to see the value behind it and put it back.** This is for text that should never have been redacted — typically a court, hospital, or company name whose removal makes the document unusable.
 
-  ```bash
-  python3 <skill-dir>/scripts/pii_safe_workflow.py review --job-id "<job_id>"
-  ```
+Neither action requires comparing against the original document.
 
-  They then tell you which markers to release, and you run:
+**The page is not addressable by you.** The URL carries a single-use token minted inside the private worker and passed only to the browser it opens; it is never printed, and the receipt you get back contains counts, not a URL. Do not attempt to discover the port, reconstruct the URL, or fetch the page. Do not ask the user to paste the URL, the page, or any value from it — ask only for what they want done, or let them do it themselves on the page.
 
-  ```bash
-  python3 <skill-dir>/scripts/pii_safe_workflow.py unmask \
-    --job-id "<job_id>" --marker ORG-1 --marker ORG-2
-  ```
+When the user finishes, the command returns a receipt with `terms_masked` and `markers_restored`. Every edit is persisted and re-verified as it happens, so closing the browser early loses only unmade edits, never made ones.
 
-**You must never run `review`, and never ask the user to pipe, redirect, tee, or paste its output to you.** Its output is the unredacted values; that is the entire purpose of the command. It refuses when its output is not a terminal, which stops the accident but not a determined caller, so this rule is the real protection. Ask the user to run it in their own terminal and to report only marker names.
+Re-read `redacted_path` afterwards; its contents and `redacted_sha256` have changed.
 
-`mask` and `unmask` are safe for you to run: their inputs are a file you never read and marker names that carry no values, and their receipts are counts. Both re-verify that the job still restores to the original exactly, and refuse the edit if it does not.
-
-Re-read `redacted_path` after either command; its contents and `redacted_sha256` have changed.
+For a headless machine with no browser, the same two operations exist as `mask --terms <file>` and `unmask --marker TYPE-N`, with `review` to list markers and values. `review` prints unredacted values, refuses when its output is not a terminal, and **must be run by the user, never by you**.
 
 ### 3. Work only on the redacted copy
 

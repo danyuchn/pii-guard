@@ -881,5 +881,118 @@ class ManualAnnotationTests(unittest.TestCase):
                 WORKFLOW._public_review(Namespace(job_id=self.JOB_ID))
 
 
+class AnnotationServerTests(unittest.TestCase):
+    """The browser page, exercised over real HTTP without opening a browser."""
+
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        helper = ManualAnnotationTests()
+        self.job_id = helper.JOB_ID
+        self.original = helper.ORIGINAL
+        self.root, _ = helper._build_job(Path(self._directory.name))
+        self.session = WORKFLOW._AnnotationSession(self.root, self.job_id)
+        self.server = WORKFLOW.http.server.ThreadingHTTPServer(("127.0.0.1", 0), None)
+        self.port = self.server.server_address[1]
+        self.token = "test-token"
+        self.server.RequestHandlerClass = WORKFLOW._annotation_handler(
+            self.session, self.token, self.port
+        )
+        self.server.daemon_threads = True
+        thread = WORKFLOW.threading.Thread(
+            target=self.server.serve_forever, daemon=True
+        )
+        thread.start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def _request(self, route, body=None, *, token=None, host=None):
+        import http.client as client
+
+        connection = client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        headers = {"Host": host or f"127.0.0.1:{self.port}"}
+        payload = None
+        if body is not None:
+            payload = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        connection.request(
+            "POST" if body is not None else "GET",
+            f"/{token or self.token}{route}",
+            body=payload,
+            headers=headers,
+        )
+        response = connection.getresponse()
+        raw = response.read()
+        connection.close()
+        return response.status, raw
+
+    def test_page_and_state_are_served_with_the_token(self) -> None:
+        status, raw = self._request("/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"<title>", raw)
+        status, raw = self._request("/state")
+        self.assertEqual(status, 200)
+        state = json.loads(raw)
+        self.assertEqual(
+            sorted(entry["marker"] for entry in state["entries"]),
+            ["ORG-1", "PERSON-1"],
+        )
+
+    def test_a_wrong_token_gets_nothing(self) -> None:
+        status, raw = self._request("/state", token="not-the-token")
+        self.assertEqual(status, 404)
+        self.assertNotIn("李真".encode("utf-8"), raw)
+
+    def test_a_foreign_host_header_is_refused(self) -> None:
+        # A hostile page whose name resolves to loopback must not reach this.
+        status, raw = self._request("/state", host="attacker.example")
+        self.assertEqual(status, 404)
+        self.assertNotIn("李真".encode("utf-8"), raw)
+
+    def test_masking_from_the_page_covers_every_occurrence(self) -> None:
+        status, raw = self._request("/mask", {"terms": ["王小明"]})
+        self.assertEqual(status, 200)
+        state = json.loads(raw)
+        self.assertEqual(state["last_masked"], 1)
+        self.assertEqual(state["last_occurrences"], 2)
+        self.assertNotIn("王小明", state["redacted"])
+        mapping = json.loads(
+            (self.root / WORKFLOW.PRIVATE_MAP_NAME).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            WORKFLOW._replace_all(state["redacted"], mapping), self.original
+        )
+
+    def test_unmasking_from_the_page_restores_inline(self) -> None:
+        status, raw = self._request("/unmask", {"markers": ["ORG-1"]})
+        self.assertEqual(status, 200)
+        state = json.loads(raw)
+        self.assertIn("臺灣臺北地方法院", state["redacted"])
+        self.assertEqual(state["unmasked"], 1)
+
+    def test_a_term_that_is_not_present_changes_nothing(self) -> None:
+        status, raw = self._request("/mask", {"terms": ["不存在的名字"]})
+        self.assertEqual(status, 200)
+        state = json.loads(raw)
+        self.assertEqual(state["last_masked"], 0)
+        self.assertEqual(state["masked"], 0)
+
+    def test_a_malformed_marker_is_rejected(self) -> None:
+        status, raw = self._request("/unmask", {"markers": ["../../etc/passwd"]})
+        self.assertEqual(status, 400)
+        self.assertIn("INVALID_MARKERS", raw.decode("utf-8"))
+
+    def test_done_releases_the_waiting_worker(self) -> None:
+        self.assertFalse(self.session.finished.is_set())
+        status, _ = self._request("/done", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(self.session.finished.wait(timeout=2))
+
+    def test_edits_survive_a_reload_because_they_are_persisted(self) -> None:
+        self._request("/mask", {"terms": ["王小明"]})
+        reopened = WORKFLOW._AnnotationSession(self.root, self.job_id)
+        self.assertNotIn("王小明", reopened.state()["redacted"])
+
+
 if __name__ == "__main__":
     unittest.main()
