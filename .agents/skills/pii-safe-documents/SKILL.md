@@ -24,6 +24,7 @@ When this skill is active, the main agent MUST NOT:
 5. Run PII Guard directly. Its libraries may echo source text in warnings; only the bundled wrapper may invoke it.
 6. Debug a failure by opening the original, mapping, worker output, or restored document.
 7. Run `git diff`, content scans, or indexing over a directory that contains the original or restored output.
+8. Run the `review` subcommand, or read a term file the user wrote for `mask`. Both carry unredacted values. Ask the user to run `review` themselves and to report only marker names.
 
 These rules still apply if the user asks the main agent to “check quickly.” If raw inspection is genuinely required, stop this workflow and obtain explicit permission for a different trust model.
 
@@ -58,6 +59,40 @@ Repeat `--allow` as needed. The wrapper runs deterministic PII Guard detection p
 If the receipt says both `redaction_checks_passed: true` and `agent_may_read_redacted: true`, the main agent may read **only** `redacted_path`. The receipt also provides safe replacement counts, audit-pass count, and the local model name. Keep `job_id` for restoration. Never infer or probe the mapping path.
 
 If the command fails, report its safe error code and stop. In particular, `NO_PII_CONFIDENCE` means the detector found no reversible replacements and therefore withheld the copy instead of calling an unchanged file safe. `ADVERSARIAL_INPUT_REVIEW_REQUIRED` means instruction-like document text could interfere with the local model, so the wrapper refused automated release. Do not inspect hidden files or rerun lower-level commands.
+
+### 2b. Offer the user a manual pass over the redacted copy
+
+The detector and the audit both miss things, and both over-redact. The user is the backstop, and this step is where they act on what they see. Offer it whenever the redacted copy will be used for anything that matters; do not skip it silently.
+
+Tell the user they can scan `redacted_path` themselves for two kinds of problem. Neither requires comparing against the original.
+
+- **A name or number still visible.** They write the terms into a plain text file, one per line, `#` for comments. You never read that file. Then run:
+
+  ```bash
+  python3 <skill-dir>/scripts/pii_safe_workflow.py mask \
+    --job-id "<job_id>" --terms "/absolute/path/to/terms.txt"
+  ```
+
+  The receipt reports `terms_masked` and `terms_not_found` only. Every occurrence of a term is masked, not just the first.
+
+- **Something over-redacted**, typically a court, hospital, or company name whose removal makes the document unusable. To decide, the user has to see what is behind a marker, so **they** run:
+
+  ```bash
+  python3 <skill-dir>/scripts/pii_safe_workflow.py review --job-id "<job_id>"
+  ```
+
+  They then tell you which markers to release, and you run:
+
+  ```bash
+  python3 <skill-dir>/scripts/pii_safe_workflow.py unmask \
+    --job-id "<job_id>" --marker ORG-1 --marker ORG-2
+  ```
+
+**You must never run `review`, and never ask the user to pipe, redirect, tee, or paste its output to you.** Its output is the unredacted values; that is the entire purpose of the command. It refuses when its output is not a terminal, which stops the accident but not a determined caller, so this rule is the real protection. Ask the user to run it in their own terminal and to report only marker names.
+
+`mask` and `unmask` are safe for you to run: their inputs are a file you never read and marker names that carry no values, and their receipts are counts. Both re-verify that the job still restores to the original exactly, and refuse the edit if it does not.
+
+Re-read `redacted_path` after either command; its contents and `redacted_sha256` have changed.
 
 ### 3. Work only on the redacted copy
 

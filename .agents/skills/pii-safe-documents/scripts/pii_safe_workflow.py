@@ -32,6 +32,15 @@ NAMESPACED_PATTERN: Final[re.Pattern[str]] = re.compile(r"\[\[PII-[^\]\r\n]+\]\]
 # date line of essentially every Taiwanese judgment, official letter, and公告.
 BOILERPLATE_PATTERN: Final[re.Pattern[str]] = re.compile(r"中\s*華\s*民\s*國")
 SAFE_JOB_ID: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{32}$")
+# The tail of a placeholder, as a person reads it off the redacted file:
+# TYPE-N out of [[PII-<job>-TYPE-N]]. Constrained so an unmask request cannot
+# smuggle anything but a marker.
+SAFE_MARKER_SUFFIX: Final[re.Pattern[str]] = re.compile(r"^[A-Z][A-Z0-9_]*-\d{1,6}$")
+MANUAL_ENTITY_TYPE: Final[str] = "MANUAL"
+MAX_ANNOTATION_TERMS: Final[int] = 500
+# Annotation is literal string work over an already-bounded document, with no
+# model in the loop; a minute is generous.
+ANNOTATE_WORKER_TIMEOUT_SECONDS: Final[int] = 60
 DEFAULT_MODEL: Final[str] = "qwen3.6:35b-a3b"
 DEFAULT_OLLAMA_URL: Final[str] = "http://127.0.0.1:11434"
 PRIVATE_MAP_NAME: Final[str] = "mapping.private.json"
@@ -1621,6 +1630,361 @@ def _public_purge(args: argparse.Namespace) -> None:
     _emit({"ok": True, "job_id": args.job_id, "purged": True})
 
 
+def _split_namespaced(placeholder: str) -> tuple[str, int] | None:
+    """Split `[[PII-<job>-<TYPE>-<n>]]` into its type and index."""
+
+    match = re.fullmatch(r"\[\[PII-[^-\]]+-(.+)-(\d+)\]\]", placeholder)
+    if match is None:
+        return None
+    return match.group(1), int(match.group(2))
+
+
+def _shield_placeholders(text: str, mapping: dict[str, str]) -> tuple[str, dict[str, str]]:
+    """Hide existing placeholders behind sentinels before a literal edit.
+
+    A manually supplied term is matched literally against the whole document,
+    and placeholders are part of that document. Without this, masking the term
+    `PII` would eat into every `[[PII-...]]` marker and destroy the mapping.
+    The sentinel carries no characters a user could plausibly type.
+    """
+
+    shielded = text
+    sentinels: dict[str, str] = {}
+    for index, placeholder in enumerate(sorted(mapping, key=len, reverse=True)):
+        sentinel = f"\x00SHIELD{index}\x00"
+        sentinels[sentinel] = placeholder
+        shielded = shielded.replace(placeholder, sentinel)
+    return shielded, sentinels
+
+
+def _load_job_state(job_dir: Path, job_id: str) -> tuple[str, dict[str, str], dict, str]:
+    """Read a job's redacted text, mapping, manifest and original document.
+
+    The original is re-read from the path the job recorded, and its digest is
+    checked, because every edit below has to prove it still round-trips. A
+    manual annotation that quietly broke restoration would be worse than the
+    leak it was correcting.
+    """
+
+    manifest = json.loads(_read_utf8(job_dir / MANIFEST_NAME))
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("kind") != "pii-safe-documents-private-job"
+        or manifest.get("job_id") != job_id
+    ):
+        raise SafeFailure("INVALID_JOB", "Private job provenance check failed.")
+    redacted = _read_utf8(job_dir / REDACTED_NAME)
+    mapping_data = json.loads(_read_utf8(job_dir / PRIVATE_MAP_NAME))
+    if not isinstance(mapping_data, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in mapping_data.items()
+    ):
+        raise SafeFailure("INVALID_MAPPING", "Private mapping is invalid.")
+    original_path = Path(str(manifest.get("original_path", "")))
+    if not original_path.is_file():
+        raise SafeFailure(
+            "ORIGINAL_UNAVAILABLE",
+            "The original document is no longer at the path this job recorded, "
+            "so an annotation cannot be proven reversible.",
+        )
+    original = _read_utf8(original_path)
+    if hashlib.sha256(original.encode("utf-8")).hexdigest() != manifest.get("original_sha256"):
+        raise SafeFailure(
+            "ORIGINAL_CHANGED",
+            "The original document changed since redaction; refusing to annotate.",
+        )
+    return redacted, dict(mapping_data), manifest, original
+
+
+def _commit_job_state(
+    job_dir: Path,
+    redacted: str,
+    mapping: dict[str, str],
+    manifest: dict,
+    original: str,
+    *,
+    annotation: dict[str, object],
+) -> None:
+    """Verify the edited job still restores exactly, then persist it."""
+
+    markers = set(NAMESPACED_PATTERN.findall(redacted))
+    if not markers.issuperset(mapping):
+        raise SafeFailure(
+            "INVALID_MAPPING", "A mapping entry has no corresponding marker after annotation."
+        )
+    if _replace_all(redacted, mapping) != original:
+        raise SafeFailure(
+            "ROUNDTRIP_INTEGRITY_FAILED",
+            "The annotated document no longer reproduces the original input.",
+        )
+
+    redacted_path = job_dir / REDACTED_NAME
+    mapping_path = job_dir / PRIVATE_MAP_NAME
+    redacted_path.unlink(missing_ok=True)
+    mapping_path.unlink(missing_ok=True)
+    _private_write(redacted_path, redacted)
+    _private_write(mapping_path, json.dumps(mapping, ensure_ascii=False, sort_keys=True))
+
+    entity_counts: dict[str, int] = {}
+    for placeholder in mapping:
+        parsed = _split_namespaced(placeholder)
+        entity_type = parsed[0] if parsed else "OTHER"
+        entity_counts[entity_type] = entity_counts.get(entity_type, 0) + 1
+    history = list(manifest.get("manual_annotations", []))
+    history.append(annotation)
+    manifest.update(
+        {
+            "replacement_count": len(mapping),
+            "entity_counts": entity_counts,
+            "redacted_sha256": _sha256(redacted_path),
+            "placeholder_counts": {
+                placeholder: redacted.count(placeholder) for placeholder in mapping
+            },
+            "placeholder_sequence": [
+                placeholder
+                for placeholder in NAMESPACED_PATTERN.findall(redacted)
+                if placeholder in mapping
+            ],
+            "manual_annotations": history,
+        }
+    )
+    manifest_path = job_dir / MANIFEST_NAME
+    manifest_path.unlink(missing_ok=True)
+    _private_write(manifest_path, json.dumps(manifest, sort_keys=True))
+
+
+def _parse_term_file(text: str) -> list[str]:
+    """One term per line; blank lines and `#` comments ignored."""
+
+    terms: list[str] = []
+    for line in text.splitlines():
+        term = line.strip()
+        if not term or term.startswith("#"):
+            continue
+        if "[[" in term or "]]" in term:
+            raise SafeFailure(
+                "INVALID_TERM", "A term may not contain placeholder brackets."
+            )
+        if term not in terms:
+            terms.append(term)
+    if not terms:
+        raise SafeFailure("NO_TERMS", "The term file contained no usable terms.")
+    if len(terms) > MAX_ANNOTATION_TERMS:
+        raise SafeFailure(
+            "TOO_MANY_TERMS",
+            f"A single annotation is limited to {MAX_ANNOTATION_TERMS} terms.",
+        )
+    return terms
+
+
+def _mask_worker(args: argparse.Namespace) -> None:
+    job_dir = Path(args.job_dir)
+    redacted, mapping, manifest, original = _load_job_state(job_dir, args.job_id)
+    terms = _parse_term_file(_read_utf8(Path(args.terms)))
+
+    shielded, sentinels = _shield_placeholders(redacted, mapping)
+    used = {
+        index
+        for placeholder in mapping
+        if (parsed := _split_namespaced(placeholder)) and parsed[0] == MANUAL_ENTITY_TYPE
+        for index in (parsed[1],)
+    }
+    counter = max(used, default=0)
+    applied = 0
+    missing = 0
+    # Longest first, so a term that contains a shorter one keeps its own
+    # occurrences instead of losing them to the shorter term's placeholder.
+    for term in sorted(terms, key=len, reverse=True):
+        if term not in shielded:
+            missing += 1
+            continue
+        counter += 1
+        placeholder = f"[[PII-{args.job_id[:10]}-{MANUAL_ENTITY_TYPE}-{counter}]]"
+        shielded = shielded.replace(term, placeholder)
+        mapping[placeholder] = term
+        applied += 1
+    redacted = _replace_all(shielded, sentinels)
+
+    _commit_job_state(
+        job_dir,
+        redacted,
+        mapping,
+        manifest,
+        original,
+        annotation={"action": "mask", "applied": applied, "not_found": missing},
+    )
+    _private_write(
+        Path(args.receipt_path),
+        json.dumps(
+            {"terms_masked": applied, "terms_not_found": missing}, sort_keys=True
+        ),
+    )
+
+
+def _unmask_worker(args: argparse.Namespace) -> None:
+    job_dir = Path(args.job_dir)
+    redacted, mapping, manifest, original = _load_job_state(job_dir, args.job_id)
+    requested = json.loads(args.markers_json)
+    if not isinstance(requested, list) or not all(
+        isinstance(item, str) for item in requested
+    ):
+        raise SafeFailure("INVALID_MARKERS", "Marker list is invalid.")
+
+    restored = 0
+    unknown = 0
+    for marker in requested:
+        placeholder = f"[[PII-{args.job_id[:10]}-{marker}]]"
+        if placeholder not in mapping:
+            unknown += 1
+            continue
+        redacted = redacted.replace(placeholder, mapping[placeholder])
+        del mapping[placeholder]
+        restored += 1
+
+    _commit_job_state(
+        job_dir,
+        redacted,
+        mapping,
+        manifest,
+        original,
+        annotation={"action": "unmask", "restored": restored, "unknown": unknown},
+    )
+    _private_write(
+        Path(args.receipt_path),
+        json.dumps({"markers_restored": restored, "markers_unknown": unknown}, sort_keys=True),
+    )
+
+
+def _run_annotation(args: argparse.Namespace, worker_arguments: list[str]) -> dict:
+    """Drive an annotation worker and return only its counts."""
+
+    root = _prepare_jobs_root(_default_jobs_root())
+    job_dir = _resolve_job_dir(root, args.job_id)
+    receipt_path = job_dir / f".annotate-receipt-{uuid.uuid4().hex}.safe.json"
+    try:
+        _run_private_worker(
+            [
+                *worker_arguments,
+                "--job-dir",
+                str(job_dir),
+                "--job-id",
+                args.job_id,
+                "--receipt-path",
+                str(receipt_path),
+            ],
+            status_path=job_dir / ".worker.safe.json",
+            timeout=ANNOTATE_WORKER_TIMEOUT_SECONDS,
+        )
+        counts = json.loads(_read_utf8(receipt_path))
+        if not isinstance(counts, dict) or not all(
+            isinstance(value, int) for value in counts.values()
+        ):
+            raise SafeFailure("INVALID_RECEIPT", "Annotation receipt was not counts-only.")
+        for artifact in (
+            job_dir / REDACTED_NAME,
+            job_dir / PRIVATE_MAP_NAME,
+            job_dir / MANIFEST_NAME,
+        ):
+            _assert_private_file(artifact)
+        return counts
+    finally:
+        receipt_path.unlink(missing_ok=True)
+
+
+def _public_mask(args: argparse.Namespace) -> None:
+    root = _prepare_jobs_root(_default_jobs_root())
+    job_dir = _resolve_job_dir(root, args.job_id)
+    validated_terms = _validate_input(Path(args.terms))
+    snapshot = job_dir / f".terms-{uuid.uuid4().hex}.private.txt"
+    _snapshot_input(
+        validated_terms.path,
+        snapshot,
+        expected_device=validated_terms.device,
+        expected_inode=validated_terms.inode,
+    )
+    try:
+        counts = _run_annotation(args, ["mask", "--terms", str(snapshot)])
+    finally:
+        snapshot.unlink(missing_ok=True)
+    manifest = json.loads(_read_utf8(job_dir / MANIFEST_NAME))
+    _emit(
+        {
+            "ok": True,
+            "job_id": args.job_id,
+            "redacted_path": str(job_dir / REDACTED_NAME),
+            "redacted_sha256": manifest["redacted_sha256"],
+            "replacement_count": manifest["replacement_count"],
+            "roundtrip_verified": True,
+            **counts,
+        }
+    )
+
+
+def _public_unmask(args: argparse.Namespace) -> None:
+    for marker in args.marker:
+        if not SAFE_MARKER_SUFFIX.fullmatch(marker):
+            raise SafeFailure(
+                "INVALID_MARKERS",
+                "A marker is written as TYPE-N, exactly as it appears in the "
+                "redacted file between [[PII-<job>- and ]].",
+            )
+    counts = _run_annotation(
+        args, ["unmask", "--markers-json", json.dumps(list(args.marker))]
+    )
+    root = _prepare_jobs_root(_default_jobs_root())
+    job_dir = _resolve_job_dir(root, args.job_id)
+    manifest = json.loads(_read_utf8(job_dir / MANIFEST_NAME))
+    _emit(
+        {
+            "ok": True,
+            "job_id": args.job_id,
+            "redacted_path": str(job_dir / REDACTED_NAME),
+            "redacted_sha256": manifest["redacted_sha256"],
+            "replacement_count": manifest["replacement_count"],
+            "roundtrip_verified": True,
+            **counts,
+        }
+    )
+
+
+def _public_review(args: argparse.Namespace) -> None:
+    """Print every placeholder with the value behind it, for the human only.
+
+    Unlike every other command here, this one's output *is* the private data.
+    It is the only way a person can decide that `[[PII-...-ORG-3]]` is a court
+    name worth putting back, so it has to exist -- but an agent that ran it and
+    captured the output would have defeated the entire workflow.
+
+    Requiring a terminal is what makes that a control rather than a request: a
+    captured pipe is not a TTY, so the command refuses instead of printing. It
+    stops the accident, not a determined caller who allocates a pty; the rule
+    in SKILL.md is still the primary defence.
+    """
+
+    if not sys.stdout.isatty():
+        raise SafeFailure(
+            "REVIEW_REQUIRES_TERMINAL",
+            "This command prints unredacted values and only runs on a terminal. "
+            "Run it yourself; do not let an agent run it for you.",
+        )
+    root = _prepare_jobs_root(_default_jobs_root())
+    job_dir = _resolve_job_dir(root, args.job_id)
+    _, mapping, _, _ = _load_job_state(job_dir, args.job_id)
+
+    def sort_key(placeholder: str) -> tuple[str, int]:
+        parsed = _split_namespaced(placeholder)
+        return parsed if parsed else ("OTHER", 0)
+
+    print(f"job {args.job_id} — {len(mapping)} redactions")
+    print("Anything you unmask becomes visible to the agent. Values are private.\n")
+    for placeholder in sorted(mapping, key=sort_key):
+        parsed = _split_namespaced(placeholder)
+        marker = f"{parsed[0]}-{parsed[1]}" if parsed else placeholder
+        print(f"  {marker:<24} {mapping[placeholder]}")
+    print("\nPut one back with:")
+    print(f"  pii_safe_workflow.py unmask --job-id {args.job_id} --marker TYPE-N")
+    raise SystemExit(0)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Isolated reversible PII redaction")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1635,6 +1999,17 @@ def _build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--job-id", required=True)
     restore.add_argument("--input", required=True)
     restore.add_argument("--output", required=True)
+
+    mask = subparsers.add_parser("mask")
+    mask.add_argument("--job-id", required=True)
+    mask.add_argument("--terms", required=True)
+
+    unmask = subparsers.add_parser("unmask")
+    unmask.add_argument("--job-id", required=True)
+    unmask.add_argument("--marker", action="append", required=True)
+
+    review = subparsers.add_parser("review")
+    review.add_argument("--job-id", required=True)
 
     purge = subparsers.add_parser("purge")
     purge.add_argument("--job-id", required=True)
@@ -1657,6 +2032,18 @@ def _build_parser() -> argparse.ArgumentParser:
     worker_restore.add_argument("--job-id", required=True)
     worker_restore.add_argument("--receipt-path", required=True)
     worker_restore.add_argument("--status-path", required=True)
+    worker_mask = worker_subparsers.add_parser("mask")
+    worker_mask.add_argument("--terms", required=True)
+    worker_mask.add_argument("--job-dir", required=True)
+    worker_mask.add_argument("--job-id", required=True)
+    worker_mask.add_argument("--receipt-path", required=True)
+    worker_mask.add_argument("--status-path", required=True)
+    worker_unmask = worker_subparsers.add_parser("unmask")
+    worker_unmask.add_argument("--markers-json", required=True)
+    worker_unmask.add_argument("--job-dir", required=True)
+    worker_unmask.add_argument("--job-id", required=True)
+    worker_unmask.add_argument("--receipt-path", required=True)
+    worker_unmask.add_argument("--status-path", required=True)
     return parser
 
 
@@ -1668,6 +2055,12 @@ def main() -> None:
             _public_redact(args)
         if args.command == "restore":
             _public_restore(args)
+        if args.command == "mask":
+            _public_mask(args)
+        if args.command == "unmask":
+            _public_unmask(args)
+        if args.command == "review":
+            _public_review(args)
         if args.command == "purge":
             _public_purge(args)
         if args.command == "_worker" and args.worker_command == "redact":
@@ -1675,6 +2068,12 @@ def main() -> None:
             return
         if args.command == "_worker" and args.worker_command == "restore":
             _restore_worker(args)
+            return
+        if args.command == "_worker" and args.worker_command == "mask":
+            _mask_worker(args)
+            return
+        if args.command == "_worker" and args.worker_command == "unmask":
+            _unmask_worker(args)
             return
         raise SafeFailure("INVALID_COMMAND", "Unsupported command.")
     except SafeFailure as exc:
