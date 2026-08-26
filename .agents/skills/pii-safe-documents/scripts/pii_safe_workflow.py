@@ -14,11 +14,13 @@ import pwd
 import re
 import secrets
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
 import uuid
 import webbrowser
@@ -386,6 +388,28 @@ def _verify_local_ollama_listener() -> None:
         )
 
 
+def _exit_if_orphaned(poll_seconds: float = 5.0) -> None:
+    """Terminate this worker once its parent is gone.
+
+    Covers the case the parent-side signal handlers cannot: SIGKILL of the
+    parent, or the terminal going away. Without this, a killed parent leaves a
+    worker holding Ollama connections for up to REDACT_WORKER_TIMEOUT_SECONDS.
+    Started as a daemon thread so it never keeps a healthy worker alive.
+    """
+    original_parent = os.getppid()
+
+    def watch() -> None:
+        while True:
+            time.sleep(poll_seconds)
+            current = os.getppid()
+            if current != original_parent or current == 1:
+                # Hard exit: the parent that owns the private job directory is
+                # gone, so there is nobody left to read a status file.
+                os._exit(1)
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
 def _run_private_worker(arguments: list[str], *, status_path: Path, timeout: int) -> None:
     command = [
         sys.executable,
@@ -395,18 +419,65 @@ def _run_private_worker(arguments: list[str], *, status_path: Path, timeout: int
         "--status-path",
         str(status_path),
     ]
+    # 2026-08-26: the child used to be spawned with subprocess.run(), which
+    # reaps the child on timeout but not when the PARENT is signalled. A redact
+    # pass can legitimately run for minutes with no output, so the very first
+    # thing a new user does is kill it -- and that orphaned a worker that kept
+    # three connections open to Ollama for up to REDACT_WORKER_TIMEOUT_SECONDS
+    # (90 minutes), wedging the server in "Stopping..." so every later run
+    # crawled. Observed 2026-08-26: an orphan survived 31 minutes and the
+    # server recovered the instant it was killed.
+    # Popen + a signal-handling wait lets SIGTERM/SIGINT take the child with it.
+    # The worker also self-terminates when it notices it has been orphaned
+    # (see _exit_if_orphaned), which covers SIGKILL of the parent.
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=_minimal_worker_environment(),
+    )
+
+    def _terminate_child() -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
+
+    def _on_signal(signum, _frame):  # noqa: ANN001 - stdlib signature
+        _terminate_child()
+        raise SystemExit(128 + signum)
+
+    previous_handlers: dict[int, object] = {}
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            previous_handlers[signum] = signal.signal(signum, _on_signal)
+        except (ValueError, OSError):
+            # Not on the main thread, or the platform refuses this signal.
+            pass
     try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=timeout,
-            env=_minimal_worker_environment(),
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise SafeFailure("LOCAL_PROCESS_TIMEOUT", "Local redaction process timed out.") from exc
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            _terminate_child()
+            raise SafeFailure(
+                "LOCAL_PROCESS_TIMEOUT", "Local redaction process timed out."
+            ) from exc
+        except BaseException:
+            # KeyboardInterrupt included: never leave the worker running.
+            _terminate_child()
+            raise
+    finally:
+        for signum, handler in previous_handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError):
+                pass
+    completed = subprocess.CompletedProcess(command, returncode)
     if completed.returncode != 0:
         # Deliberately discard both streams: dependencies can echo source text.
         try:
@@ -2518,6 +2589,8 @@ def main() -> None:
             _public_review(args)
         if args.command == "purge":
             _public_purge(args)
+        if args.command == "_worker":
+            _exit_if_orphaned()
         if args.command == "_worker" and args.worker_command == "redact":
             _redact_worker(args)
             return

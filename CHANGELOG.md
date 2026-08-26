@@ -3,6 +3,24 @@
 本檔案記錄對使用者可見的變更。格式參考 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)，
 版號依 [Semantic Versioning](https://semver.org/lang/zh-TW/)。
 
+## [未發布]
+
+### 修正
+
+- **被中斷的 `redact` 不再留下佔住模型的孤兒行程。** wrapper 原本用
+  `subprocess.run()` 起私有 worker：逾時會回收子行程，但**父行程自己被砍時不會**。
+  一次 `redact` 會安靜跑上好幾分鐘，所以「按耐不住把它砍掉」是新使用者最可能做的事——
+  而那會留下一個看不見的 worker，最長可以再跑 90 分鐘
+  （`REDACT_WORKER_TIMEOUT_SECONDS`），期間握著三條到 Ollama 的連線，
+  把伺服器卡在 `Stopping...`，之後每一次執行都變慢。
+  2026-08-26 實測：一個孤兒活了 31 分鐘，同一份文件原本 3 分 37 秒跑完的變成 16 分鐘，
+  砍掉孤兒後 Ollama 立刻恢復。
+
+  修法兩層：父行程改用 `Popen` 並在 `SIGTERM`／`SIGINT`／`SIGHUP` 與任何例外路徑上
+  終止子行程；worker 自己另有一條看門狗執行緒，發現被收養（`getppid()` 變了或變成 1）
+  就直接退出，這一層擋的是父行程被 `SIGKILL` 的情況。
+  兩條路徑都有測試，且已反向驗證——把修復拿掉，測試會失敗。
+
 ## [0.2.0] — 2026-08-21
 
 第一個「別人可以拿去用」的版本。此前 skill 的實際開發副本住在作者的私人目錄，

@@ -3,6 +3,9 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import json
+import time
+import subprocess
+import os
 import stat
 import sys
 import tempfile
@@ -992,6 +995,71 @@ class AnnotationServerTests(unittest.TestCase):
         self._request("/mask", {"terms": ["王小明"]})
         reopened = WORKFLOW._AnnotationSession(self.root, self.job_id)
         self.assertNotIn("王小明", reopened.state()["redacted"])
+
+
+class TestWorkerIsNotOrphaned(unittest.TestCase):
+    """A killed parent must not leave a worker holding the local model.
+
+    2026-08-26: killing a redact parent left a worker alive for 31 minutes with
+    three open Ollama connections, wedging the server in "Stopping..." so every
+    later run crawled (a 3m37s document took 16m). A redact pass runs for
+    minutes with no output, so killing it is the first thing a new user does --
+    this path is normal use, not an edge case.
+    """
+
+    def _spawn_sleeping_worker(self) -> subprocess.Popen:
+        """A stand-in parent that spawns a long-lived child and then waits.
+
+        Uses the real _exit_if_orphaned so the watchdog itself is under test.
+        """
+        script = (
+            "import subprocess, sys, time\n"
+            f"sys.path.insert(0, {str(Path(WORKFLOW.__file__).parent)!r})\n"
+            "child = subprocess.Popen([sys.executable, '-c',\n"
+            "    'import sys, time; sys.path.insert(0, %r);'\n"
+            "    'import pii_safe_workflow as w; w._exit_if_orphaned(0.2);'\n"
+            "    'time.sleep(120)' % "
+            f"{str(Path(WORKFLOW.__file__).parent)!r}])\n"
+            "print(child.pid, flush=True)\n"
+            "time.sleep(120)\n"
+        )
+        parent = subprocess.Popen(
+            [sys.executable, "-c", script], stdout=subprocess.PIPE
+        )
+        assert parent.stdout is not None
+        child_pid = int(parent.stdout.readline().decode().strip())
+        self.child_pid = child_pid
+        return parent
+
+    @staticmethod
+    def _alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+    def _wait_for_exit(self, pid: int, timeout: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self._alive(pid):
+                return True
+            time.sleep(0.2)
+        return not self._alive(pid)
+
+    def test_worker_exits_when_its_parent_is_killed(self) -> None:
+        parent = self._spawn_sleeping_worker()
+        try:
+            self.assertTrue(self._alive(self.child_pid))
+            parent.kill()  # SIGKILL: the parent runs no cleanup at all
+            parent.wait(timeout=10)
+            self.assertTrue(
+                self._wait_for_exit(self.child_pid),
+                "worker survived its parent -- it would hold Ollama for 90 minutes",
+            )
+        finally:
+            if self._alive(self.child_pid):
+                os.kill(self.child_pid, 9)
 
 
 if __name__ == "__main__":
