@@ -1697,16 +1697,66 @@ def _public_restore(args: argparse.Namespace) -> None:
     )
 
 
+# A job directory holds either the three finished artefacts or the dot-prefixed
+# working files the private worker writes as it goes. Nothing else belongs
+# there, so this is the whole allowed set -- and purge refuses any directory
+# holding something outside it rather than removing a tree it does not
+# recognise.
+_PURGEABLE_FINAL_NAMES: Final[frozenset[str]] = frozenset(
+    {MANIFEST_NAME, PRIVATE_MAP_NAME, REDACTED_NAME}
+)
+_PURGEABLE_WORKING_FILE: Final[re.Pattern[str]] = re.compile(
+    r"^\.[A-Za-z0-9._-]+\.(?:private\.txt|private\.json|safe\.json)$"
+)
+
+
+def _purgeable_leftovers_only(job_dir: Path) -> bool:
+    """True when every entry is a file this skill is known to write."""
+    for entry in job_dir.iterdir():
+        if not entry.is_file() or entry.is_symlink():
+            return False
+        if entry.name in _PURGEABLE_FINAL_NAMES:
+            continue
+        if _PURGEABLE_WORKING_FILE.fullmatch(entry.name):
+            continue
+        return False
+    return True
+
+
 def _public_purge(args: argparse.Namespace) -> None:
     root = _prepare_jobs_root(_default_jobs_root())
     job_dir = _resolve_job_dir(root, args.job_id)
-    manifest = json.loads(_read_utf8(job_dir / MANIFEST_NAME))
-    if not isinstance(manifest, dict) or manifest.get("kind") != "pii-safe-documents-private-job":
-        raise SafeFailure("INVALID_JOB", "Private job provenance check failed.")
-    if manifest.get("job_id") != args.job_id:
-        raise SafeFailure("INVALID_JOB", "Private job identity check failed.")
+    manifest_path = job_dir / MANIFEST_NAME
+    if manifest_path.exists():
+        manifest = json.loads(_read_utf8(manifest_path))
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("kind") != "pii-safe-documents-private-job"
+        ):
+            raise SafeFailure("INVALID_JOB", "Private job provenance check failed.")
+        if manifest.get("job_id") != args.job_id:
+            raise SafeFailure("INVALID_JOB", "Private job identity check failed.")
+        shutil.rmtree(job_dir)
+        _emit({"ok": True, "job_id": args.job_id, "purged": True})
+        return
+
+    # 2026-08-26: a redact that dies before it writes its manifest -- killed,
+    # timed out, or failed an audit -- leaves the worker's .source.private.txt
+    # (the complete original) and .mapping.private.json behind, and purge used
+    # to fail on exactly those directories because it read the manifest first.
+    # The documented way to clean up therefore could not remove the one kind of
+    # residue that matters most. Found with 11 such directories sitting in a
+    # jobs root, the oldest six days old.
+    # Provenance cannot come from a manifest that was never written, so it comes
+    # from the layout instead: the directory is inside the jobs root, its name
+    # is a valid job id, and it holds nothing but files this skill writes.
+    if not _purgeable_leftovers_only(job_dir):
+        raise SafeFailure(
+            "INVALID_JOB",
+            "Private job has no manifest and holds unrecognised files; not removing it.",
+        )
     shutil.rmtree(job_dir)
-    _emit({"ok": True, "job_id": args.job_id, "purged": True})
+    _emit({"ok": True, "job_id": args.job_id, "purged": True, "incomplete_job": True})
 
 
 ANNOTATION_PAGE: Final[str] = """<!doctype html>

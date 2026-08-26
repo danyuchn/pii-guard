@@ -4,6 +4,7 @@ import importlib.util
 import hashlib
 import json
 import time
+import shutil
 import subprocess
 import os
 import stat
@@ -995,6 +996,55 @@ class AnnotationServerTests(unittest.TestCase):
         self._request("/mask", {"terms": ["王小明"]})
         reopened = WORKFLOW._AnnotationSession(self.root, self.job_id)
         self.assertNotIn("王小明", reopened.state()["redacted"])
+
+
+class TestPurgeRemovesAbortedJobs(unittest.TestCase):
+    """purge must clean up after a redact that died before writing a manifest.
+
+    2026-08-26: a killed or failed redact leaves .source.private.txt (the whole
+    original) and .mapping.private.json in the job directory, and purge read the
+    manifest first -- so the documented cleanup path could not remove the one
+    kind of residue that matters most. Eleven such directories were found in a
+    real jobs root, the oldest six days old.
+    """
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.jobs = self.root / "jobs"
+        self.jobs.mkdir(mode=0o700)
+        self.job_id = "a" * 32
+        self.job_dir = self.jobs / self.job_id
+        self.job_dir.mkdir(mode=0o700)
+
+    def _purge(self) -> None:
+        # _emit ends a successful public command with SystemExit(0) by design.
+        with patch.object(WORKFLOW, "_default_jobs_root", return_value=self.jobs):
+            with self.assertRaises(SystemExit) as exited:
+                WORKFLOW._public_purge(Namespace(job_id=self.job_id))
+        self.assertEqual(exited.exception.code, 0)
+
+    def _purge_expecting_refusal(self) -> WORKFLOW.SafeFailure:
+        with patch.object(WORKFLOW, "_default_jobs_root", return_value=self.jobs):
+            with self.assertRaises(WORKFLOW.SafeFailure) as caught:
+                WORKFLOW._public_purge(Namespace(job_id=self.job_id))
+        return caught.exception
+
+    def test_aborted_job_with_no_manifest_is_removed(self) -> None:
+        (self.job_dir / ".source.private.txt").write_text("原文", encoding="utf-8")
+        (self.job_dir / ".mapping.private.json").write_text("{}", encoding="utf-8")
+        (self.job_dir / ".redacted.private.txt").write_text("x", encoding="utf-8")
+        self._purge()
+        self.assertFalse(
+            self.job_dir.exists(),
+            "an aborted job kept the original document on disk forever",
+        )
+
+    def test_a_directory_holding_a_foreign_file_is_refused(self) -> None:
+        (self.job_dir / ".source.private.txt").write_text("原文", encoding="utf-8")
+        (self.job_dir / "NOT_OURS.txt").write_text("x", encoding="utf-8")
+        self.assertEqual(self._purge_expecting_refusal().code, "INVALID_JOB")
+        self.assertTrue(self.job_dir.exists())
 
 
 class TestWorkerIsNotOrphaned(unittest.TestCase):
