@@ -6,6 +6,8 @@
 
 **English summary** — Reversible PII de-identification for Traditional Chinese (Taiwan) documents.
 
+核心去識別化不需要啟動 Ollama。它可以先用本機的規則與中文辨識模型快速產出去識別化副本，再由使用者在本機網頁介面補遮漏網資料或放回誤遮內容。需要更高召回率時，才選擇加入 Ollama 的本地稽核。
+
 Most tools that strip PII before an LLM call are network gateways ([LiteLLM + Presidio](https://www.litellm.ai/), [PrivAiTe](https://github.com/crp4222/PrivAiTe), [AI Security Gateway](https://github.com/aisecuritygateway/aisecuritygateway)) and they work well. None of them handle Taiwanese PII: national ID and ARC numbers, 統一編號 business IDs, local phone formats, or Traditional Chinese personal and organisation names — which need CKIP's Chinese NER rather than an English model with the locale switched.
 
 This fills that gap, and differs in one more way: it produces a **redacted file you can keep and hand to someone**, not a per-request proxy. Detection is Presidio + CKIP BERT + Taiwan regex; substitution and restoration are plain code, so restoration is exact. A bundled Claude Code skill runs the whole thing without letting the cloud agent read the original.
@@ -76,7 +78,9 @@ Everything below is in Traditional Chinese. Start at [安裝](#安裝).
 
 ## 還在做的事
 
-商用 agent 的越權跟隔離問題我還在研究，未來考慮走 proxy 配置。批量文檔處理與多格式文檔處理也是接下來努力的方向。
+下一步不是另做一套 gateway，而是把現有的人工補標頁擴成完整的本機網頁入口：選檔、選擇快速或加強模式、快審、再下載去識別化結果。CLI、商用 AI skill 與網頁介面會共用同一套私有工作目錄、對照表與還原邏輯；商用 AI 仍只讀取去識別化副本，不會讀到原文或對照表。
+
+PDF 會提早支援文字抽取後的網頁快審，但要能保留原 PDF 版面並輸出去識別化 PDF，仍是後期工作。
 
 歡迎有興趣協作者一起試用，也歡迎所有的提意見跟 PR。
 
@@ -199,11 +203,33 @@ skill 的稽核層開啟推理並對每個視窗取樣三次，**單份文件實
 - [x] 評估語料與 precision/recall 框架
 - [x] `pii-safe-documents` skill（主 agent 隔離的可逆去識別化）
 - [x] 人工補標介面（localhost 網頁）
-- [ ] **效能**：先用決定性規則篩出可疑段落再送模型，讓批量可行
-- [ ] **更多文件類型**：library 端已能讀 docx/xlsx/pdf，卡在 skill 端——解析套件可能在警告訊息中回吐原文，需移進私有行程並驗證
-- [ ] **可公開的準確率**：需另建一份可公開語料才能報真實文件上的數字
-- [ ] **工作目錄保留期限**：`~/.local/share/pii-safe-documents/jobs/` 目前只有手動 `purge`，沒有自動清理。長期使用會累積大量含真實對照表的目錄。
+
+### 第一階段：快速模式與完整本機網頁入口
+
+- [ ] **快速模式**：不啟動 Ollama，使用規則與中文辨識模型做可逆去識別化。
+- [ ] **完整網頁入口**：把既有人工補標頁擴成選檔、選模式、快審與下載的一頁式本機流程。
+- [ ] **共用核心**：CLI、商用 AI skill 與網頁介面共用同一套工作目錄、私有對照表、去識別化與還原邏輯。
+- [ ] **JSON 與 HTML 邊界**：一般 JSON 只含去識別化文字、代號與工作編號；私有對照表只留在本機，HTML 僅用於本機快審且不嵌入真實個資。
+- [ ] **效能基準**：在固定中文文字檔與指定電腦上，分別量測首次啟動與後續處理；快速模式須通過完整還原驗證後，才主打速度。
+- [ ] **手動清除**：在網頁介面提供清楚的私有工作目錄與對照表刪除操作，不設定自動到期。
+
+### 第二階段：PDF 快審
+
+- [ ] **PDF 文字快審**：抽取 PDF 文字後在本機 HTML 介面審閱，輸出去識別化文字或 HTML。
+- [ ] **格式說明**：明確說明此階段不保留原 PDF 版面；掃描型 PDF 與可輸出去識別化 PDF 留待後期。
+
+### 第三階段：加強模式
+
+- [ ] **Ollama 本地稽核**：在快速模式之外提供可選的多次本地稽核，清楚呈現速度與召回率的取捨。
+- [ ] **效能**：先用決定性規則篩出可疑段落再送模型，讓批量處理更可行。
+
+### 後期
+
+- [ ] **更多文件類型**：library 端已能讀 docx/xlsx/pdf；需要把解析移進私有行程並驗證警告訊息不會回吐原文。
+- [ ] **保留版面的 PDF 輸出**：研究 PDF 重排或遮罩技術，輸出去識別化 PDF。
+- [ ] **可公開的準確率**：另建不含私人資料的語料，才能公開接近真實文件的數字。
 - [ ] **CI**
+- [ ] **桌面程式打包**：待本機網頁流程與功能完整後，再處理 `.app`／`.exe` 的安裝、更新與簽章。
 
 ### 已知問題
 
