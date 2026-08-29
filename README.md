@@ -78,9 +78,9 @@ Everything below is in Traditional Chinese. Start at [安裝](#安裝).
 
 ## 還在做的事
 
-下一步不是另做一套 gateway，而是把現有的人工補標頁擴成完整的本機網頁入口：選檔、選擇快速或加強模式、快審、再下載去識別化結果。CLI、商用 AI skill 與網頁介面會共用同一套私有工作目錄、對照表與還原邏輯；商用 AI 仍只讀取去識別化副本，不會讀到原文或對照表。
+第一階段的快速模式與完整本機網頁入口已完成。它們與 skill 的快速路徑共用同一個私有工作目錄、對照表與還原核心；一般 JSON、下載內容與 HTML 只會有去識別化文字、代號與工作編號。網頁伺服器預設只繫結 `127.0.0.1`，不提供加強模式的假入口。
 
-PDF 會提早支援文字抽取後的網頁快審，但要能保留原 PDF 版面並輸出去識別化 PDF，仍是後期工作。
+下一步是 PDF 文字抽取後的本機快審；保留原 PDF 版面並輸出去識別化 PDF，仍是後期工作。
 
 歡迎有興趣協作者一起試用，也歡迎所有的提意見跟 PR。
 
@@ -137,6 +137,30 @@ python3 $S restore --job-id "<job_id>" --input "編輯後的.txt" --output "還�
 ### 進階／無瀏覽器環境
 
 `mask --terms <詞清單檔>`、`unmask --marker TYPE-N` 是同樣兩種操作的指令列版本，`review` 列出代號與真實值。`review` 會印出未遮蔽的內容，因此在輸出不是終端機時拒絕執行。`purge` 刪除一個工作目錄。
+
+### 第一階段本機入口
+
+快速模式不啟動或呼叫 Ollama，只使用既有的 Presidio、台灣規則與 CKIP 中文辨識；反向對照表與原文快照留在 `~/.local/share/pii-safe-documents/jobs/<job_id>/`，檔案權限為 `0600`、工作目錄為 `0700`。
+
+```bash
+# 輸出安全 JSON；可加 -o 另存去識別化文字
+uv run python -m pii_guard quick tests/fixtures/phase1_chinese.txt
+uv run python -m pii_guard quick input.txt -o input.anonymized.txt
+
+# 用 quick 工作編號還原編輯後的去識別化文字；不需要知道 mapping 路徑
+uv run python -m pii_guard quick-restore <job_id> edited.anonymized.txt -o restored.txt
+
+# 開啟一頁式 localhost 流程：選檔 → 快速模式 → 快審／補遮 → 下載
+uv run python -m pii_guard web
+# 等價別名：uv run python -m pii_guard local-web
+
+# 固定 fixture，可重跑並分開量測 cold start 與 warm processing
+uv run python -m pii_guard benchmark --fixture tests/fixtures/phase1_chinese.txt
+```
+
+網頁只在 client 端以固定邏輯顯示 `~/.local/share/pii-safe-documents/jobs/<job_id>/` 提示；若啟動時自訂 `jobs-root`，則顯示「啟動 CLI 設定的私有工作根目錄 + 工作編號」，API 不回傳絕對路徑。「產生還原檔」只會把結果寫回同一個私有工作目錄，不透過 HTTP 傳回原文；「刪除這個工作」是手動刪除單一工作與對照表，沒有自動 TTL。第一階段的模式選單會明確把加強模式標為尚未完成。
+
+`quick-restore` 以 quick receipt 的工作編號和編輯後去識別化檔案操作同一個私有工作目錄與還原核心；輸出檔會以 `0600` 建立，既有輸出或 symlink 會拒絕覆寫。CLI 回執只回報工作編號、成功狀態與 round-trip 狀態，不回傳還原內容、mapping、digest 或私有路徑。
 
 ## 準確率
 
@@ -206,12 +230,12 @@ skill 的稽核層開啟推理並對每個視窗取樣三次，**單份文件實
 
 ### 第一階段：快速模式與完整本機網頁入口
 
-- [ ] **快速模式**：不啟動 Ollama，使用規則與中文辨識模型做可逆去識別化。
-- [ ] **完整網頁入口**：把既有人工補標頁擴成選檔、選模式、快審與下載的一頁式本機流程。
-- [ ] **共用核心**：CLI、商用 AI skill 與網頁介面共用同一套工作目錄、私有對照表、去識別化與還原邏輯。
-- [ ] **JSON 與 HTML 邊界**：一般 JSON 只含去識別化文字、代號與工作編號；私有對照表只留在本機，HTML 僅用於本機快審且不嵌入真實個資。
-- [ ] **效能基準**：在固定中文文字檔與指定電腦上，分別量測首次啟動與後續處理；快速模式須通過完整還原驗證後，才主打速度。
-- [ ] **手動清除**：在網頁介面提供清楚的私有工作目錄與對照表刪除操作，不設定自動到期。
+- [x] **快速模式**：不啟動 Ollama，使用規則與中文辨識模型做可逆去識別化。
+- [x] **完整網頁入口**：把既有人工補標頁擴成選檔、選模式、快審與下載的一頁式本機流程；加強模式明確保留到第三階段。
+- [x] **共用核心**：CLI、`pii-safe-documents` skill 的快速路徑與網頁介面共用同一套工作目錄、私有對照表、去識別化與還原邏輯。
+- [x] **JSON 與 HTML 邊界**：一般 JSON 只含去識別化文字、代號與工作編號；私有對照表只留在本機，HTML 僅用於 localhost 快審且不嵌入真實個資。
+- [x] **效能基準**：固定中文 fixture 提供可重跑的 cold-start、warm-processing 與完整 round-trip 指標；目前只報實測數字，不宣稱速度門檻。
+- [x] **手動清除**：網頁介面提供清楚的私有工作目錄與單一工作刪除操作，不設定自動到期。
 
 ### 第二階段：PDF 快審
 

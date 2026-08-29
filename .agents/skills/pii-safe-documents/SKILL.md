@@ -44,6 +44,19 @@ The user may provide the original path. You may check path metadata such as exis
 
 Choose allowed terms only when the user explicitly wants them preserved, such as a company or product name. An allowed term is visible to the main agent because the user supplied it; do not discover allowed terms from the original.
 
+### 1b. 第一階段快速模式（不啟動 Ollama）
+
+需要只做決定性本機處理時，可明確使用 quick：
+
+```bash
+python3 <skill-dir>/scripts/pii_safe_workflow.py quick \
+  --input "/absolute/path/to/private-file.txt"
+```
+
+quick 只呼叫共用的 PII Guard 核心（Presidio、台灣規則與 CKIP），不啟動、連線或探測 Ollama。它和 repo 的 `pii_guard quick` CLI 及 localhost 網頁使用同一個 `~/.local/share/pii-safe-documents/jobs/<job_id>/` 私有工作目錄、mapping、快照與還原邏輯。回執只含 job ID、去識別化檔案路徑、數量、摘要與 `roundtrip_verified`，不含原文或 mapping 值。
+
+quick 回執成功後，主 agent 只能讀 `redacted_path`；仍應讓使用者在本機網頁人工快審，因為決定性偵測可能漏掉或誤遮。還原前保留 job ID，完成後以 `purge` 手動清除，不會自動 TTL。
+
 ### 2. Create the redacted working copy
 
 Run:

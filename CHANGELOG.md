@@ -7,12 +7,24 @@
 
 ### 新增
 
+- **第一階段快速模式與完整 localhost 入口。** 新增 `pii_guard quick`、`web`／`local-web`
+  與 `benchmark` 指令；快速模式沿用 Presidio、台灣規則與 CKIP，完全不啟動 Ollama。
+  本機網頁提供選檔、模式選擇、去識別化快審、人工補遮、下載與單一工作手動刪除。
+- CLI、網頁與 `pii-safe-documents` skill 的快速路徑共用私有工作目錄、mapping、
+  anonymize／restore 核心；新增固定中文 fixture 與 cold/warm 可重跑 benchmark。
+- 新增 `quick-restore` job-based CLI 入口；編輯後的去識別化文字可透過工作編號走共用
+  restore core，輸出檔以 `0600` 建立，回執不含還原內容、mapping、digest 或私有路徑。
+
 - README 補上一段人工補標介面的實際操作動畫（`docs/annotate-demo.gif`），
   示範文件是虛構判決書。靜態截圖保留在它下面。
 - README 新增「還在做的事」：商用 agent 的越權與隔離（考慮走 proxy 配置）、
   批量與多格式文檔處理，並公開徵求試用者、意見與 PR。
 
 ### 修正
+
+- localhost 入口固定繫結 `127.0.0.1`，不把原文、mapping 或還原內容放進 HTTP 回應、
+  HTML、錯誤訊息或 server log；私有工作目錄保留 `0700`／`0600` 權限並可逐一刪除。
+- 第一階段的模式選單明確標示加強模式尚未完成，避免把第二階段／第三階段功能當成已交付。
 
 - **`purge` 現在清得掉中途死掉的 job。** 一次 redact 若在寫出 manifest 之前結束
   ——被砍、逾時、或稽核不過——會把 worker 的 `.source.private.txt`（**完整原文**）

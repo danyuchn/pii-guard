@@ -24,10 +24,10 @@ import time
 import urllib.parse
 import uuid
 import webbrowser
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Iterable, NoReturn
-
+from typing import Final, NoReturn
 
 SUPPORTED_SUFFIXES: Final[frozenset[str]] = frozenset(
     {".txt", ".md", ".csv", ".tsv", ".log", ".dat"}
@@ -56,6 +56,7 @@ DEFAULT_OLLAMA_URL: Final[str] = "http://127.0.0.1:11434"
 PRIVATE_MAP_NAME: Final[str] = "mapping.private.json"
 MANIFEST_NAME: Final[str] = "manifest.safe.json"
 REDACTED_NAME: Final[str] = "redacted.txt"
+SOURCE_NAME: Final[str] = ".source.private.txt"
 MAX_INPUT_BYTES: Final[int] = 64 * 1024
 MAX_MODEL_RESPONSE_BYTES: Final[int] = 1024 * 1024
 AUDIT_CHUNK_CHARS: Final[int] = 3600
@@ -149,7 +150,11 @@ def _private_write(path: Path, data: str) -> None:
         raise
     finally:
         temporary.unlink(missing_ok=True)
-    if stat.S_IMODE(path.stat(follow_symlinks=False).st_mode) != 0o600:
+    # ``Path.stat(follow_symlinks=False)`` is only available on newer Python
+    # versions.  ``lstat`` has the same no-follow guarantee on every Python
+    # supported by the standalone skill, and keeps the permission check race
+    # resistant without dereferencing a possibly swapped symlink.
+    if stat.S_IMODE(path.lstat().st_mode) != 0o600:
         raise SafeFailure("PERMISSION_CHECK_FAILED", "Private file permissions are unsafe.")
 
 
@@ -169,6 +174,9 @@ def _sha256(path: Path) -> str:
 
 
 def _default_jobs_root() -> Path:
+    configured = os.environ.get("PII_GUARD_JOBS_ROOT", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
     home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     return (home / ".local/share/pii-safe-documents/jobs").resolve()
 
@@ -410,9 +418,15 @@ def _exit_if_orphaned(poll_seconds: float = 5.0) -> None:
     threading.Thread(target=watch, daemon=True).start()
 
 
-def _run_private_worker(arguments: list[str], *, status_path: Path, timeout: int) -> None:
+def _run_private_worker(
+    arguments: list[str],
+    *,
+    status_path: Path,
+    timeout: int,
+    interpreter: Path | None = None,
+) -> None:
     command = [
-        sys.executable,
+        str(interpreter or sys.executable),
         str(Path(__file__).resolve()),
         "_worker",
         *arguments,
@@ -435,7 +449,11 @@ def _run_private_worker(arguments: list[str], *, status_path: Path, timeout: int
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        env=_minimal_worker_environment(),
+        # Every private worker must be local-only.  Quick workers construct a
+        # fresh CKIP engine in the child, so leaving the Hugging Face offline
+        # flags out here would make a cold subprocess try the network even
+        # though the model is expected to be available from the local cache.
+        env=_minimal_pii_guard_environment(),
     )
 
     def _terminate_child() -> None:
@@ -1414,8 +1432,58 @@ def _redact_worker(args: argparse.Namespace) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _quick_worker(args: argparse.Namespace) -> None:
+    """Run the shared deterministic quick path without touching Ollama."""
+
+    from pii_guard.local_workflow import PrivateJobStore, WorkflowError
+
+    try:
+        job_dir = Path(args.job_dir)
+        source = Path(args.input)
+        if (
+            job_dir.name != args.job_id
+            or source.resolve() != (job_dir / SOURCE_NAME).resolve()
+        ):
+            raise WorkflowError("INVALID_WORKER_PATH", "Private quick snapshot path is invalid.")
+        store = PrivateJobStore(job_dir.parent, ckip_model=args.model)
+        store.materialize_existing_quick_job(
+            job_dir,
+            args.job_id,
+            model=args.model,
+            source_path=source,
+        )
+    except WorkflowError as exc:
+        raise SafeFailure(exc.code, exc.message) from exc
+
+
 def _restore_worker(args: argparse.Namespace) -> None:
     job_dir = Path(args.job_dir)
+    manifest = json.loads(_read_utf8(job_dir / MANIFEST_NAME))
+    if isinstance(manifest, dict) and manifest.get("mode") == "quick":
+        from pii_guard.local_workflow import PrivateJobStore, WorkflowError
+
+        try:
+            edited = _read_utf8(Path(args.input))
+            result = PrivateJobStore(job_dir.parent).restore_edited_redacted(
+                args.job_id,
+                edited,
+                output_path=Path(args.output),
+                overwrite=False,
+            )
+        except WorkflowError as exc:
+            raise SafeFailure(exc.code, exc.message) from exc
+        _private_write(
+            Path(args.receipt_path),
+            json.dumps(
+                {
+                    "restored_sha256": result.restored_sha256,
+                    "roundtrip_equal": result.roundtrip_equal,
+                },
+                sort_keys=True,
+            ),
+        )
+        return
+
     edited = _read_utf8(Path(args.input))
     mapping_data = json.loads(_read_utf8(job_dir / PRIVATE_MAP_NAME))
     if not isinstance(mapping_data, dict) or not all(
@@ -1423,7 +1491,6 @@ def _restore_worker(args: argparse.Namespace) -> None:
     ):
         raise SafeFailure("INVALID_MAPPING", "Private mapping is invalid.")
     mapping: dict[str, str] = dict(mapping_data)
-    manifest = json.loads(_read_utf8(job_dir / MANIFEST_NAME))
     if (
         not isinstance(manifest, dict)
         or manifest.get("kind") != "pii-safe-documents-private-job"
@@ -1616,9 +1683,92 @@ def _public_redact(args: argparse.Namespace) -> None:
         raise
 
 
+def _public_quick(args: argparse.Namespace) -> None:
+    """Create a quick job using the same private directory as the skill."""
+
+    validated_input = _validate_input(Path(args.input))
+    input_path = validated_input.path
+    root = _prepare_jobs_root(_default_jobs_root())
+    project = _find_pii_guard_project()
+    interpreter = _pii_guard_python(project)
+    job_id = uuid.uuid4().hex
+    job_dir = root / job_id
+    job_dir.mkdir(mode=0o700)
+    job_dir.chmod(0o700)
+    try:
+        source_snapshot = job_dir / SOURCE_NAME
+        _snapshot_input(
+            input_path,
+            source_snapshot,
+            expected_device=validated_input.device,
+            expected_inode=validated_input.inode,
+        )
+        _run_private_worker(
+            [
+                "quick",
+                "--input",
+                str(source_snapshot),
+                "--job-dir",
+                str(job_dir),
+                "--job-id",
+                job_id,
+                "--model",
+                args.model,
+            ],
+            status_path=job_dir / ".worker.safe.json",
+            timeout=REDACT_WORKER_TIMEOUT_SECONDS,
+            interpreter=interpreter,
+        )
+        manifest = json.loads(_read_utf8(job_dir / MANIFEST_NAME))
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("kind") != "pii-safe-documents-private-job"
+            or manifest.get("job_id") != job_id
+            or manifest.get("mode") != "quick"
+        ):
+            raise SafeFailure("INVALID_JOB", "Private quick job metadata is invalid.")
+        for artifact in (
+            job_dir / REDACTED_NAME,
+            job_dir / PRIVATE_MAP_NAME,
+            job_dir / MANIFEST_NAME,
+        ):
+            _assert_private_file(artifact)
+        _emit(
+            {
+                "ok": True,
+                "mode": "quick",
+                "redaction_checks_passed": True,
+                "agent_may_read_redacted": True,
+                "job_id": job_id,
+                "redacted_path": str(job_dir / REDACTED_NAME),
+                "local_audit": "not-run",
+                "replacement_count": manifest["replacement_count"],
+                "entity_counts": manifest["entity_counts"],
+                "redacted_sha256": manifest["redacted_sha256"],
+                "roundtrip_verified": True,
+                "permissions": {"job_dir": "0700", "private_files": "0600"},
+            }
+        )
+    except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+
+
 def _public_restore(args: argparse.Namespace) -> None:
     root = _prepare_jobs_root(_default_jobs_root())
     job_dir = _resolve_job_dir(root, args.job_id)
+    # Quick jobs delegate restoration to the repository's shared
+    # ``PrivateJobStore``.  The public skill may itself be launched by a
+    # system Python that has no project dependencies, so that worker must run
+    # in the PII Guard project environment.  Enhanced jobs retain the legacy
+    # stdlib-only worker path and interpreter selection.
+    worker_interpreter: Path | None = None
+    try:
+        manifest = json.loads(_read_utf8(job_dir / MANIFEST_NAME))
+    except (OSError, SafeFailure, json.JSONDecodeError):
+        manifest = None
+    if isinstance(manifest, dict) and manifest.get("mode") == "quick":
+        worker_interpreter = _pii_guard_python(_find_pii_guard_project())
     validated_edited = _validate_input(Path(args.input))
     edited = validated_edited.path
     output = Path(args.output).expanduser().resolve()
@@ -1653,6 +1803,7 @@ def _public_restore(args: argparse.Namespace) -> None:
             ],
             status_path=job_dir / ".worker.safe.json",
             timeout=120,
+            interpreter=worker_interpreter,
         )
         receipt = json.loads(_read_utf8(receipt_path))
         if (
@@ -1787,7 +1938,8 @@ button.primary { background: var(--accent); color: #fff; border-color: transpare
 button:disabled { opacity: .4; cursor: default; }
 #float { position: fixed; display: none; z-index: 9; }
 #panel { position: fixed; display: none; z-index: 9; background: Canvas; padding: 12px;
-  border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 24px #0003; max-width: 22rem; }
+  border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 24px #0003;
+  max-width: 22rem; }
 #panel .val { font-weight: 600; margin: 4px 0 10px; word-break: break-all; }
 #log { margin-top: 14px; font-size: 13px; min-height: 1.7em; }
 #done { padding: 20px 0 40px; }
@@ -1835,7 +1987,8 @@ async function call(path, body) {
 function render(state) {
   entries = {};
   for (const item of state.entries) entries[item.marker] = item;
-  stat.textContent = `${state.entries.length} 個遮蔽 · 已補遮 ${state.masked} · 已放回 ${state.unmasked}`;
+  stat.textContent = `${state.entries.length} 個遮蔽 · 已補遮 ${state.masked} · ` +
+    `已放回 ${state.unmasked}`;
   doc.textContent = "";
   const parts = state.redacted.split(/(\\[\\[PII-[^\\]\\r\\n]+\\]\\])/);
   for (const part of parts) {
@@ -2561,6 +2714,13 @@ def _build_parser() -> argparse.ArgumentParser:
     redact.add_argument("--model", default=DEFAULT_MODEL)
     redact.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
 
+    quick = subparsers.add_parser(
+        "quick",
+        help="Run deterministic quick redaction without starting or calling Ollama",
+    )
+    quick.add_argument("--input", required=True)
+    quick.add_argument("--model", default="ckiplab/bert-base-chinese-ner")
+
     restore = subparsers.add_parser("restore")
     restore.add_argument("--job-id", required=True)
     restore.add_argument("--input", required=True)
@@ -2594,6 +2754,12 @@ def _build_parser() -> argparse.ArgumentParser:
     worker_redact.add_argument("--ollama-url", required=True)
     worker_redact.add_argument("--allow-json", required=True)
     worker_redact.add_argument("--status-path", required=True)
+    worker_quick = worker_subparsers.add_parser("quick")
+    worker_quick.add_argument("--input", required=True)
+    worker_quick.add_argument("--job-dir", required=True)
+    worker_quick.add_argument("--job-id", required=True)
+    worker_quick.add_argument("--model", required=True)
+    worker_quick.add_argument("--status-path", required=True)
     worker_restore = worker_subparsers.add_parser("restore")
     worker_restore.add_argument("--input", required=True)
     worker_restore.add_argument("--output", required=True)
@@ -2627,6 +2793,8 @@ def main() -> None:
     try:
         if args.command == "redact":
             _public_redact(args)
+        if args.command == "quick":
+            _public_quick(args)
         if args.command == "restore":
             _public_restore(args)
         if args.command == "annotate":
@@ -2643,6 +2811,9 @@ def main() -> None:
             _exit_if_orphaned()
         if args.command == "_worker" and args.worker_command == "redact":
             _redact_worker(args)
+            return
+        if args.command == "_worker" and args.worker_command == "quick":
+            _quick_worker(args)
             return
         if args.command == "_worker" and args.worker_command == "restore":
             _restore_worker(args)

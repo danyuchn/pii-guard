@@ -1,20 +1,21 @@
 from __future__ import annotations
 
-import importlib.util
 import hashlib
+import importlib.util
+import io
 import json
-import time
-import shutil
-import subprocess
 import os
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from argparse import Namespace
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
-
 
 SCRIPT = Path(__file__).parents[1] / "scripts/pii_safe_workflow.py"
 SPEC = importlib.util.spec_from_file_location("pii_safe_workflow", SCRIPT)
@@ -414,6 +415,239 @@ class FilesystemSafetyTests(unittest.TestCase):
                 output.read_text(encoding="utf-8"),
                 restored_text,
             )
+
+
+class QuickPathRegressionTests(unittest.TestCase):
+    """The skill quick command must use the shared core and never Ollama."""
+
+    def test_quick_restore_worker_uses_shared_restore_core(self) -> None:
+        from pii_guard.local_workflow import PrivateJobStore as SharedPrivateJobStore
+
+        original = "聯絡人王小明，身分證A123456789。"
+
+        class FakeEngine:
+            def anonymize(self, text: str) -> tuple[str, dict[str, str]]:
+                redacted = text.replace("王小明", "<PERSON_1>")
+                redacted = redacted.replace("A123456789", "<TW_NATIONAL_ID_1>")
+                return redacted, {
+                    "<PERSON_1>": "王小明",
+                    "<TW_NATIONAL_ID_1>": "A123456789",
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SharedPrivateJobStore(root / "jobs", engine=FakeEngine())
+            public = store.create_quick_from_text(original)
+            job_id = str(public["job_id"])
+            job_dir = store.root / job_id
+            edited = root / "edited.txt"
+            edited.write_text(
+                (job_dir / WORKFLOW.REDACTED_NAME).read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            output = job_dir / ".restore-output-0123456789abcdef0123456789abcdef.private.txt"
+            receipt = job_dir / ".restore-receipt-0123456789abcdef0123456789abcdef.safe.json"
+            calls: list[str] = []
+            original_restore = SharedPrivateJobStore.restore_edited_redacted
+
+            def spy_restore(
+                instance: SharedPrivateJobStore,
+                requested_job_id: str,
+                edited_redacted: str | None = None,
+                *,
+                output_path: Path | None = None,
+                overwrite: bool = True,
+            ):
+                calls.append(requested_job_id)
+                return original_restore(
+                    instance,
+                    requested_job_id,
+                    edited_redacted,
+                    output_path=output_path,
+                    overwrite=overwrite,
+                )
+
+            with patch.object(SharedPrivateJobStore, "restore_edited_redacted", spy_restore):
+                WORKFLOW._restore_worker(
+                    Namespace(
+                        job_dir=str(job_dir),
+                        job_id=job_id,
+                        input=str(edited),
+                        output=str(output),
+                        receipt_path=str(receipt),
+                    )
+                )
+
+            self.assertEqual(calls, [job_id])
+            self.assertEqual(output.read_text(encoding="utf-8"), original)
+            self.assertTrue(json.loads(receipt.read_text(encoding="utf-8"))["roundtrip_equal"])
+
+    def test_public_quick_runs_real_private_subprocess(self) -> None:
+        """Exercise the actual Popen/status boundary with the fixed fixture."""
+
+        fixture = Path(__file__).parents[4] / "tests/fixtures/phase1_chinese.txt"
+        original = fixture.read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            stdout = io.StringIO()
+            with patch.object(WORKFLOW, "_default_jobs_root", return_value=jobs):
+                with redirect_stdout(stdout):
+                    with self.assertRaises(SystemExit) as exit_info:
+                        WORKFLOW._public_quick(
+                            Namespace(
+                                input=str(fixture),
+                                model="ckiplab/bert-base-chinese-ner",
+                            )
+                        )
+
+            self.assertEqual(exit_info.exception.code, 0)
+            receipt = json.loads(stdout.getvalue())
+            self.assertTrue(receipt["roundtrip_verified"])
+            self.assertNotIn(original, stdout.getvalue())
+            self.assertNotIn("mapping.private.json", stdout.getvalue())
+
+            job_id = receipt["job_id"]
+            job_dir = jobs / job_id
+            self.assertTrue(job_dir.is_dir())
+            manifest = json.loads(
+                (job_dir / WORKFLOW.MANIFEST_NAME).read_text(encoding="utf-8")
+            )
+            redacted = (job_dir / WORKFLOW.REDACTED_NAME).read_text(encoding="utf-8")
+            self.assertEqual(manifest["mode"], "quick")
+            self.assertNotIn(original, redacted)
+            self.assertTrue(manifest["replacement_count"] > 0)
+
+            # The public worker is the only path under test here: no in-process
+            # worker stub can make this assertion pass if Popen/status handling
+            # regresses.
+            self.assertEqual(
+                sorted(path.name for path in job_dir.iterdir()),
+                sorted(
+                    [
+                        WORKFLOW.SOURCE_NAME,
+                        WORKFLOW.REDACTED_NAME,
+                        WORKFLOW.PRIVATE_MAP_NAME,
+                        WORKFLOW.MANIFEST_NAME,
+                        ".job.lock",
+                    ]
+                ),
+            )
+
+    def test_public_quick_shared_job_is_restorable_and_purgeable(self) -> None:
+        from pii_guard.local_workflow import PrivateJobStore as SharedPrivateJobStore
+
+        original = "聯絡人王小明，身分證A123456789。"
+
+        class FakeEngine:
+            def anonymize(self, text: str) -> tuple[str, dict[str, str]]:
+                redacted = text.replace("王小明", "<PERSON_1>")
+                redacted = redacted.replace("A123456789", "<TW_NATIONAL_ID_1>")
+                return redacted, {
+                    "<PERSON_1>": "王小明",
+                    "<TW_NATIONAL_ID_1>": "A123456789",
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jobs = root / "jobs"
+            source = root / "source.txt"
+            source.write_text(original, encoding="utf-8")
+            restore_interpreters: list[Path | None] = []
+
+            def run_worker(
+                arguments: list[str],
+                *,
+                status_path: Path,
+                timeout: int,
+                interpreter: Path | None = None,
+            ) -> None:
+                del status_path, timeout
+                values = dict(zip(arguments[1::2], arguments[2::2]))
+                if arguments[0] == "quick":
+                    WORKFLOW._quick_worker(
+                        Namespace(
+                            input=values["--input"],
+                            job_dir=values["--job-dir"],
+                            job_id=values["--job-id"],
+                            model=values["--model"],
+                            status_path="unused",
+                        )
+                    )
+                    return
+                if arguments[0] == "restore":
+                    restore_interpreters.append(interpreter)
+                    WORKFLOW._restore_worker(
+                        Namespace(
+                            input=values["--input"],
+                            output=values["--output"],
+                            job_dir=values["--job-dir"],
+                            job_id=values["--job-id"],
+                            receipt_path=values["--receipt-path"],
+                        )
+                    )
+                    return
+                raise AssertionError(f"unexpected worker: {arguments[0]}")
+
+            def fail_if_called(*_args: object, **_kwargs: object) -> None:
+                raise AssertionError("quick path must not call Ollama")
+            with (
+                patch.object(WORKFLOW, "_default_jobs_root", return_value=jobs),
+                patch.object(WORKFLOW, "_find_pii_guard_project", return_value=root),
+                patch.object(WORKFLOW, "_pii_guard_python", return_value=Path(sys.executable)),
+                patch.object(WORKFLOW, "_run_private_worker", side_effect=run_worker),
+                patch.object(WORKFLOW, "_verify_local_ollama_listener", side_effect=fail_if_called),
+                patch.object(WORKFLOW, "_call_local_audit", side_effect=fail_if_called),
+                patch.object(SharedPrivateJobStore, "_get_engine", return_value=FakeEngine()),
+            ):
+                quick_stdout = io.StringIO()
+                with redirect_stdout(quick_stdout):
+                    with self.assertRaises(SystemExit) as quick_exit:
+                        WORKFLOW._public_quick(Namespace(input=str(source), model="test-model"))
+                self.assertEqual(quick_exit.exception.code, 0)
+                quick_receipt = json.loads(quick_stdout.getvalue())
+                self.assertTrue(quick_receipt["roundtrip_verified"])
+                self.assertNotIn(original, quick_stdout.getvalue())
+                self.assertNotIn("mapping.private.json", quick_stdout.getvalue())
+
+                job_id = quick_receipt["job_id"]
+                job_dir = jobs / job_id
+                manifest = json.loads(
+                    (job_dir / WORKFLOW.MANIFEST_NAME).read_text(encoding="utf-8")
+                )
+                mapping = json.loads(
+                    (job_dir / WORKFLOW.PRIVATE_MAP_NAME).read_text(encoding="utf-8")
+                )
+                self.assertEqual(manifest["mode"], "quick")
+                self.assertTrue(mapping)
+
+                edited = root / "edited.txt"
+                edited.write_text(
+                    (job_dir / WORKFLOW.REDACTED_NAME).read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+                restored = root / "restored.txt"
+                restore_stdout = io.StringIO()
+                with redirect_stdout(restore_stdout):
+                    with self.assertRaises(SystemExit) as restore_exit:
+                        WORKFLOW._public_restore(
+                            Namespace(
+                                job_id=job_id,
+                                input=str(edited),
+                                output=str(restored),
+                            )
+                        )
+                self.assertEqual(restore_exit.exception.code, 0)
+                self.assertEqual(restored.read_text(encoding="utf-8"), original)
+                self.assertEqual(restore_interpreters, [Path(sys.executable)])
+
+                purge_stdout = io.StringIO()
+                with redirect_stdout(purge_stdout):
+                    with self.assertRaises(SystemExit) as purge_exit:
+                        WORKFLOW._public_purge(Namespace(job_id=job_id))
+                self.assertEqual(purge_exit.exception.code, 0)
+                self.assertFalse(job_dir.exists())
 
 
 class EndpointValidationTests(unittest.TestCase):
@@ -945,13 +1179,13 @@ class AnnotationServerTests(unittest.TestCase):
     def test_a_wrong_token_gets_nothing(self) -> None:
         status, raw = self._request("/state", token="not-the-token")
         self.assertEqual(status, 404)
-        self.assertNotIn("李真".encode("utf-8"), raw)
+        self.assertNotIn("李真".encode(), raw)
 
     def test_a_foreign_host_header_is_refused(self) -> None:
         # A hostile page whose name resolves to loopback must not reach this.
         status, raw = self._request("/state", host="attacker.example")
         self.assertEqual(status, 404)
-        self.assertNotIn("李真".encode("utf-8"), raw)
+        self.assertNotIn("李真".encode(), raw)
 
     def test_masking_from_the_page_covers_every_occurrence(self) -> None:
         status, raw = self._request("/mask", {"terms": ["王小明"]})

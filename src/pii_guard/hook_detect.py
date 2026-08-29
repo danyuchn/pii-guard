@@ -16,7 +16,6 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-
 # Entity type display names for the review prompt
 _DISPLAY_NAMES: dict[str, str] = {
     "TW_NATIONAL_ID": "身分證字號",
