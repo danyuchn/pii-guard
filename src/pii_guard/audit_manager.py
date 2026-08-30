@@ -8,7 +8,6 @@ been explicitly started.
 
 from __future__ import annotations
 
-import fcntl
 import io
 import json
 import logging
@@ -25,6 +24,12 @@ from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Any
 
+from pii_guard._compat import (
+    lock_descriptor,
+    owner_matches,
+    set_descriptor_mode,
+    unlock_descriptor,
+)
 from pii_guard.local_workflow import (
     JOB_MODE,
     EnhancedAttempt,
@@ -82,10 +87,10 @@ def _acquire_manager_lease(store: object) -> tuple[Path, int]:
                 0o600,
             )
             info = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            if not stat.S_ISREG(info.st_mode) or not owner_matches(info) or info.st_nlink != 1:
                 raise OSError("unsafe manager lease")
-            os.fchmod(descriptor, 0o600)
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            set_descriptor_mode(descriptor, 0o600)
+            lock_descriptor(descriptor, exclusive=True, blocking=False)
         except (BlockingIOError, OSError):
             if descriptor is not None:
                 os.close(descriptor)
@@ -100,7 +105,7 @@ def _release_manager_lease(root: Path, descriptor: int) -> None:
     with _LEASE_REGISTRY_LOCK:
         _LEASED_ROOTS.discard(root)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            unlock_descriptor(descriptor)
         finally:
             os.close(descriptor)
 

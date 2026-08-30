@@ -8,7 +8,6 @@ opaque marker names to callers.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import io
 import json
@@ -31,6 +30,14 @@ from dataclasses import dataclass
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Final, NoReturn, Protocol
+
+from pii_guard._compat import (
+    lock_descriptor,
+    mode_matches,
+    owner_matches,
+    set_descriptor_mode,
+    unlock_descriptor,
+)
 
 SUPPORTED_SUFFIXES: Final[frozenset[str]] = frozenset(
     {".txt", ".md", ".csv", ".tsv", ".log", ".dat"}
@@ -245,7 +252,7 @@ def _assert_owner_mode(path: Path, expected_mode: int, *, directory: bool) -> No
         raise WorkflowError("PERMISSION_CHECK_FAILED", "Private artifact is not safe.")
     if not directory and not stat.S_ISREG(info.st_mode):
         raise WorkflowError("PERMISSION_CHECK_FAILED", "Private artifact is not a file.")
-    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != expected_mode:
+    if not owner_matches(info) or not mode_matches(info, expected_mode):
         raise WorkflowError("PERMISSION_CHECK_FAILED", "Private artifact permissions are unsafe.")
     if not directory and info.st_nlink != 1:
         raise WorkflowError("PERMISSION_CHECK_FAILED", "Private artifact has multiple hard links.")
@@ -268,7 +275,7 @@ def _ensure_lock_file(job_dir: Path) -> Path:
         raise WorkflowError("LOCK_FAILED", "Private job lock is unavailable.") from exc
     else:
         try:
-            os.fchmod(descriptor, PRIVATE_MODE)
+            set_descriptor_mode(descriptor, PRIVATE_MODE)
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
@@ -290,8 +297,8 @@ def _job_lock(job_dir: Path, *, exclusive: bool) -> Iterator[None]:
             descriptor_info = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(descriptor_info.st_mode)
-                or descriptor_info.st_uid != os.getuid()
-                or stat.S_IMODE(descriptor_info.st_mode) != PRIVATE_MODE
+                or not owner_matches(descriptor_info)
+                or not mode_matches(descriptor_info, PRIVATE_MODE)
                 or descriptor_info.st_nlink != 1
             ):
                 raise WorkflowError("PERMISSION_CHECK_FAILED", "Private job lock is unsafe.")
@@ -301,8 +308,7 @@ def _job_lock(job_dir: Path, *, exclusive: bool) -> Iterator[None]:
                 or path_info.st_ino != descriptor_info.st_ino
             ):
                 raise WorkflowError("LOCK_FAILED", "Private job lock changed unexpectedly.")
-            operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-            fcntl.flock(descriptor, operation)
+            lock_descriptor(descriptor, exclusive=exclusive, blocking=True)
             locked = True
             # Recheck the pathname after waiting: a replaced lock path must not let
             # a caller proceed while holding a lock on an unlinked inode.
@@ -320,7 +326,7 @@ def _job_lock(job_dir: Path, *, exclusive: bool) -> Iterator[None]:
     finally:
         if locked:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                unlock_descriptor(descriptor)
             except OSError:
                 pass
         if descriptor >= 0:
@@ -350,7 +356,7 @@ def _write_private(path: Path, data: str, *, replace: bool = False) -> None:
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, PRIVATE_MODE)
+        set_descriptor_mode(descriptor, PRIVATE_MODE)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             descriptor = -1
             handle.write(data)
@@ -2519,4 +2525,14 @@ class PrivateJobStore:
                 raise WorkflowError("INVALID_JOB", "Private job metadata is invalid.")
             if manifest.get("job_id") != job_id:
                 raise WorkflowError("INVALID_JOB", "Private job identity is invalid.")
-            shutil.rmtree(job_dir)
+            # Remove every private artifact while still holding the exclusive
+            # lock. The lock file itself stays: the lock descriptor keeps it
+            # open, and Windows cannot unlink an open file.
+            for entry in job_dir.iterdir():
+                if entry.is_dir():
+                    shutil.rmtree(entry)
+                elif entry.name != LOCK_NAME:
+                    entry.unlink()
+        # Only the inert lock file remains; drop it and the emptied directory
+        # once the descriptor is released.
+        shutil.rmtree(job_dir)

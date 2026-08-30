@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import json
 import multiprocessing
+import os
 import re
 import stat
 import subprocess
@@ -37,6 +38,21 @@ from tests.pdf_fixtures import (
     build_image_only_pdf,
     build_text_pdf,
 )
+
+# POSIX permission bits don't exist on NTFS: chmod can only toggle a
+# read-only flag, so 0o600/0o700 can never be read back on Windows.
+_POSIX_MODES = os.name != "nt"
+
+
+def _require_symlinks(tmp_path: Path) -> None:
+    """Skip when the platform refuses symlink creation (Windows sans privilege)."""
+    probe = tmp_path / ".symlink-probe"
+    try:
+        probe.symlink_to(tmp_path / "missing-target")
+    except OSError:
+        pytest.skip("symlink creation requires elevated privileges on this platform")
+    finally:
+        probe.unlink(missing_ok=True)
 
 
 class FakeEngine:
@@ -342,7 +358,8 @@ def test_cli_quick_restore_uses_shared_core_and_writes_private_output(
         "roundtrip_equal": False,
     }
     _assert_public_json_has_no_private_paths(payload, tmp_path)
-    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+    if _POSIX_MODES:
+        assert stat.S_IMODE(output.stat().st_mode) == 0o600
     assert output.read_text(encoding="utf-8") == ORIGINAL.replace("聯絡人", "收件人")
 
 
@@ -357,9 +374,10 @@ def test_quick_job_keeps_mapping_private_and_roundtrips(tmp_path: Path) -> None:
     _assert_public_json_has_no_private_paths(public, tmp_path)
     assert "A123456789" not in str(public)
     assert "mapping.private.json" not in json.dumps(public, ensure_ascii=False)
-    assert stat.S_IMODE(job_dir.stat().st_mode) == 0o700
-    for name in (SOURCE_NAME, REDACTED_NAME, PRIVATE_MAP_NAME, MANIFEST_NAME):
-        assert stat.S_IMODE((job_dir / name).stat().st_mode) == 0o600
+    if _POSIX_MODES:
+        assert stat.S_IMODE(job_dir.stat().st_mode) == 0o700
+        for name in (SOURCE_NAME, REDACTED_NAME, PRIVATE_MAP_NAME, MANIFEST_NAME):
+            assert stat.S_IMODE((job_dir / name).stat().st_mode) == 0o600
 
     state = store.load_state(job_id)
     assert state.redacted != ORIGINAL
@@ -380,7 +398,8 @@ def test_edited_redacted_restore_allows_plain_text_edit(tmp_path: Path) -> None:
 
     assert result.roundtrip_equal is False
     assert output.read_text(encoding="utf-8") == ORIGINAL.replace("聯絡人", "收件人")
-    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+    if _POSIX_MODES:
+        assert stat.S_IMODE(output.stat().st_mode) == 0o600
 
 
 def test_edited_redacted_literal_placeholder_integrity_fails_closed(tmp_path: Path) -> None:
@@ -493,6 +512,7 @@ def test_job_id_traversal_and_unknown_files_are_rejected(tmp_path: Path) -> None
 
 
 def test_input_and_private_job_symlinks_are_rejected(tmp_path: Path) -> None:
+    _require_symlinks(tmp_path)
     store = _store(tmp_path)
     source = tmp_path / "source.txt"
     source.write_text(ORIGINAL, encoding="utf-8")
