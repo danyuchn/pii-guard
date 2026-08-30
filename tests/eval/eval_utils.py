@@ -4,6 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Predicted types folded into the corpus annotation type they are equivalent
+# to. TW_ADDRESS (deterministic regex) and LOCATION (CKIP NER) both denote a
+# place and redact the span identically; scoring them as different types would
+# count a correct redaction as one FP plus one FN whenever the regex wins the
+# span. The corpus itself only ever annotates LOCATION.
+TYPE_EQUIVALENCE: dict[str, str] = {"TW_ADDRESS": "LOCATION"}
+
+
+def canonical_type(entity_type: str) -> str:
+    """Return the scoring type for ``entity_type``, folding equivalent types."""
+    return TYPE_EQUIVALENCE.get(entity_type, entity_type)
+
 
 @dataclass(frozen=True)
 class Span:
@@ -16,13 +28,16 @@ class Span:
 
 def results_to_spans(results, offset: int = 0) -> set[Span]:
     """Convert ``list[RecognizerResult]`` to a set of :class:`Span`."""
-    return {Span(r.entity_type, r.start + offset, r.end + offset) for r in results}
+    return {
+        Span(canonical_type(r.entity_type), r.start + offset, r.end + offset)
+        for r in results
+    }
 
 
 def annotations_to_spans(annotations: list[dict], offset: int = 0) -> set[Span]:
     """Convert corpus annotation dicts to a set of :class:`Span`."""
     return {
-        Span(a["entity_type"], a["start"] + offset, a["end"] + offset)
+        Span(canonical_type(a["entity_type"]), a["start"] + offset, a["end"] + offset)
         for a in annotations
     }
 

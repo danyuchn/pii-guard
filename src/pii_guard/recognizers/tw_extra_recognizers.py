@@ -437,8 +437,12 @@ class TwPasswordRecognizer(LocalRecognizer):
     """
 
     SUPPORTED_ENTITY: ClassVar[str] = "TW_PASSWORD"
+    # The English label alternatives need letter boundaries on both sides:
+    # without them "pass" fires inside "passport"/"bypass" and captures the
+    # rest of the word as the password value.
     _PATTERN: ClassVar[re.Pattern[str]] = re.compile(
-        r"(?:密碼|密码|password|pwd|pass)\s*(?:是|為|为)?\s*[:：]?\s*"
+        r"(?<![A-Za-z])(?:密碼|密码|password|pwd|pass)(?![A-Za-z])"
+        r"\s*(?:是|為|为)?\s*[:：]?\s*"
         r"([A-Za-z0-9!@#$%^&*_\-+=.]{4,32})",
         re.IGNORECASE,
     )

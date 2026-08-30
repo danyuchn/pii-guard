@@ -16,6 +16,7 @@ import pytest
 from tests.eval.eval_utils import (
     Span,
     annotations_to_spans,
+    canonical_type,
     compute_metrics,
     format_report,
     results_to_spans,
@@ -33,11 +34,17 @@ def _aggregate(engine, corpus, *, exclude_ner: bool = False):
     for sample in corpus:
         annotations = sample["annotations"]
         if exclude_ner:
-            annotations = [a for a in annotations if a["entity_type"] not in _NER_TYPES]
+            annotations = [
+                a for a in annotations
+                if canonical_type(a["entity_type"]) not in _NER_TYPES
+            ]
 
         results = engine.detect(sample["text"])
         if exclude_ner:
-            results = [r for r in results if r.entity_type not in _NER_TYPES]
+            results = [
+                r for r in results
+                if canonical_type(r.entity_type) not in _NER_TYPES
+            ]
 
         all_predicted |= results_to_spans(results, offset)
         all_expected |= annotations_to_spans(annotations, offset)
