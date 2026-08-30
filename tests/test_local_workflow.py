@@ -635,3 +635,32 @@ def test_concurrent_mask_operations_preserve_both_updates(tmp_path: Path) -> Non
     state = first_store.load_state(job_id)
     assert {value for value in state.mapping.values()} == {"甲", "乙"}
     assert state.redacted.count("-MANUAL-") == 2
+
+
+def test_enhanced_transaction_recovers_after_partial_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    pending = store.prepare_enhanced_from_text("聯絡人王小明。")
+    job_id = str(pending["job_id"])
+    real_replace = local_workflow.os.replace
+    official_replaces = 0
+
+    def fail_second_official_replace(source: Path | str, target: Path | str) -> None:
+        nonlocal official_replaces
+        target_path = Path(target)
+        if target_path.name in {REDACTED_NAME, PRIVATE_MAP_NAME, MANIFEST_NAME}:
+            official_replaces += 1
+            if official_replaces == 2:
+                raise OSError("injected partial transaction")
+        real_replace(source, target)
+
+    monkeypatch.setattr(local_workflow.os, "replace", fail_second_official_replace)
+    with pytest.raises(OSError, match="injected partial transaction"):
+        store._begin_enhanced_attempt(job_id)
+    monkeypatch.undo()
+
+    state = store.load_state(job_id)
+    assert state.manifest["audit_status"] == "queued"
+    assert not any((store.root / job_id).glob(".txn-*"))

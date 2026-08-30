@@ -24,6 +24,7 @@ import threading
 import time
 import unicodedata
 import uuid
+import weakref
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
@@ -62,6 +63,47 @@ NAMESPACED_PARTS_PATTERN: Final[re.Pattern[str]] = re.compile(
 )
 WORKFLOW_KIND: Final[str] = "pii-safe-documents-private-job"
 WORKFLOW_VERSION: Final[int] = 1
+ENHANCED_STATES: Final[frozenset[str]] = frozenset(
+    {
+        "quick_ready",
+        "queued",
+        "running",
+        "cancel_requested",
+        "passed",
+        "failed",
+        "cancelled",
+        "interrupted",
+    }
+)
+ENHANCED_ACTIVE_STATES: Final[frozenset[str]] = frozenset({"queued", "running", "cancel_requested"})
+ENHANCED_RESTARTABLE_STATES: Final[frozenset[str]] = frozenset(
+    {"failed", "cancelled", "interrupted"}
+)
+SAFE_AUDIT_ERROR_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "AUDIT_UNAVAILABLE",
+        "AUDIT_TIMEOUT",
+        "AUDIT_FAILED",
+        "AUDIT_CRASHED",
+        "AUDIT_CANCELLED",
+        "AUDIT_RESOURCE_LIMIT",
+        "AUDIT_INVALID_RESULT",
+        "AUDIT_INTERRUPTED",
+        "LOCAL_MODEL_UNVERIFIED",
+        "LOCAL_AUDIT_UNAVAILABLE",
+        "LOCAL_AUDIT_INVALID",
+        "LOCAL_AUDIT_UNRESOLVED",
+        "LOCAL_AUDIT_RESIDUAL",
+        "ADVERSARIAL_INPUT_REVIEW_REQUIRED",
+        "LEAKAGE_CHECK_FAILED",
+        "INVALID_MAPPING",
+        "ROUNDTRIP_INTEGRITY_FAILED",
+        "INVALID_OLLAMA_URL",
+        "INVALID_AUDIT_CONFIG",
+        "AUDIT_CALL_BUDGET_EXCEEDED",
+    }
+)
+AUDIT_ATTEMPT_TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{32}$")
 PRIVATE_MAP_NAME: Final[str] = "mapping.private.json"
 MANIFEST_NAME: Final[str] = "manifest.safe.json"
 REDACTED_NAME: Final[str] = "redacted.txt"
@@ -70,6 +112,15 @@ RESTORED_NAME: Final[str] = ".restored.private.txt"
 LOCK_NAME: Final[str] = ".job.lock"
 PRIVATE_MODE: Final[int] = 0o600
 JOB_MODE: Final[int] = 0o700
+TRANSACTION_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\.txn-[0-9a-f]{32}$")
+ATTEMPT_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\.attempt-[0-9a-f]{32}$")
+TRANSACTION_READY_NAME: Final[str] = "READY"
+TRANSACTION_COMMITTED_NAME: Final[str] = "COMMITTED"
+TRANSACTION_STATE_FILES: Final[tuple[str, ...]] = (
+    REDACTED_NAME,
+    PRIVATE_MAP_NAME,
+    MANIFEST_NAME,
+)
 
 
 class WorkflowError(Exception):
@@ -127,6 +178,20 @@ class PdfTextExtraction:
 
     text: str
     page_count: int
+
+
+@dataclass(frozen=True)
+class EnhancedAttempt:
+    """Private immutable baseline handed to one background enhanced audit."""
+
+    job_id: str
+    attempt_token: str
+    base_generation: int
+    original: str
+    redacted: str
+    mapping: dict[str, str]
+    source_format: str
+    page_count: int | None
 
 
 def default_jobs_root() -> Path:
@@ -302,6 +367,147 @@ def _write_private(path: Path, data: str, *, replace: bool = False) -> None:
     finally:
         temporary.unlink(missing_ok=True)
     _assert_owner_mode(path, PRIVATE_MODE, directory=False)
+
+
+def _manifest_generation(manifest: Mapping[str, object]) -> int:
+    """Return a valid state generation, treating old v1 manifests as generation one."""
+
+    value = manifest.get("generation", 1)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise WorkflowError("INVALID_MANIFEST", "Private state generation is invalid.")
+    return value
+
+
+def _read_private_bytes(path: Path) -> bytes:
+    """Read one already-validated private file without exposing its contents."""
+
+    _assert_owner_mode(path, PRIVATE_MODE, directory=False)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise WorkflowError(
+            "INTEGRITY_CHECK_FAILED", "Private state could not be read safely."
+        ) from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise WorkflowError("PERMISSION_CHECK_FAILED", "Private artifact is unsafe.")
+        data = bytearray()
+        while True:
+            chunk = os.read(descriptor, MAX_INPUT_BYTES * 4)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > 4 * MAX_INPUT_BYTES:
+                raise WorkflowError("INTEGRITY_CHECK_FAILED", "Private state is too large.")
+        return bytes(data)
+    finally:
+        os.close(descriptor)
+
+
+def _write_atomic_state(
+    job_dir: Path,
+    *,
+    redacted: str,
+    mapping: Mapping[str, str],
+    manifest: Mapping[str, object],
+) -> None:
+    """Commit the three mutable state files with crash-recoverable journaling.
+
+    A process can be killed between individual ``os.replace`` calls.  The
+    READY marker means all old files have been backed up before any official
+    file is changed; the COMMITTED marker means all new files are installed.
+    Startup recovery rolls back an unfinished transaction and discards a
+    completed one, so readers never accept a half-new enhanced generation.
+    """
+
+    for name in TRANSACTION_STATE_FILES:
+        _assert_owner_mode(job_dir / name, PRIVATE_MODE, directory=False)
+    transaction = job_dir / f".txn-{uuid.uuid4().hex}"
+    transaction.mkdir(mode=JOB_MODE)
+    transaction.chmod(JOB_MODE)
+    new_contents = {
+        REDACTED_NAME: redacted,
+        PRIVATE_MAP_NAME: _mapping_text(mapping),
+        MANIFEST_NAME: json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+    }
+    ready = False
+    try:
+        for name in TRANSACTION_STATE_FILES:
+            old_bytes = _read_private_bytes(job_dir / name)
+            try:
+                old_text = old_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise WorkflowError(
+                    "INTEGRITY_CHECK_FAILED", "Private state is not valid UTF-8."
+                ) from exc
+            _write_private(transaction / f".old-{name}", old_text)
+            _write_private(transaction / f".new-{name}", new_contents[name])
+        _write_private(transaction / TRANSACTION_READY_NAME, "ready")
+        ready = True
+        for name in TRANSACTION_STATE_FILES:
+            os.replace(transaction / f".new-{name}", job_dir / name)
+            _assert_owner_mode(job_dir / name, PRIVATE_MODE, directory=False)
+        _write_private(transaction / TRANSACTION_COMMITTED_NAME, "committed")
+        shutil.rmtree(transaction)
+    except BaseException:
+        # If a caller receives an exception (as opposed to a hard process
+        # death), recover synchronously so the next operation sees the base.
+        if ready:
+            try:
+                _recover_pending_transactions(job_dir)
+            except (OSError, WorkflowError):
+                pass
+        else:
+            shutil.rmtree(transaction, ignore_errors=True)
+        raise
+
+
+def _recover_pending_transactions(job_dir: Path) -> None:
+    """Recover unfinished state transactions left by a killed writer."""
+
+    try:
+        entries = list(job_dir.iterdir())
+    except OSError as exc:
+        raise WorkflowError(
+            "INTEGRITY_CHECK_FAILED", "Private state could not be inspected."
+        ) from exc
+    for transaction in entries:
+        if (
+            not transaction.is_dir()
+            or transaction.is_symlink()
+            or not TRANSACTION_PATTERN.fullmatch(transaction.name)
+        ):
+            continue
+        _assert_owner_mode(transaction, JOB_MODE, directory=True)
+        committed = transaction / TRANSACTION_COMMITTED_NAME
+        ready = transaction / TRANSACTION_READY_NAME
+        if committed.exists() and not committed.is_symlink():
+            shutil.rmtree(transaction)
+            continue
+        if not ready.exists() or ready.is_symlink():
+            # A transaction without READY has not modified official state.
+            shutil.rmtree(transaction)
+            continue
+        _assert_owner_mode(ready, PRIVATE_MODE, directory=False)
+        for name in TRANSACTION_STATE_FILES:
+            backup = transaction / f".old-{name}"
+            _assert_owner_mode(backup, PRIVATE_MODE, directory=False)
+        for name in TRANSACTION_STATE_FILES:
+            backup = transaction / f".old-{name}"
+            backup_bytes = _read_private_bytes(backup)
+            try:
+                backup_text = backup_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise WorkflowError(
+                    "INTEGRITY_CHECK_FAILED", "Private transaction backup is invalid."
+                ) from exc
+            # Keep each backup until the entire rollback is complete.  If the
+            # recovery process itself is killed, the next reader can retry
+            # from the same complete old generation.
+            _write_private(job_dir / name, backup_text, replace=True)
+        shutil.rmtree(transaction)
 
 
 def _read_utf8(path: Path, *, max_bytes: int | None = MAX_INPUT_BYTES) -> str:
@@ -831,6 +1037,8 @@ def _manifest_for(
             "version": WORKFLOW_VERSION,
             "job_id": job_id,
             "mode": "quick",
+            "audit_status": "quick_ready",
+            "generation": _manifest_generation(previous or {}),
             "source_format": source_format,
             "redacted_file": REDACTED_NAME,
             "replacement_count": len(mapping),
@@ -1096,6 +1304,8 @@ class PrivateJobStore:
         self._engine_factory = engine_factory
         self.ckip_model = ckip_model
         self.score_threshold = validated_threshold
+        self._audit_managers: weakref.WeakSet[object] = weakref.WeakSet()
+        self._default_audit_manager: object | None = None
 
     def _get_engine(self) -> Anonymizer:
         if self._engine is None:
@@ -1125,6 +1335,22 @@ class PrivateJobStore:
             raise WorkflowError("JOB_NOT_FOUND", "Private job was not found.")
         _assert_owner_mode(candidate, JOB_MODE, directory=True)
         return candidate
+
+    def _register_audit_manager(self, manager: object) -> None:
+        """Register an app-owned manager so deletion can stop its active child."""
+
+        try:
+            self._audit_managers.add(manager)
+        except TypeError:
+            # Test doubles need not be weak-referenceable; the default manager
+            # remains available through the explicit ``manager`` argument.
+            return
+
+    def _unregister_audit_manager(self, manager: object) -> None:
+        try:
+            self._audit_managers.discard(manager)
+        except TypeError:
+            return
 
     def _materialize(
         self,
@@ -1237,6 +1463,530 @@ class PrivateJobStore:
             page_count=extraction.page_count,
         )
 
+    def _mark_enhanced_queued(self, job_id: str) -> dict[str, object]:
+        """Promote a newly-created quick baseline into the enhanced queue."""
+
+        job_dir = self._job_dir(job_id)
+        with _job_lock(job_dir, exclusive=True):
+            state = self._load_state_unlocked(job_id, job_dir)
+            if state.manifest.get("mode", "quick") != "quick":
+                raise WorkflowError("INVALID_JOB", "Private quick baseline is invalid.")
+            manifest = dict(state.manifest)
+            manifest.update(
+                {
+                    "mode": "enhanced",
+                    "audit_status": "queued",
+                    "audit_progress": {
+                        "completed": 0,
+                        "total": 0,
+                        "scope": "enhanced_audit",
+                    },
+                    "generation": _manifest_generation(state.manifest) + 1,
+                }
+            )
+            for key in ("audit_attempt_token", "audit_base_generation", "audit_error_code"):
+                manifest.pop(key, None)
+            _write_atomic_state(
+                job_dir,
+                redacted=state.redacted,
+                mapping=state.mapping,
+                manifest=manifest,
+            )
+            return self._public_state_from_state(self._load_state_unlocked(job_id, job_dir))
+
+    def prepare_enhanced_from_text(
+        self,
+        text: str,
+        *,
+        source_name: str = "upload.txt",
+        source_format: str = "text",
+        page_count: int | None = None,
+    ) -> dict[str, object]:
+        """Create a private quick baseline and queue its optional local audit.
+
+        This method deliberately performs no enhanced-audit import or Ollama
+        probe.  The caller chooses when to hand the queued job to an
+        :class:`~pii_guard.audit_manager.AuditManager`.
+        """
+
+        public = self.create_quick_from_text(
+            text,
+            source_name=source_name,
+            source_format=source_format,
+            page_count=page_count,
+        )
+        try:
+            return self._mark_enhanced_queued(str(public["job_id"]))
+        except BaseException:
+            try:
+                self.delete(str(public["job_id"]))
+            except (OSError, WorkflowError):
+                pass
+            raise
+
+    def prepare_enhanced_from_pdf_bytes(self, data: bytes) -> dict[str, object]:
+        """Extract one PDF in memory, then queue its enhanced private baseline."""
+
+        extraction = extract_pdf_text(data)
+        return self.prepare_enhanced_from_text(
+            extraction.text,
+            source_name="upload.pdf",
+            source_format="pdf",
+            page_count=extraction.page_count,
+        )
+
+    def _begin_enhanced_attempt(self, job_id: str) -> EnhancedAttempt:
+        """Atomically claim a queued/restartable job for one audit child."""
+
+        job_dir = self._job_dir(job_id)
+        with _job_lock(job_dir, exclusive=True):
+            state = self._load_state_unlocked(job_id, job_dir)
+            if state.manifest.get("mode") != "enhanced":
+                raise WorkflowError("JOB_NOT_READY", "This job has no enhanced audit queued.")
+            status = state.manifest.get("audit_status")
+            if status in {"running", "cancel_requested", "queued"}:
+                if status == "queued":
+                    pass
+                else:
+                    raise WorkflowError(
+                        "ENHANCED_BUSY", "An enhanced audit is already running for this job."
+                    )
+            elif status not in ENHANCED_RESTARTABLE_STATES:
+                raise WorkflowError(
+                    "JOB_NOT_READY", "This job cannot be audited in its current state."
+                )
+            token = uuid.uuid4().hex
+            base_generation = _manifest_generation(state.manifest)
+            manifest = dict(state.manifest)
+            manifest.update(
+                {
+                    "audit_status": "running",
+                    "audit_attempt_token": token,
+                    "audit_base_generation": base_generation,
+                    "audit_progress": {
+                        "completed": 0,
+                        "total": 0,
+                        "scope": "enhanced_audit",
+                    },
+                    "generation": base_generation + 1,
+                }
+            )
+            manifest.pop("audit_error_code", None)
+            _write_atomic_state(
+                job_dir,
+                redacted=state.redacted,
+                mapping=state.mapping,
+                manifest=manifest,
+            )
+            source_format = state.manifest.get("source_format", "text")
+            page_count = state.manifest.get("page_count")
+            return EnhancedAttempt(
+                job_id=job_id,
+                attempt_token=token,
+                base_generation=base_generation,
+                original=state.original,
+                redacted=state.redacted,
+                mapping=dict(state.mapping),
+                source_format=str(source_format),
+                page_count=page_count if isinstance(page_count, int) else None,
+            )
+
+    @staticmethod
+    def _safe_audit_progress(value: object) -> dict[str, object]:
+        """Keep only bounded progress counters safe for public status."""
+
+        if not isinstance(value, Mapping):
+            return {"completed": 0, "total": 0, "scope": "enhanced_audit"}
+        result: dict[str, object] = {}
+        for key in ("completed", "total", "pass_number"):
+            count = value.get(key)
+            if isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= 1_000_000:
+                result[key] = count
+        scope = value.get("scope")
+        if isinstance(scope, str) and scope in {"enhanced_audit", "pii_review"}:
+            result["scope"] = scope
+        result.setdefault("completed", 0)
+        result.setdefault("total", 0)
+        result.setdefault("scope", "enhanced_audit")
+        return result
+
+    def _update_enhanced_progress(
+        self,
+        attempt: EnhancedAttempt,
+        progress: Mapping[str, object] | None,
+    ) -> bool:
+        """Publish safe progress without holding the lock during model work."""
+
+        job_dir = self._job_dir(attempt.job_id)
+        with _job_lock(job_dir, exclusive=True):
+            try:
+                state = self._load_state_unlocked(attempt.job_id, job_dir)
+            except WorkflowError:
+                return False
+            if (
+                state.manifest.get("mode") != "enhanced"
+                or state.manifest.get("audit_status") != "running"
+                or state.manifest.get("audit_attempt_token") != attempt.attempt_token
+                or state.manifest.get("audit_base_generation") != attempt.base_generation
+            ):
+                return False
+            manifest = dict(state.manifest)
+            manifest["audit_progress"] = self._safe_audit_progress(progress)
+            manifest["generation"] = _manifest_generation(state.manifest) + 1
+            _write_atomic_state(
+                job_dir,
+                redacted=state.redacted,
+                mapping=state.mapping,
+                manifest=manifest,
+            )
+            return True
+
+    @staticmethod
+    def _result_value(result: object, names: tuple[str, ...]) -> object:
+        if isinstance(result, Mapping):
+            for name in names:
+                if name in result:
+                    return result[name]
+            return None
+        for name in names:
+            try:
+                value = getattr(result, name)
+            except AttributeError:
+                continue
+            return value
+        return None
+
+    def _normalise_enhanced_result(
+        self,
+        attempt: EnhancedAttempt,
+        result: object,
+    ) -> tuple[str, dict[str, str]]:
+        """Validate an audit result and namespace any newly returned markers."""
+
+        candidate_text = self._result_value(
+            result, ("redacted_text", "redacted", "anonymized_text", "text")
+        )
+        if not isinstance(candidate_text, str):
+            raise WorkflowError(
+                "AUDIT_INVALID_RESULT", "Enhanced audit returned an invalid result."
+            )
+        raw_mapping = self._result_value(result, ("mapping", "replacement_map", "private_mapping"))
+        if not isinstance(raw_mapping, Mapping):
+            raise WorkflowError(
+                "AUDIT_INVALID_RESULT", "Enhanced audit returned an invalid result."
+            )
+        if not all(
+            isinstance(key, str) and isinstance(value, str) and value
+            for key, value in raw_mapping.items()
+        ):
+            raise WorkflowError(
+                "AUDIT_INVALID_RESULT", "Enhanced audit returned an invalid result."
+            )
+        if any(raw_mapping.get(marker) != value for marker, value in attempt.mapping.items()):
+            raise WorkflowError(
+                "AUDIT_INVALID_RESULT",
+                "Enhanced audit omitted part of the private baseline mapping.",
+            )
+
+        output = candidate_text
+        mapping = dict(attempt.mapping)
+        counters: dict[str, int] = {}
+        for marker in mapping:
+            parsed = _split_marker(marker)
+            if parsed is not None:
+                counters[parsed[0]] = max(counters.get(parsed[0], 0), parsed[1])
+        for marker, value in raw_mapping.items():
+            if marker in mapping:
+                if mapping[marker] != value:
+                    raise WorkflowError(
+                        "AUDIT_INVALID_RESULT", "Enhanced audit returned an invalid result."
+                    )
+                continue
+            if NAMESPACED_PATTERN.fullmatch(marker):
+                expected_prefix = f"[[PII-{attempt.job_id[:10]}-"
+                if not marker.startswith(expected_prefix):
+                    raise WorkflowError(
+                        "AUDIT_INVALID_RESULT", "Enhanced audit returned an invalid result."
+                    )
+                generated = marker
+            else:
+                raw_match = PLACEHOLDER_TYPE_PATTERN.fullmatch(marker)
+                if raw_match is None:
+                    raise WorkflowError(
+                        "AUDIT_INVALID_RESULT", "Enhanced audit returned an invalid result."
+                    )
+                entity_type = raw_match.group(1)
+                counters[entity_type] = counters.get(entity_type, 0) + 1
+                generated = f"[[PII-{attempt.job_id[:10]}-{entity_type}-{counters[entity_type]}]]"
+                output = output.replace(marker, generated)
+            if generated in mapping and mapping[generated] != value:
+                raise WorkflowError(
+                    "AUDIT_INVALID_RESULT", "Enhanced audit returned an invalid result."
+                )
+            mapping[generated] = value
+
+        if _replace_all(output, mapping) != attempt.original:
+            raise WorkflowError(
+                "AUDIT_INVALID_RESULT", "Enhanced audit failed round-trip validation."
+            )
+        if len(output.encode("utf-8")) > MAX_INPUT_BYTES:
+            raise WorkflowError(
+                "AUDIT_INVALID_RESULT", "Enhanced audit result exceeds the safety limit."
+            )
+        return output, mapping
+
+    def _finish_enhanced_attempt(
+        self,
+        attempt: EnhancedAttempt,
+        *,
+        status: str,
+        result: object | None = None,
+        error_code: str | None = None,
+        progress: Mapping[str, object] | None = None,
+    ) -> bool:
+        """Atomically publish one audit outcome only for its live attempt."""
+
+        if status not in {"passed", "failed", "cancelled", "interrupted"}:
+            status = "failed"
+        job_dir = self._job_dir(attempt.job_id)
+        with _job_lock(job_dir, exclusive=True):
+            try:
+                state = self._load_state_unlocked(attempt.job_id, job_dir)
+            except WorkflowError:
+                return False
+            if (
+                state.manifest.get("mode") != "enhanced"
+                or state.manifest.get("audit_status") not in {"running", "cancel_requested"}
+                or state.manifest.get("audit_attempt_token") != attempt.attempt_token
+                or state.manifest.get("audit_base_generation") != attempt.base_generation
+                or state.original != attempt.original
+                or state.redacted != attempt.redacted
+                or state.mapping != attempt.mapping
+            ):
+                return False
+            if state.manifest.get("audit_status") == "cancel_requested" and status != "interrupted":
+                status = "cancelled"
+            candidate_redacted = state.redacted
+            candidate_mapping = dict(state.mapping)
+            if status == "passed":
+                try:
+                    candidate_redacted, candidate_mapping = self._normalise_enhanced_result(
+                        attempt, result
+                    )
+                except WorkflowError:
+                    status = "failed"
+                    error_code = "AUDIT_INVALID_RESULT"
+            manifest = _manifest_for(
+                job_id=attempt.job_id,
+                job_dir=job_dir,
+                original=attempt.original,
+                redacted=candidate_redacted,
+                mapping=candidate_mapping,
+                model="enhanced",
+                source_path=job_dir / SOURCE_NAME,
+                source_format=attempt.source_format,
+                page_count=attempt.page_count,
+                previous=state.manifest,
+            )
+            manifest["mode"] = "enhanced"
+            manifest["audit_status"] = status
+            manifest["generation"] = _manifest_generation(state.manifest) + 1
+            manifest["audit_progress"] = self._safe_audit_progress(progress)
+            audit_summary = self._result_value(result, ("summary", "audit_summary"))
+            if isinstance(audit_summary, Mapping):
+                safe_summary: dict[str, object] = {}
+                for key in (
+                    "audit_passes",
+                    "selected_paragraphs",
+                    "total_paragraphs",
+                    "model_calls",
+                ):
+                    value = audit_summary.get(key)
+                    if (
+                        isinstance(value, int)
+                        and not isinstance(value, bool)
+                        and 0 <= value <= 1_000_000
+                    ):
+                        safe_summary[key] = value
+                scope = audit_summary.get("audit_scope")
+                if isinstance(scope, str) and scope in {
+                    "full",
+                    "suspicious_paragraphs",
+                    "enhanced_audit",
+                    "pii_review",
+                }:
+                    safe_summary["audit_scope"] = scope
+                if safe_summary:
+                    manifest["audit_summary"] = safe_summary
+            if status == "passed":
+                progress_manifest = manifest.get("audit_progress")
+                if isinstance(progress_manifest, dict):
+                    progress_manifest["completed"] = progress_manifest.get(
+                        "total", progress_manifest.get("completed", 0)
+                    )
+                manifest.pop("audit_error_code", None)
+            else:
+                safe_code = error_code if error_code in SAFE_AUDIT_ERROR_CODES else "AUDIT_FAILED"
+                manifest["audit_error_code"] = safe_code
+            manifest.pop("audit_attempt_token", None)
+            manifest.pop("audit_base_generation", None)
+            _write_atomic_state(
+                job_dir,
+                redacted=candidate_redacted if status == "passed" else state.redacted,
+                mapping=candidate_mapping if status == "passed" else state.mapping,
+                manifest=manifest,
+            )
+            return True
+
+    def _request_enhanced_cancel(self, job_id: str) -> dict[str, object]:
+        """Mark one active enhanced job for cancellation under its job lock."""
+
+        job_dir = self._job_dir(job_id)
+        with _job_lock(job_dir, exclusive=True):
+            state = self._load_state_unlocked(job_id, job_dir)
+            if state.manifest.get("mode") != "enhanced":
+                raise WorkflowError("JOB_NOT_READY", "This job has no enhanced audit.")
+            status = state.manifest.get("audit_status")
+            if status not in {"queued", "running", "cancel_requested"}:
+                return self._public_state_from_state(state)
+            manifest = dict(state.manifest)
+            if status == "queued":
+                manifest["audit_status"] = "cancelled"
+                manifest["audit_error_code"] = "AUDIT_CANCELLED"
+                manifest.pop("audit_attempt_token", None)
+                manifest.pop("audit_base_generation", None)
+            else:
+                manifest["audit_status"] = "cancel_requested"
+            manifest["generation"] = _manifest_generation(state.manifest) + 1
+            _write_atomic_state(
+                job_dir,
+                redacted=state.redacted,
+                mapping=state.mapping,
+                manifest=manifest,
+            )
+            return self._public_state_from_state(self._load_state_unlocked(job_id, job_dir))
+
+    def _queue_enhanced_restart(self, job_id: str) -> dict[str, object]:
+        """Queue a failed/cancelled/interrupted enhanced job for explicit restart."""
+
+        job_dir = self._job_dir(job_id)
+        with _job_lock(job_dir, exclusive=True):
+            state = self._load_state_unlocked(job_id, job_dir)
+            if (
+                state.manifest.get("mode") != "enhanced"
+                or state.manifest.get("audit_status") not in ENHANCED_RESTARTABLE_STATES
+            ):
+                raise WorkflowError("JOB_NOT_READY", "This job cannot be restarted yet.")
+            manifest = dict(state.manifest)
+            manifest["audit_status"] = "queued"
+            manifest["audit_progress"] = {
+                "completed": 0,
+                "total": 0,
+                "scope": "enhanced_audit",
+            }
+            manifest.pop("audit_error_code", None)
+            manifest.pop("audit_attempt_token", None)
+            manifest.pop("audit_base_generation", None)
+            manifest["generation"] = _manifest_generation(state.manifest) + 1
+            _write_atomic_state(
+                job_dir,
+                redacted=state.redacted,
+                mapping=state.mapping,
+                manifest=manifest,
+            )
+            return self._public_state_from_state(self._load_state_unlocked(job_id, job_dir))
+
+    def start_enhanced_audit(
+        self, job_id: str, *, manager: object | None = None
+    ) -> dict[str, object]:
+        """Start one enhanced child through an explicitly supplied manager."""
+
+        selected = manager
+        if selected is None:
+            selected = self._default_audit_manager
+        if selected is None:
+            from pii_guard.audit_manager import AuditManager
+
+            selected = AuditManager(self)
+            self._default_audit_manager = selected
+        start = getattr(selected, "start", None)
+        if not callable(start):
+            raise WorkflowError("AUDIT_UNAVAILABLE", "Enhanced audit manager is unavailable.")
+        return start(job_id)
+
+    # Short aliases keep adapters from needing to know the internal lifecycle
+    # verb while the explicit method remains the documented API.
+    start_enhanced = start_enhanced_audit
+
+    def cancel_enhanced(self, job_id: str, *, manager: object | None = None) -> dict[str, object]:
+        """Request cancellation and terminate the manager's child if present."""
+
+        selected = manager
+        if selected is None:
+            selected = self._default_audit_manager
+        if selected is not None:
+            cancel = getattr(selected, "cancel", None)
+            if callable(cancel):
+                return cancel(job_id)
+        return self._request_enhanced_cancel(job_id)
+
+    def restart_enhanced(self, job_id: str, *, manager: object | None = None) -> dict[str, object]:
+        """Explicitly restart a failed/cancelled/interrupted enhanced job."""
+
+        selected = manager
+        if selected is None:
+            selected = self._default_audit_manager
+        if selected is None:
+            from pii_guard.audit_manager import AuditManager
+
+            selected = AuditManager(self)
+            self._default_audit_manager = selected
+        restart = getattr(selected, "restart", None)
+        if not callable(restart):
+            raise WorkflowError("AUDIT_UNAVAILABLE", "Enhanced audit manager is unavailable.")
+        return restart(job_id)
+
+    def recover_stale_enhanced_jobs(self) -> int:
+        """Mark stale active enhanced jobs interrupted without restarting them."""
+
+        recovered = 0
+        try:
+            entries = list(self.root.iterdir())
+        except OSError:
+            return recovered
+        for candidate in entries:
+            if (
+                candidate.is_symlink()
+                or not candidate.is_dir()
+                or not JOB_ID_PATTERN.fullmatch(candidate.name)
+            ):
+                continue
+            try:
+                _assert_owner_mode(candidate, JOB_MODE, directory=True)
+                with _job_lock(candidate, exclusive=True):
+                    state = self._load_state_unlocked(candidate.name, candidate)
+                    if (
+                        state.manifest.get("mode") != "enhanced"
+                        or state.manifest.get("audit_status") not in ENHANCED_ACTIVE_STATES
+                    ):
+                        continue
+                    manifest = dict(state.manifest)
+                    manifest["audit_status"] = "interrupted"
+                    manifest["audit_error_code"] = "AUDIT_INTERRUPTED"
+                    manifest.pop("audit_attempt_token", None)
+                    manifest.pop("audit_base_generation", None)
+                    manifest["generation"] = _manifest_generation(state.manifest) + 1
+                    _write_atomic_state(
+                        candidate,
+                        redacted=state.redacted,
+                        mapping=state.mapping,
+                        manifest=manifest,
+                    )
+                    recovered += 1
+            except (OSError, WorkflowError):
+                continue
+        return recovered
+
     def create_quick_from_path(self, path: Path) -> dict[str, object]:
         """Read one safe source path and create the corresponding private job."""
 
@@ -1282,6 +2032,7 @@ class PrivateJobStore:
     def _load_state_unlocked(self, job_id: str, job_dir: Path) -> JobState:
         """Load and validate one job while its caller owns the job lock."""
 
+        _recover_pending_transactions(job_dir)
         for name in (SOURCE_NAME, REDACTED_NAME, PRIVATE_MAP_NAME, MANIFEST_NAME):
             _assert_owner_mode(job_dir / name, PRIVATE_MODE, directory=False)
         raw_manifest = _safe_json(job_dir / MANIFEST_NAME)
@@ -1320,6 +2071,24 @@ class PrivateJobStore:
             raise WorkflowError(
                 "INTEGRITY_CHECK_FAILED", "Private job integrity verification failed."
             )
+        mode = raw_manifest.get("mode", "quick")
+        if mode not in {"quick", "enhanced"}:
+            raise WorkflowError("INVALID_JOB", "Private job mode is invalid.")
+        audit_status = raw_manifest.get("audit_status")
+        if mode == "quick":
+            if audit_status not in {None, "quick_ready"}:
+                raise WorkflowError("INVALID_JOB", "Private quick state is invalid.")
+        elif not isinstance(audit_status, str) or audit_status not in ENHANCED_STATES - {
+            "quick_ready"
+        }:
+            raise WorkflowError("INVALID_JOB", "Private enhanced state is invalid.")
+        _manifest_generation(raw_manifest)
+        attempt_token = raw_manifest.get("audit_attempt_token")
+        if attempt_token is not None and (
+            not isinstance(attempt_token, str)
+            or AUDIT_ATTEMPT_TOKEN_PATTERN.fullmatch(attempt_token) is None
+        ):
+            raise WorkflowError("INVALID_MANIFEST", "Private audit attempt identity is invalid.")
         source_format = raw_manifest.get("source_format", "text")
         if source_format not in {"text", "pdf"}:
             raise WorkflowError("INVALID_JOB", "Private source format is invalid.")
@@ -1348,12 +2117,87 @@ class PrivateJobStore:
 
     def load_state(self, job_id: str) -> JobState:
         job_dir = self._job_dir(job_id)
-        with _job_lock(job_dir, exclusive=False):
+        # Loading may recover an interrupted multi-file transaction, so this
+        # path is a writer even when the common case only reads state.
+        with _job_lock(job_dir, exclusive=True):
             return self._load_state_unlocked(job_id, job_dir)
 
     @staticmethod
     def _public_state_from_state(state: JobState) -> dict[str, object]:
         """Build a public receipt from a state already protected by a lock."""
+
+        mode = state.manifest.get("mode", "quick")
+        if mode == "enhanced":
+            audit_status = state.manifest.get("audit_status")
+            if not isinstance(audit_status, str) or audit_status not in ENHANCED_STATES - {
+                "quick_ready"
+            }:
+                raise WorkflowError("INVALID_JOB", "Private enhanced state is invalid.")
+            result: dict[str, object] = {
+                "ok": True,
+                "job_id": state.job_id,
+                "mode": "enhanced",
+                "audit_status": audit_status,
+                "source_format": state.manifest.get("source_format", "text"),
+            }
+            if result["source_format"] == "pdf":
+                result["page_count"] = state.manifest["page_count"]
+            progress = state.manifest.get("audit_progress")
+            if isinstance(progress, dict):
+                safe_progress: dict[str, object] = {}
+                for key in ("completed", "total", "pass_number"):
+                    value = progress.get(key)
+                    if (
+                        isinstance(value, int)
+                        and not isinstance(value, bool)
+                        and 0 <= value <= 1_000_000
+                    ):
+                        safe_progress[key] = value
+                scope = progress.get("scope")
+                if isinstance(scope, str) and scope in {"enhanced_audit", "pii_review"}:
+                    safe_progress["scope"] = scope
+                if safe_progress:
+                    result["progress"] = safe_progress
+            summary = state.manifest.get("audit_summary")
+            if isinstance(summary, Mapping):
+                safe_summary: dict[str, object] = {}
+                for key in (
+                    "audit_passes",
+                    "selected_paragraphs",
+                    "total_paragraphs",
+                    "model_calls",
+                ):
+                    value = summary.get(key)
+                    if (
+                        isinstance(value, int)
+                        and not isinstance(value, bool)
+                        and 0 <= value <= 1_000_000
+                    ):
+                        safe_summary[key] = value
+                scope = summary.get("audit_scope")
+                if isinstance(scope, str) and scope in {
+                    "full",
+                    "suspicious_paragraphs",
+                    "enhanced_audit",
+                    "pii_review",
+                }:
+                    safe_summary["audit_scope"] = scope
+                if safe_summary:
+                    result["audit_summary"] = safe_summary
+            if audit_status != "passed":
+                error_code = state.manifest.get("audit_error_code")
+                if isinstance(error_code, str) and error_code in SAFE_AUDIT_ERROR_CODES:
+                    result["error_code"] = error_code
+                return result
+            # Only a passed audit releases text and marker names to callers.
+            result.update(PrivateJobStore._quick_public_fields(state))
+            return result
+
+        return PrivateJobStore._quick_public_fields(state)
+
+    @staticmethod
+    def _quick_public_fields(state: JobState) -> dict[str, object]:
+        """Build the legacy quick receipt fields from validated private state."""
 
         placeholders: list[dict[str, str]] = []
         for placeholder in sorted(state.mapping):
@@ -1369,7 +2213,7 @@ class PrivateJobStore:
         result: dict[str, object] = {
             "ok": True,
             "job_id": state.job_id,
-            "mode": "quick",
+            "mode": state.manifest.get("mode", "quick"),
             "source_format": state.manifest.get("source_format", "text"),
             "anonymized_text": state.redacted,
             "placeholders": placeholders,
@@ -1475,27 +2319,54 @@ class PrivateJobStore:
             page_count=page_count if source_format == "pdf" else None,
             previous=state.manifest,
         )
+        previous_mode = state.manifest.get("mode", "quick")
+        previous_status = state.manifest.get("audit_status")
+        if previous_mode == "enhanced" and previous_status == "passed":
+            manifest["mode"] = "enhanced"
+            manifest["audit_status"] = "passed"
+            for key, value in state.manifest.items():
+                if key.startswith("audit_") and key not in {
+                    "audit_attempt_token",
+                    "audit_base_generation",
+                }:
+                    manifest[key] = value
+        manifest["generation"] = _manifest_generation(state.manifest) + 1
         history = manifest.get("manual_annotations", [])
         history_list = list(history) if isinstance(history, list) else []
         history_list.append(dict(annotation))
         manifest["manual_annotations"] = history_list
-        _write_private(state.job_dir / REDACTED_NAME, redacted, replace=True)
-        _write_private(
-            state.job_dir / PRIVATE_MAP_NAME,
-            json.dumps(mapping, ensure_ascii=False, sort_keys=True),
-            replace=True,
-        )
-        _write_private(
-            state.job_dir / MANIFEST_NAME,
-            json.dumps(manifest, ensure_ascii=False, sort_keys=True),
-            replace=True,
-        )
+        if previous_mode == "enhanced":
+            _write_atomic_state(
+                state.job_dir,
+                redacted=redacted,
+                mapping=mapping,
+                manifest=manifest,
+            )
+        else:
+            _write_private(state.job_dir / REDACTED_NAME, redacted, replace=True)
+            _write_private(
+                state.job_dir / PRIVATE_MAP_NAME,
+                json.dumps(mapping, ensure_ascii=False, sort_keys=True),
+                replace=True,
+            )
+            _write_private(
+                state.job_dir / MANIFEST_NAME,
+                json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+                replace=True,
+            )
 
     def mask_terms(self, job_id: str, terms: Iterable[str]) -> dict[str, object]:
         cleaned = self._clean_terms(terms)
         job_dir = self._job_dir(job_id)
         with _job_lock(job_dir, exclusive=True):
             state = self._load_state_unlocked(job_id, job_dir)
+            if (
+                state.manifest.get("mode") == "enhanced"
+                and state.manifest.get("audit_status") != "passed"
+            ):
+                raise WorkflowError(
+                    "JOB_NOT_READY", "This enhanced job is not ready for manual review."
+                )
             redacted, mapping, applied, missing, occurrences = self._apply_mask(
                 state.redacted, dict(state.mapping), job_id, cleaned
             )
@@ -1537,10 +2408,16 @@ class PrivateJobStore:
         job_dir = self._job_dir(job_id)
         with _job_lock(job_dir, exclusive=True):
             state = self._load_state_unlocked(job_id, job_dir)
-            if state.manifest.get("mode") != "quick":
+            mode = state.manifest.get("mode", "quick")
+            audit_status = state.manifest.get("audit_status")
+            if mode == "quick":
+                ready = audit_status in {None, "quick_ready"}
+            else:
+                ready = mode == "enhanced" and audit_status == "passed"
+            if not ready:
                 raise WorkflowError(
-                    "MODE_UNAVAILABLE",
-                    "This restore core only accepts quick-mode private jobs.",
+                    "JOB_NOT_READY",
+                    "This private job is not ready for restoration.",
                 )
             edited = state.redacted if edited_redacted is None else edited_redacted
             _validate_edited_redacted(state, edited)
@@ -1578,6 +2455,15 @@ class PrivateJobStore:
         """Delete one validated private job and nothing outside the jobs root."""
 
         job_dir = self._job_dir(job_id)
+        for manager in list(self._audit_managers):
+            try:
+                cancel = getattr(manager, "cancel", None)
+                if callable(cancel):
+                    cancel(job_id)
+            except (OSError, WorkflowError, RuntimeError):
+                # Deletion remains authoritative; an already-dead manager is
+                # harmless because the attempt token prevents stale promotion.
+                pass
         with _job_lock(job_dir, exclusive=True):
             known_files = {
                 SOURCE_NAME,
@@ -1591,7 +2477,15 @@ class PrivateJobStore:
                 r"^\.[A-Za-z0-9._-]+\.(?:private\.txt|private\.json|safe\.json)$"
             )
             for entry in job_dir.iterdir():
-                if entry.is_symlink() or not entry.is_file():
+                if entry.is_symlink():
+                    raise WorkflowError("INVALID_JOB", "Private job contains an unknown artifact.")
+                if entry.is_dir() and (
+                    TRANSACTION_PATTERN.fullmatch(entry.name)
+                    or ATTEMPT_PATTERN.fullmatch(entry.name)
+                ):
+                    shutil.rmtree(entry)
+                    continue
+                if not entry.is_file():
                     raise WorkflowError("INVALID_JOB", "Private job contains an unknown artifact.")
                 if (
                     entry.name not in known_files

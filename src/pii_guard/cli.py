@@ -55,13 +55,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="輸入檔案路徑或 - (stdin，僅純文字)",
     )
     anon.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         type=Path,
         default=None,
         help="去識別化輸出路徑（預設：stdout for text, <input>.anon.<ext> for files）",
     )
     anon.add_argument(
-        "-m", "--mapping",
+        "-m",
+        "--mapping",
         type=Path,
         default=Path("mapping.json"),
         help="mapping JSON 輸出路徑（預設：mapping.json）",
@@ -141,13 +143,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="去識別化文本檔案路徑或 - (stdin，僅純文字)",
     )
     restore.add_argument(
-        "-m", "--mapping",
+        "-m",
+        "--mapping",
         type=Path,
         required=True,
         help="mapping JSON 路徑",
     )
     restore.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         type=Path,
         default=None,
         help="還原後文本輸出路徑（預設：stdout）",
@@ -169,13 +173,25 @@ def build_parser() -> argparse.ArgumentParser:
     web = subparsers.add_parser(
         "web",
         aliases=["local-web"],
-        help="啟動 127.0.0.1 本機一頁式 quick review 介面",
+        help="啟動 127.0.0.1 本機快速／加強去識別化介面",
     )
     web.add_argument("--port", type=int, default=0, help="本機埠號（預設隨機）")
     web.add_argument("--open", action="store_true", help="啟動後開啟預設瀏覽器")
     web.add_argument("--model", type=str, default="ckiplab/bert-base-chinese-ner")
     web.add_argument("--threshold", type=_threshold_arg, default=0.5)
     web.add_argument("--jobs-root", type=Path, default=None)
+    web.add_argument(
+        "--audit-model",
+        type=str,
+        default=None,
+        help="加強模式使用的本機 Ollama 模型（預設由共用稽核核心決定）",
+    )
+    web.add_argument(
+        "--ollama-url",
+        type=str,
+        default=None,
+        help="加強模式的本機 Ollama loopback URL",
+    )
 
     return parser
 
@@ -222,6 +238,7 @@ def _default_output_path(input_path: str) -> Path:
     """Generate default output path: <stem>.anon.<ext>."""
     p = Path(input_path)
     from pii_guard.file_handlers import get_output_extension
+
     out_ext = get_output_extension(p)
     return p.with_stem(p.stem + ".anon").with_suffix(out_ext)
 
@@ -230,6 +247,7 @@ def _default_restore_output_path(input_path: str) -> Path:
     """Generate default restore output path for structured formats: <stem>.restored.<ext>."""
     p = Path(input_path)
     from pii_guard.file_handlers import get_output_extension
+
     out_ext = get_output_extension(p)
     return p.with_stem(p.stem + ".restored").with_suffix(out_ext)
 
@@ -379,7 +397,13 @@ def cmd_web(args: argparse.Namespace) -> int:
             ckip_model=args.model,
             score_threshold=args.threshold,
         )
-        run_web(port=args.port, open_browser=args.open, store=store)
+        run_web(
+            port=args.port,
+            open_browser=args.open,
+            store=store,
+            audit_model=args.audit_model,
+            ollama_url=args.ollama_url,
+        )
     except WorkflowError as error:
         return _safe_error(error.code, error.message)
     except OSError:

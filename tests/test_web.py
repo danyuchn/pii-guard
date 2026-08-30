@@ -5,18 +5,37 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 import pytest
 
+import pii_guard.audit_manager as audit_manager_module
+from pii_guard import enhanced_audit
+from pii_guard.audit_manager import AuditManager
 from pii_guard.local_workflow import RESTORED_NAME, PrivateJobStore
 from pii_guard.web import LocalWebApplication, WebConfig, create_server
 from tests.pdf_fixtures import build_image_only_pdf, build_text_pdf
 from tests.test_local_workflow import FakeEngine
 
 ORIGINAL = "聯絡人王小明，身分證A123456789，手機0912345678。"
+
+
+def passing_enhanced_audit(
+    _original: str,
+    redacted: str,
+    mapping: dict[str, str],
+    **_kwargs: object,
+) -> dict[str, object]:
+    time.sleep(0.15)
+    return {"passed": True, "redacted_text": redacted, "mapping": mapping}
+
+
+def blocking_enhanced_audit(*_args: object, **_kwargs: object) -> dict[str, object]:
+    time.sleep(10)
+    return {"passed": True}
 
 
 @pytest.fixture()
@@ -140,6 +159,31 @@ def test_page_and_api_never_return_mapping_values(running_server) -> None:
     assert "A123456789" not in json.dumps(state, ensure_ascii=False)
     assert "王小明" not in json.dumps(state, ensure_ascii=False)
     _assert_public_json_has_no_private_paths(state, store)
+
+
+def test_quick_text_and_pdf_never_touch_ollama(
+    running_server,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base, _server, _store = running_server
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("quick mode touched Ollama")
+
+    monkeypatch.setattr(enhanced_audit, "_verify_local_ollama_listener", forbidden)
+    monkeypatch.setattr(enhanced_audit, "_call_ollama", forbidden)
+
+    text_body, text_type = _multipart(ORIGINAL, mode="quick")
+    text_status, _ = _request(
+        base, "/api/process", method="POST", data=text_body, content_type=text_type
+    )
+    assert text_status == 200
+
+    pdf_body, pdf_type = _multipart_bytes(build_text_pdf("PAGE ONE"), mode="quick")
+    pdf_status, _ = _request(
+        base, "/api/process", method="POST", data=pdf_body, content_type=pdf_type
+    )
+    assert pdf_status == 200
 
 
 def test_upload_review_download_private_restore_and_delete(
@@ -338,17 +382,168 @@ def test_pdf_image_only_upload_is_rejected_without_creating_a_job(running_server
     assert list(store.root.iterdir()) == []
 
 
-def test_enhanced_mode_is_explicitly_unavailable(running_server) -> None:
-    base, _server, store = running_server
-    body, content_type = _multipart(ORIGINAL, mode="enhanced")
-    status, result = _request(
-        base, "/api/process", method="POST", data=body, content_type=content_type
-    )
-    assert status == 400
-    assert isinstance(result, dict)
-    assert result["error_code"] == "MODE_UNAVAILABLE"
-    assert "A123456789" not in json.dumps(result, ensure_ascii=False)
-    _assert_public_json_has_no_private_paths(result, store)
+def test_enhanced_mode_withholds_until_passed_and_keeps_quick_responsive(
+    tmp_path: Path,
+) -> None:
+    store = PrivateJobStore(tmp_path / "jobs", engine=FakeEngine())
+    manager = AuditManager(store, runner=passing_enhanced_audit)
+    application = LocalWebApplication(store, audit_manager=manager)
+    server, url = create_server(application, WebConfig(port=0))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = url.rstrip("/")
+    try:
+        body, content_type = _multipart(ORIGINAL, mode="enhanced")
+        status, result = _request(
+            base, "/api/process", method="POST", data=body, content_type=content_type
+        )
+        assert status == 202
+        assert isinstance(result, dict)
+        assert result["audit_status"] == "queued"
+        assert "anonymized_text" not in result
+        assert "placeholders" not in result
+        job_id = str(result["job_id"])
+
+        download_status, _ = _request(base, f"/api/jobs/{job_id}/download")
+        assert download_status == 409
+        mask_status, _ = _request(
+            base,
+            f"/api/jobs/{job_id}/mask",
+            method="POST",
+            data=json.dumps({"terms": ["聯絡人"]}).encode("utf-8"),
+            content_type="application/json",
+        )
+        assert mask_status == 409
+        restore_status, _ = _request(
+            base,
+            f"/api/jobs/{job_id}/restore",
+            method="POST",
+            data=b"",
+            content_type="application/json",
+        )
+        assert restore_status == 409
+
+        quick_body, quick_type = _multipart("聯絡人王小明", mode="quick")
+        quick_status, quick = _request(
+            base,
+            "/api/process",
+            method="POST",
+            data=quick_body,
+            content_type=quick_type,
+        )
+        assert quick_status == 200
+        assert isinstance(quick, dict)
+        assert quick["mode"] == "quick"
+
+        deadline = time.monotonic() + 8
+        state: dict[str, object] = {}
+        while time.monotonic() < deadline:
+            state_status, payload = _request(base, f"/api/jobs/{job_id}/state")
+            assert state_status == 200
+            assert isinstance(payload, dict)
+            state = payload
+            if state.get("audit_status") == "passed":
+                break
+            assert "anonymized_text" not in state
+            time.sleep(0.02)
+        assert state["audit_status"] == "passed"
+        assert "anonymized_text" in state
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_default_web_manager_never_marks_fresh_job_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = PrivateJobStore(tmp_path / "jobs", engine=FakeEngine())
+    real_manager = AuditManager
+
+    def manager_factory(store_value: object, **kwargs: object) -> AuditManager:
+        return real_manager(store_value, runner=passing_enhanced_audit, **kwargs)
+
+    monkeypatch.setattr(audit_manager_module, "AuditManager", manager_factory)
+    application = LocalWebApplication(store)
+    receipt = application.process(ORIGINAL, "fake.txt", "enhanced")
+    job_id = str(receipt["job_id"])
+    observed: list[str] = [str(receipt["audit_status"])]
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        state = application.state(job_id)
+        observed.append(str(state["audit_status"]))
+        if state["audit_status"] == "passed":
+            break
+        time.sleep(0.01)
+
+    assert observed[-1] == "passed"
+    assert "interrupted" not in observed
+    application.close()
+
+
+def test_enhanced_http_cancel_and_restart(tmp_path: Path) -> None:
+    store = PrivateJobStore(tmp_path / "jobs", engine=FakeEngine())
+    manager = AuditManager(store, runner=blocking_enhanced_audit, timeout_seconds=30)
+    application = LocalWebApplication(store, audit_manager=manager)
+    server, url = create_server(application, WebConfig(port=0))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = url.rstrip("/")
+    try:
+        body, content_type = _multipart(ORIGINAL, mode="enhanced")
+        status, result = _request(
+            base, "/api/process", method="POST", data=body, content_type=content_type
+        )
+        assert status == 202
+        assert isinstance(result, dict)
+        job_id = str(result["job_id"])
+
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            _, state = _request(base, f"/api/jobs/{job_id}/state")
+            assert isinstance(state, dict)
+            if state.get("audit_status") == "running":
+                break
+            time.sleep(0.02)
+        assert state["audit_status"] == "running"
+
+        cancel_status, cancelled = _request(
+            base,
+            f"/api/jobs/{job_id}/audit/cancel",
+            method="POST",
+            data=b"",
+            content_type="application/json",
+        )
+        assert cancel_status == 200
+        assert isinstance(cancelled, dict)
+        assert cancelled["audit_status"] == "cancelled"
+        assert "anonymized_text" not in cancelled
+
+        manager.runner = passing_enhanced_audit
+        restart_status, restarted = _request(
+            base,
+            f"/api/jobs/{job_id}/audit/restart",
+            method="POST",
+            data=b"",
+            content_type="application/json",
+        )
+        assert restart_status == 202
+        assert isinstance(restarted, dict)
+        assert restarted["audit_status"] == "queued"
+
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            _, state = _request(base, f"/api/jobs/{job_id}/state")
+            assert isinstance(state, dict)
+            if state.get("audit_status") == "passed":
+                break
+            time.sleep(0.02)
+        assert state["audit_status"] == "passed"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
 
 
 def test_host_header_and_job_traversal_are_rejected(running_server) -> None:

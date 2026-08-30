@@ -81,9 +81,12 @@ MAX_AUDIT_SPLIT_DEPTH: Final[int] = 3
 # Response-level problems that say nothing about the document: a dropped
 # connection, a truncated generation, a reply that did not match the schema.
 # Discardable only because each chunk is sampled several times.
-TRANSIENT_AUDIT_FAILURES: Final[frozenset[str]] = frozenset({
-    "LOCAL_AUDIT_INVALID", "LOCAL_AUDIT_UNAVAILABLE",
-})
+TRANSIENT_AUDIT_FAILURES: Final[frozenset[str]] = frozenset(
+    {
+        "LOCAL_AUDIT_INVALID",
+        "LOCAL_AUDIT_UNAVAILABLE",
+    }
+)
 PROMPT_INJECTION_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(
         r"\b(?:ignore|disregard|override|forget)\b.{0,100}"
@@ -131,9 +134,7 @@ def _private_write(path: Path, data: str) -> None:
     """Atomically create a private file without following links or overwriting."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", dir=path.parent
-    )
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
     try:
         os.fchmod(descriptor, 0o600)
@@ -562,9 +563,7 @@ def _drop_degenerate_detections(
     return output, kept
 
 
-def _sweep_remaining_occurrences(
-    redacted: str, mapping: dict[str, str]
-) -> str:
+def _sweep_remaining_occurrences(redacted: str, mapping: dict[str, str]) -> str:
     """Redact every remaining literal occurrence of an already-mapped value.
 
     PII Guard replaces the spans its detector reported, not every occurrence of
@@ -617,9 +616,7 @@ def _expand_protected_spans(
     if not protected_tokens:
         return redacted, mapping
     sorted_tokens = sorted(protected_tokens, key=len, reverse=True)
-    token_pattern = re.compile(
-        "(" + "|".join(re.escape(token) for token in sorted_tokens) + ")"
-    )
+    token_pattern = re.compile("(" + "|".join(re.escape(token) for token in sorted_tokens) + ")")
     expanded_mapping = dict(mapping)
     counter = 0
     for placeholder, original_value in list(mapping.items()):
@@ -666,9 +663,7 @@ def _redact_location_suffixes(
     def replace(match: re.Match[str]) -> str:
         nonlocal counter
         counter += 1
-        placeholder = (
-            f"[[PII-{job_id[:10]}-ADDRESS_SUFFIX-{counter}]]"
-        )
+        placeholder = f"[[PII-{job_id[:10]}-ADDRESS_SUFFIX-{counter}]]"
         expanded_mapping[placeholder] = match.group("suffix")
         return match.group("location") + placeholder
 
@@ -702,10 +697,22 @@ def _redact_labeled_identifiers(
     return identifier.sub(replace, redacted), expanded_mapping
 
 
-GENERIC_MAILBOX_HANDLES: Final[frozenset[str]] = frozenset({
-    "admin", "contact", "help", "info", "mail", "master", "news", "office",
-    "sales", "service", "support", "webmaster",
-})
+GENERIC_MAILBOX_HANDLES: Final[frozenset[str]] = frozenset(
+    {
+        "admin",
+        "contact",
+        "help",
+        "info",
+        "mail",
+        "master",
+        "news",
+        "office",
+        "sales",
+        "service",
+        "support",
+        "webmaster",
+    }
+)
 
 
 def _redact_email_handles_in_urls(
@@ -798,9 +805,7 @@ def _redact_casefold_person_aliases(
             if match.group(0) in allowlist:
                 return match.group(0)
             counter += 1
-            alias_placeholder = (
-                f"[[PII-{job_id[:10]}-PERSON_ALIAS-{counter}]]"
-            )
+            alias_placeholder = f"[[PII-{job_id[:10]}-PERSON_ALIAS-{counter}]]"
             expanded_mapping[alias_placeholder] = match.group(0)
             return alias_placeholder
 
@@ -1149,12 +1154,8 @@ def _local_alias_audit(
         # together rather than one after another. Same requests, same union,
         # a third of the wall clock when the local server has slots free -- and
         # no worse than sequential when it does not, since it queues them.
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=AUDIT_SAMPLES_PER_CHUNK
-        ) as pool:
-            futures = [
-                pool.submit(one_sample) for _ in range(AUDIT_SAMPLES_PER_CHUNK)
-            ]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=AUDIT_SAMPLES_PER_CHUNK) as pool:
+            futures = [pool.submit(one_sample) for _ in range(AUDIT_SAMPLES_PER_CHUNK)]
             for future in futures:
                 try:
                     found.extend(future.result())
@@ -1300,67 +1301,35 @@ def _redact_worker(args: argparse.Namespace) -> None:
         )
     redacted, mapping = _namespace_mapping(redacted, mapping, args.job_id)
     protected_tokens = {**allow_tokens, **literal_tokens, **boilerplate_tokens}
-    redacted, mapping = _expand_protected_spans(
-        redacted, mapping, protected_tokens, args.job_id
-    )
+    redacted, mapping = _expand_protected_spans(redacted, mapping, protected_tokens, args.job_id)
     redacted = _replace_all(redacted, protected_tokens)
     redacted, mapping = _drop_degenerate_detections(redacted, mapping)
     redacted = _sweep_remaining_occurrences(redacted, mapping)
     redacted, mapping = _redact_location_suffixes(redacted, mapping, args.job_id)
     redacted, mapping = _redact_labeled_identifiers(redacted, mapping, args.job_id)
-    redacted, mapping = _redact_casefold_person_aliases(
-        redacted, mapping, args.job_id, allowlist
-    )
-    redacted, mapping = _redact_email_handles_in_urls(
-        redacted, mapping, args.job_id, allowlist
-    )
-    counters: dict[str, int] = {}
-    audit_passes = 0
-    audited_windows: set[str] = set()
-    # Counts consecutive clean passes against REQUIRED_CLEAN_AUDIT_PASSES. The
-    # local audit is not deterministic in practice: on 2026-08-20 the same
-    # penalty table came back with four employer names on one run and none on
-    # the next, and a reporter's byline was found on one run and missed on the
-    # next. That is why one pass cannot be taken at face value -- but the
-    # repetition that answers it now lives inside the pass, in the
-    # AUDIT_SAMPLES_PER_CHUNK union, so the requirement here is one. Raise
-    # REQUIRED_CLEAN_AUDIT_PASSES to demand confirming passes on top of it.
-    clean_streak = 0
-    for audit_passes in range(1, MAX_AUDIT_PASSES + 1):
-        misses = _local_alias_audit(
+    redacted, mapping = _redact_casefold_person_aliases(redacted, mapping, args.job_id, allowlist)
+    redacted, mapping = _redact_email_handles_in_urls(redacted, mapping, args.job_id, allowlist)
+    # The skill and localhost web mode share one enhanced-audit implementation.
+    # Importing here keeps the quick command completely outside the Ollama path.
+    from pii_guard.enhanced_audit import AuditConfig, AuditError, run_enhanced_audit
+
+    try:
+        audit_result = run_enhanced_audit(
             original,
             redacted,
-            model=args.model,
-            base_url=args.ollama_url,
-            allowlist=allowlist,
-            already_audited=audited_windows,
+            mapping,
+            args.job_id,
+            config=AuditConfig(
+                model=args.model,
+                ollama_url=args.ollama_url,
+                allowlist=allowlist,
+            ),
         )
-        if not misses:
-            clean_streak += 1
-            if clean_streak >= REQUIRED_CLEAN_AUDIT_PASSES:
-                break
-            continue
-        clean_streak = 0
-        for entity_type, value in sorted(
-            set(misses), key=lambda item: len(item[1]), reverse=True
-        ):
-            if value not in redacted:
-                continue
-            counters[entity_type] = counters.get(entity_type, 0) + 1
-            placeholder = (
-                f"[[PII-{args.job_id[:10]}-AUDIT_{entity_type}-"
-                f"{counters[entity_type]}]]"
-            )
-            redacted = redacted.replace(value, placeholder)
-            mapping[placeholder] = value
-        redacted, mapping = _redact_casefold_person_aliases(
-            redacted, mapping, args.job_id, allowlist
-        )
-    else:
-        raise SafeFailure(
-            "LOCAL_AUDIT_RESIDUAL",
-            "Local audit still found visible identifiers after repeated redaction.",
-        )
+    except AuditError as exc:
+        raise SafeFailure(exc.code, exc.message) from exc
+    redacted = audit_result.redacted_text
+    mapping = audit_result.mapping
+    audit_passes = audit_result.audit_passes
 
     if original.strip() and not mapping:
         raise SafeFailure(
@@ -1376,9 +1345,7 @@ def _redact_worker(args: argparse.Namespace) -> None:
             "INVALID_MAPPING",
             "A private mapping entry has no corresponding redaction marker.",
         )
-    generated_markers = set(NAMESPACED_PATTERN.findall(redacted)) - set(
-        literal_placeholders
-    )
+    generated_markers = set(NAMESPACED_PATTERN.findall(redacted)) - set(literal_placeholders)
     if generated_markers != set(mapping):
         raise SafeFailure(
             "INVALID_MAPPING",
@@ -1413,17 +1380,14 @@ def _redact_worker(args: argparse.Namespace) -> None:
         "redacted_sha256": _sha256(final_redacted),
         "original_path": str(Path(args.original_path).resolve()),
         "original_sha256": hashlib.sha256(original.encode("utf-8")).hexdigest(),
-        "placeholder_counts": {
-            placeholder: redacted.count(placeholder) for placeholder in mapping
-        },
+        "placeholder_counts": {placeholder: redacted.count(placeholder) for placeholder in mapping},
         "placeholder_sequence": [
             placeholder
             for placeholder in NAMESPACED_PATTERN.findall(redacted)
             if placeholder in mapping
         ],
         "literal_placeholder_counts": {
-            placeholder: redacted.count(placeholder)
-            for placeholder in set(literal_placeholders)
+            placeholder: redacted.count(placeholder) for placeholder in set(literal_placeholders)
         },
     }
     _private_write(job_dir / MANIFEST_NAME, json.dumps(manifest, sort_keys=True))
@@ -1440,10 +1404,7 @@ def _quick_worker(args: argparse.Namespace) -> None:
     try:
         job_dir = Path(args.job_dir)
         source = Path(args.input)
-        if (
-            job_dir.name != args.job_id
-            or source.resolve() != (job_dir / SOURCE_NAME).resolve()
-        ):
+        if job_dir.name != args.job_id or source.resolve() != (job_dir / SOURCE_NAME).resolve():
             raise WorkflowError("INVALID_WORKER_PATH", "Private quick snapshot path is invalid.")
         store = PrivateJobStore(job_dir.parent, ckip_model=args.model)
         store.materialize_existing_quick_job(
@@ -1495,21 +1456,15 @@ def _restore_worker(args: argparse.Namespace) -> None:
         not isinstance(manifest, dict)
         or manifest.get("kind") != "pii-safe-documents-private-job"
         or manifest.get("job_id") != args.job_id
-        or any(
-            not placeholder.startswith(f"[[PII-{args.job_id[:10]}-")
-            for placeholder in mapping
-        )
+        or any(not placeholder.startswith(f"[[PII-{args.job_id[:10]}-") for placeholder in mapping)
     ):
         raise SafeFailure("INVALID_MANIFEST", "Private job identity is invalid.")
     original_sha256 = manifest.get("original_sha256")
-    if not isinstance(original_sha256, str) or not re.fullmatch(
-        r"[0-9a-f]{64}", original_sha256
-    ):
+    if not isinstance(original_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", original_sha256):
         raise SafeFailure("INVALID_MANIFEST", "Private job digest is invalid.")
     expected_counts = manifest.get("placeholder_counts") if isinstance(manifest, dict) else None
     if not isinstance(expected_counts, dict) or not all(
-        isinstance(key, str) and isinstance(value, int)
-        for key, value in expected_counts.items()
+        isinstance(key, str) and isinstance(value, int) for key, value in expected_counts.items()
     ):
         raise SafeFailure("INVALID_MANIFEST", "Private job manifest is invalid.")
     if set(expected_counts) != set(mapping):
@@ -1521,9 +1476,7 @@ def _restore_worker(args: argparse.Namespace) -> None:
     ):
         raise SafeFailure("INVALID_MANIFEST", "Private placeholder sequence is invalid.")
     actual_sequence = [
-        placeholder
-        for placeholder in NAMESPACED_PATTERN.findall(edited)
-        if placeholder in mapping
+        placeholder for placeholder in NAMESPACED_PATTERN.findall(edited) if placeholder in mapping
     ]
     literal_counts = manifest.get("literal_placeholder_counts")
     if not isinstance(literal_counts, dict) or not all(
@@ -1813,9 +1766,7 @@ def _public_restore(args: argparse.Namespace) -> None:
         ):
             raise SafeFailure("RESTORE_CHECK_FAILED", "Restore receipt is invalid.")
         restored_text = _read_utf8(worker_output)
-        if hashlib.sha256(restored_text.encode("utf-8")).hexdigest() != receipt[
-            "restored_sha256"
-        ]:
+        if hashlib.sha256(restored_text.encode("utf-8")).hexdigest() != receipt["restored_sha256"]:
             raise SafeFailure("RESTORE_CHECK_FAILED", "Restore digest verification failed.")
         output.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -2200,9 +2151,7 @@ def _parse_term_file(text: str) -> list[str]:
         if not term or term.startswith("#"):
             continue
         if "[[" in term or "]]" in term:
-            raise SafeFailure(
-                "INVALID_TERM", "A term may not contain placeholder brackets."
-            )
+            raise SafeFailure("INVALID_TERM", "A term may not contain placeholder brackets.")
         if term not in terms:
             terms.append(term)
     if not terms:
@@ -2269,9 +2218,7 @@ def _mask_worker(args: argparse.Namespace) -> None:
     job_dir = Path(args.job_dir)
     redacted, mapping, manifest, original = _load_job_state(job_dir, args.job_id)
     terms = _parse_term_file(_read_utf8(Path(args.terms)))
-    redacted, mapping, applied, missing, _ = _apply_mask(
-        redacted, mapping, args.job_id, terms
-    )
+    redacted, mapping, applied, missing, _ = _apply_mask(redacted, mapping, args.job_id, terms)
     _commit_job_state(
         job_dir,
         redacted,
@@ -2282,9 +2229,7 @@ def _mask_worker(args: argparse.Namespace) -> None:
     )
     _private_write(
         Path(args.receipt_path),
-        json.dumps(
-            {"terms_masked": applied, "terms_not_found": missing}, sort_keys=True
-        ),
+        json.dumps({"terms_masked": applied, "terms_not_found": missing}, sort_keys=True),
     )
 
 
@@ -2292,13 +2237,9 @@ def _unmask_worker(args: argparse.Namespace) -> None:
     job_dir = Path(args.job_dir)
     redacted, mapping, manifest, original = _load_job_state(job_dir, args.job_id)
     requested = json.loads(args.markers_json)
-    if not isinstance(requested, list) or not all(
-        isinstance(item, str) for item in requested
-    ):
+    if not isinstance(requested, list) or not all(isinstance(item, str) for item in requested):
         raise SafeFailure("INVALID_MARKERS", "Marker list is invalid.")
-    redacted, mapping, restored, unknown = _apply_unmask(
-        redacted, mapping, args.job_id, requested
-    )
+    redacted, mapping, restored, unknown = _apply_unmask(redacted, mapping, args.job_id, requested)
     _commit_job_state(
         job_dir,
         redacted,
@@ -2410,7 +2351,7 @@ def _annotation_handler(session: _AnnotationSession, token: str, port: int):
             prefix = f"/{token}"
             if not path.startswith(prefix + "/") and path != prefix:
                 return None
-            return path[len(prefix):] or "/"
+            return path[len(prefix) :] or "/"
 
         def _send(self, payload: bytes, content_type: str, status: int = 200) -> None:
             self.send_response(status)
@@ -2439,9 +2380,7 @@ def _annotation_handler(session: _AnnotationSession, token: str, port: int):
                 self._send(b"not found", "text/plain; charset=utf-8", 404)
                 return
             if route == "/":
-                self._send(
-                    ANNOTATION_PAGE.encode("utf-8"), "text/html; charset=utf-8"
-                )
+                self._send(ANNOTATION_PAGE.encode("utf-8"), "text/html; charset=utf-8")
                 return
             if route == "/state":
                 self._json(session.state())
@@ -2512,9 +2451,7 @@ def _annotate_ui_worker(args: argparse.Namespace) -> None:
     session = _AnnotationSession(job_dir, args.job_id)
     token = secrets.token_urlsafe(32)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), None)
-    server.RequestHandlerClass = _annotation_handler(
-        session, token, server.server_address[1]
-    )
+    server.RequestHandlerClass = _annotation_handler(session, token, server.server_address[1])
     server.daemon_threads = True
     port = server.server_address[1]
     url = f"http://127.0.0.1:{port}/{token}/"
@@ -2534,8 +2471,7 @@ def _annotate_ui_worker(args: argparse.Namespace) -> None:
         if not session.finished.wait(timeout=ANNOTATE_UI_TIMEOUT_SECONDS):
             raise SafeFailure(
                 "ANNOTATION_TIMED_OUT",
-                "The annotation page was not completed in time; edits already "
-                "made were saved.",
+                "The annotation page was not completed in time; edits already made were saved.",
             )
     finally:
         server.shutdown()
@@ -2646,9 +2582,7 @@ def _public_unmask(args: argparse.Namespace) -> None:
                 "A marker is written as TYPE-N, exactly as it appears in the "
                 "redacted file between [[PII-<job>- and ]].",
             )
-    counts = _run_annotation(
-        args, ["unmask", "--markers-json", json.dumps(list(args.marker))]
-    )
+    counts = _run_annotation(args, ["unmask", "--markers-json", json.dumps(list(args.marker))])
     root = _prepare_jobs_root(_default_jobs_root())
     job_dir = _resolve_job_dir(root, args.job_id)
     manifest = json.loads(_read_utf8(job_dir / MANIFEST_NAME))

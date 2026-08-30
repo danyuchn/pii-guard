@@ -86,7 +86,7 @@ Everything below is in Traditional Chinese. Start at [安裝](#安裝).
 
 ## 安裝
 
-需要 Python 3.13（3.11 以上可跑）、[uv](https://docs.astral.sh/uv/)、以及 [Ollama](https://ollama.com/)（只有 skill 的稽核層需要）。
+需要 Python 3.13（3.11 以上可跑）、[uv](https://docs.astral.sh/uv/)、以及 [Ollama](https://ollama.com/)（只有加強模式與 skill 的稽核層需要）。
 
 ```bash
 git clone https://github.com/danyuchn/pii-guard.git
@@ -138,7 +138,7 @@ python3 $S restore --job-id "<job_id>" --input "編輯後的.txt" --output "還�
 
 `mask --terms <詞清單檔>`、`unmask --marker TYPE-N` 是同樣兩種操作的指令列版本，`review` 列出代號與真實值。`review` 會印出未遮蔽的內容，因此在輸出不是終端機時拒絕執行。`purge` 刪除一個工作目錄。
 
-### 第一階段本機入口
+### 本機網頁入口
 
 快速模式不啟動或呼叫 Ollama，只使用既有的 Presidio、台灣規則與 CKIP 中文辨識；反向對照表與原文快照留在 `~/.local/share/pii-safe-documents/jobs/<job_id>/`，檔案權限為 `0600`、工作目錄為 `0700`。
 
@@ -154,11 +154,20 @@ uv run python -m pii_guard quick-restore <job_id> edited.anonymized.txt -o resto
 uv run python -m pii_guard web
 # 等價別名：uv run python -m pii_guard local-web
 
+# 加強模式在同一頁選擇；可明確指定本機模型與 loopback 位置
+uv run python -m pii_guard web \
+  --audit-model ornith-1.5:9b \
+  --ollama-url http://127.0.0.1:11434
+
 # 固定 fixture，可重跑並分開量測 cold start 與 warm processing
 uv run python -m pii_guard benchmark --fixture tests/fixtures/phase1_chinese.txt
 ```
 
-網頁只在 client 端以固定邏輯顯示 `~/.local/share/pii-safe-documents/jobs/<job_id>/` 提示；若啟動時自訂 `jobs-root`，則顯示「啟動 CLI 設定的私有工作根目錄 + 工作編號」，API 不回傳絕對路徑。「產生還原檔」只會把結果寫回同一個私有工作目錄，不透過 HTTP 傳回原文；「刪除這個工作」是手動刪除單一工作與對照表，沒有自動 TTL。第一階段的模式選單會明確把加強模式標為尚未完成。
+網頁只在 client 端以固定邏輯顯示 `~/.local/share/pii-safe-documents/jobs/<job_id>/` 提示；若啟動時自訂 `jobs-root`，則顯示「啟動 CLI 設定的私有工作根目錄 + 工作編號」，API 不回傳絕對路徑。「產生還原檔」只會把結果寫回同一個私有工作目錄，不透過 HTTP 傳回原文；「刪除這個工作」是手動刪除單一工作與對照表，沒有自動 TTL。
+
+加強模式先建立與快速模式相同的私有基線，再由獨立本機工作執行 Ollama 稽核。每個送入模型的視窗取樣三次，三次都成功才取聯集；模型回報的文字必須能精確或唯一地對回目前文字，最後仍要逐字還原成功。工作尚未通過時，API 與頁面都不提供去識別化文字、代號、下載、人工補遮或還原；可以取消，失敗、取消或伺服器中斷後可以明確重跑。同一時間只執行一個加強工作，快速模式仍可使用且不會探測或呼叫 Ollama。程式會保守拒絕常見的提示注入文字，但這是有限規則，不代表能證明所有提示注入都無效；`passed` 只表示這套有界稽核與完整性檢查已完成，不是零漏網保證。
+
+超過 12,000 字的文件會先以固定規則挑出疑似段落，並連同前後段落送入模型；沒有命中或命中內容超過全文八成時，退回全文稽核。這項篩選只代表減少送入模型的文字量，不代表已證明速度提升或維持全文召回率。目前沒有新增可公開的真實文件效能或召回率數字。
 
 `quick-restore` 以 quick receipt 的工作編號和編輯後去識別化檔案操作同一個私有工作目錄與還原核心；輸出檔會以 `0600` 建立，既有輸出或 symlink 會拒絕覆寫。CLI 回執只回報工作編號、成功狀態與 round-trip 狀態，不回傳還原內容、mapping、digest 或私有路徑。
 
@@ -244,8 +253,8 @@ skill 的稽核層開啟推理並對每個視窗取樣三次，**單份文件實
 
 ### 第三階段：加強模式
 
-- [ ] **Ollama 本地稽核**：在快速模式之外提供可選的多次本地稽核，清楚呈現速度與召回率的取捨。
-- [ ] **效能**：先用決定性規則篩出可疑段落再送模型，讓批量處理更可行。
+- [x] **Ollama 本地稽核**：在快速模式之外提供可選的三次本地稽核；背景工作可取消、失敗後重跑，通過前不釋出去識別化內容。
+- [x] **模型輸入篩選**：先用決定性規則選出可疑段落與相鄰內容；保守條件下退回全文稽核，不宣稱尚未量測的速度或召回率提升。
 
 ### 後期
 

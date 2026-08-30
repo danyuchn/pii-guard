@@ -67,7 +67,7 @@ python3 <skill-dir>/scripts/pii_safe_workflow.py redact \
   --allow "company name the user explicitly supplied"
 ```
 
-Repeat `--allow` as needed. The wrapper runs deterministic PII Guard detection plus a chunked, repeated local Ollama audit, captures all raw output, creates a private job directory, and prints only a safe JSON receipt. The verified default model is `qwen3.6:35b-a3b`; override it only after a representative local accuracy and speed test.
+Repeat `--allow` as needed. The wrapper runs deterministic PII Guard detection plus the same chunked, three-sample local Ollama audit used by the localhost enhanced mode, captures all raw output, creates a private job directory, and prints only a safe JSON receipt. The verified default model is `ornith-1.5:9b`; override it only after a representative local accuracy and speed test.
 
 If the receipt says both `redaction_checks_passed: true` and `agent_may_read_redacted: true`, the main agent may read **only** `redacted_path`. The receipt also provides safe replacement counts, audit-pass count, and the local model name. Keep `job_id` for restoration. Never infer or probe the mapping path.
 
