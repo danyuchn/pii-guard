@@ -1,11 +1,39 @@
-"""CLI interface: anonymize / restore / serve subcommands."""
+"""CLI interface: anonymize / quick / restore / benchmark / web / serve."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import sys
 from pathlib import Path
+
+
+def _safe_error(error_code: str, message: str) -> int:
+    """Print a structured error without echoing source text or mappings."""
+
+    print(
+        json.dumps(
+            {"ok": False, "error_code": error_code, "message": message},
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _threshold_arg(raw: str) -> float:
+    """Parse a finite Presidio threshold constrained to the documented range."""
+
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("threshold must be a number from 0 to 1") from exc
+    if not math.isfinite(value) or not 0 <= value <= 1:
+        raise argparse.ArgumentTypeError("threshold must be a finite number from 0 to 1")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,13 +55,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="輸入檔案路徑或 - (stdin，僅純文字)",
     )
     anon.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         type=Path,
         default=None,
         help="去識別化輸出路徑（預設：stdout for text, <input>.anon.<ext> for files）",
     )
     anon.add_argument(
-        "-m", "--mapping",
+        "-m",
+        "--mapping",
         type=Path,
         default=Path("mapping.json"),
         help="mapping JSON 輸出路徑（預設：mapping.json）",
@@ -46,9 +76,60 @@ def build_parser() -> argparse.ArgumentParser:
     )
     anon.add_argument(
         "--threshold",
-        type=float,
+        type=_threshold_arg,
         default=0.5,
         help="Presidio 信心分數閾值（預設：0.5）",
+    )
+
+    # ── quick (shared private job workflow) ─────────────────────────────
+    quick = subparsers.add_parser(
+        "quick",
+        help="快速模式：不啟動 Ollama，使用規則、Presidio 與中文辨識做可逆處理",
+    )
+    quick.add_argument("input", type=Path, help="UTF-8 純文字檔案路徑")
+    quick.add_argument(
+        "-o", "--output", type=Path, default=None, help="去識別化文字輸出路徑（預設輸出安全 JSON）"
+    )
+    quick.add_argument("--model", type=str, default="ckiplab/bert-base-chinese-ner")
+    quick.add_argument("--threshold", type=_threshold_arg, default=0.5)
+    quick.add_argument(
+        "--jobs-root",
+        type=Path,
+        default=None,
+        help="私有工作目錄（預設 ~/.local/share/pii-safe-documents/jobs）",
+    )
+
+    quick_restore = subparsers.add_parser(
+        "quick-restore",
+        help="以 quick 工作編號還原編輯後的去識別化文字",
+    )
+    quick_restore.add_argument("job_id", type=str, help="quick receipt 中的工作編號")
+    quick_restore.add_argument("input", type=Path, help="編輯後的去識別化 UTF-8 純文字檔")
+    quick_restore.add_argument(
+        "-o", "--output", type=Path, required=True, help="還原檔輸出路徑（拒絕覆寫）"
+    )
+    quick_restore.add_argument(
+        "--jobs-root",
+        type=Path,
+        default=None,
+        help="私有工作目錄（預設 ~/.local/share/pii-safe-documents/jobs）",
+    )
+
+    # ── benchmark ────────────────────────────────────────────────────────
+    benchmark = subparsers.add_parser("benchmark", help="量測 quick 冷啟動與後續處理速度")
+    benchmark.add_argument(
+        "--fixture",
+        type=Path,
+        default=Path("tests/fixtures/phase1_chinese.txt"),
+        help="固定 UTF-8 中文 fixture",
+    )
+    benchmark.add_argument("--runs", type=int, default=3)
+    benchmark.add_argument("--model", type=str, default="ckiplab/bert-base-chinese-ner")
+    benchmark.add_argument("--threshold", type=_threshold_arg, default=0.5)
+    benchmark.add_argument(
+        "--regex-only",
+        action="store_true",
+        help="只供本機快速測試；正式 benchmark 預設包含 CKIP",
     )
 
     # ── restore ──────────────────────────────────────────────────────────
@@ -62,13 +143,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="去識別化文本檔案路徑或 - (stdin，僅純文字)",
     )
     restore.add_argument(
-        "-m", "--mapping",
+        "-m",
+        "--mapping",
         type=Path,
         required=True,
         help="mapping JSON 路徑",
     )
     restore.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         type=Path,
         default=None,
         help="還原後文本輸出路徑（預設：stdout）",
@@ -84,6 +167,30 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="ckiplab/bert-base-chinese-ner",
         help="CKIP NER 模型 ID 或本地路徑",
+    )
+
+    # ── web (loopback-only one-page UI) ──────────────────────────────────
+    web = subparsers.add_parser(
+        "web",
+        aliases=["local-web"],
+        help="啟動 127.0.0.1 本機快速／加強去識別化介面",
+    )
+    web.add_argument("--port", type=int, default=0, help="本機埠號（預設隨機）")
+    web.add_argument("--open", action="store_true", help="啟動後開啟預設瀏覽器")
+    web.add_argument("--model", type=str, default="ckiplab/bert-base-chinese-ner")
+    web.add_argument("--threshold", type=_threshold_arg, default=0.5)
+    web.add_argument("--jobs-root", type=Path, default=None)
+    web.add_argument(
+        "--audit-model",
+        type=str,
+        default=None,
+        help="加強模式使用的本機 Ollama 模型（預設由共用稽核核心決定）",
+    )
+    web.add_argument(
+        "--ollama-url",
+        type=str,
+        default=None,
+        help="加強模式的本機 Ollama loopback URL",
     )
 
     return parser
@@ -103,10 +210,35 @@ def _write_output(text: str, output: Path | None) -> None:
         output.write_text(text, encoding="utf-8")
 
 
+def _write_quick_output(text: str, output: Path) -> None:
+    """Create a user-requested quick output without following an output link."""
+
+    target = output.expanduser()
+    if target.exists() or target.is_symlink():
+        raise OSError("quick output already exists")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.parent.is_symlink():
+        raise OSError("quick output parent is a symlink")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(target, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        target.unlink(missing_ok=True)
+        raise
+
+
 def _default_output_path(input_path: str) -> Path:
     """Generate default output path: <stem>.anon.<ext>."""
     p = Path(input_path)
-    from pii_guard.file_handlers import get_output_extension, PDF_EXTENSIONS
+    from pii_guard.file_handlers import get_output_extension
+
     out_ext = get_output_extension(p)
     return p.with_stem(p.stem + ".anon").with_suffix(out_ext)
 
@@ -115,13 +247,14 @@ def _default_restore_output_path(input_path: str) -> Path:
     """Generate default restore output path for structured formats: <stem>.restored.<ext>."""
     p = Path(input_path)
     from pii_guard.file_handlers import get_output_extension
+
     out_ext = get_output_extension(p)
     return p.with_stem(p.stem + ".restored").with_suffix(out_ext)
 
 
 def cmd_anonymize(args: argparse.Namespace) -> int:
+    from pii_guard.file_handlers import is_supported, read_file, write_file
     from pii_guard.pipeline.engine import PiiGuardEngine
-    from pii_guard.file_handlers import read_file, write_file, is_supported, PLAIN_TEXT_EXTENSIONS
 
     is_stdin = args.input == "-"
 
@@ -145,7 +278,7 @@ def cmd_anonymize(args: argparse.Namespace) -> int:
     input_path = Path(args.input)
     if not is_supported(input_path):
         print(f"[pii-guard] 不支援的檔案格式：{input_path.suffix}", file=sys.stderr)
-        print(f"[pii-guard] 支援的格式：.txt .csv .tsv .xlsx .docx .pdf 等", file=sys.stderr)
+        print("[pii-guard] 支援的格式：.txt .csv .tsv .xlsx .docx .pdf 等", file=sys.stderr)
         return 1
 
     content = read_file(input_path)
@@ -168,9 +301,119 @@ def cmd_anonymize(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_quick(args: argparse.Namespace) -> int:
+    """Run the shared deterministic quick path and keep the reverse map private."""
+
+    from pii_guard.local_workflow import PrivateJobStore, WorkflowError
+
+    try:
+        store = PrivateJobStore(
+            args.jobs_root,
+            ckip_model=args.model,
+            score_threshold=args.threshold,
+        )
+        receipt = store.create_quick_from_path(args.input)
+    except WorkflowError as error:
+        return _safe_error(error.code, error.message)
+    except (OSError, ValueError):
+        return _safe_error("QUICK_FAILED", "Quick redaction failed safely.")
+    anonymized = str(receipt["anonymized_text"])
+    try:
+        if args.output is not None:
+            _write_quick_output(anonymized, args.output)
+    except (OSError, ValueError):
+        try:
+            store.delete(str(receipt["job_id"]))
+        except (OSError, ValueError, WorkflowError):
+            pass
+        return _safe_error("OUTPUT_FAILED", "The requested output could not be written safely.")
+    print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_quick_restore(args: argparse.Namespace) -> int:
+    """Restore an edited quick job without exposing its private mapping."""
+
+    from pii_guard.local_workflow import PrivateJobStore, WorkflowError, read_source_path
+
+    try:
+        store = PrivateJobStore(args.jobs_root)
+        edited_redacted = read_source_path(args.input)
+        result = store.restore_edited_redacted(
+            args.job_id,
+            edited_redacted,
+            output_path=args.output,
+            overwrite=False,
+        )
+    except WorkflowError as error:
+        return _safe_error(error.code, error.message)
+    except (OSError, ValueError):
+        return _safe_error(
+            "QUICK_RESTORE_FAILED", "Quick restore failed without exposing private details."
+        )
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "mode": "quick",
+                "job_id": result.job_id,
+                "roundtrip_equal": result.roundtrip_equal,
+                "restored": True,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_benchmark(args: argparse.Namespace) -> int:
+    from pii_guard.benchmark import run_quick_benchmark
+    from pii_guard.local_workflow import WorkflowError
+
+    try:
+        result = run_quick_benchmark(
+            args.fixture,
+            runs=args.runs,
+            model=args.model,
+            threshold=args.threshold,
+            regex_only=args.regex_only,
+        )
+    except WorkflowError as error:
+        return _safe_error(error.code, error.message)
+    except (OSError, ValueError):
+        return _safe_error("BENCHMARK_FAILED", "The benchmark could not run safely.")
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_web(args: argparse.Namespace) -> int:
+    from pii_guard.local_workflow import PrivateJobStore, WorkflowError
+    from pii_guard.web import run_web
+
+    try:
+        store = PrivateJobStore(
+            args.jobs_root,
+            ckip_model=args.model,
+            score_threshold=args.threshold,
+        )
+        run_web(
+            port=args.port,
+            open_browser=args.open,
+            store=store,
+            audit_model=args.audit_model,
+            ollama_url=args.ollama_url,
+        )
+    except WorkflowError as error:
+        return _safe_error(error.code, error.message)
+    except OSError:
+        return _safe_error("WEB_START_FAILED", "The localhost server could not be started safely.")
+    return 0
+
+
 def cmd_restore(args: argparse.Namespace) -> int:
+    from pii_guard.file_handlers import is_supported, read_file, write_file
     from pii_guard.pipeline.engine import PiiGuardEngine
-    from pii_guard.file_handlers import read_file, write_file, is_supported
 
     mapping = PiiGuardEngine.load_mapping(args.mapping)
     is_stdin = args.input == "-"

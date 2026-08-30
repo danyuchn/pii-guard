@@ -7,14 +7,11 @@ from pathlib import Path
 import pytest
 
 from pii_guard.file_handlers import (
-    FileContent,
+    get_output_extension,
+    is_supported,
     read_file,
     write_file,
-    is_supported,
-    get_output_extension,
-    SUPPORTED_EXTENSIONS,
 )
-
 
 # ---------------------------------------------------------------------------
 # is_supported / get_output_extension

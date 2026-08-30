@@ -13,7 +13,19 @@ from __future__ import annotations
 
 import sys
 
-_SUBCOMMANDS = {"anonymize", "anon", "restore", "serve", "-h", "--help"}
+_SUBCOMMANDS = {
+    "anonymize",
+    "anon",
+    "restore",
+    "quick",
+    "quick-restore",
+    "benchmark",
+    "web",
+    "local-web",
+    "serve",
+    "-h",
+    "--help",
+}
 
 
 def main() -> None:
@@ -21,13 +33,30 @@ def main() -> None:
     if len(sys.argv) >= 2 and sys.argv[1] not in _SUBCOMMANDS and not sys.argv[1].startswith("-"):
         sys.argv.insert(1, "anonymize")
 
-    from pii_guard.cli import build_parser, cmd_anonymize, cmd_restore, cmd_serve
+    from pii_guard.cli import (
+        build_parser,
+        cmd_anonymize,
+        cmd_benchmark,
+        cmd_quick,
+        cmd_quick_restore,
+        cmd_restore,
+        cmd_serve,
+        cmd_web,
+    )
 
     parser = build_parser()
     args = parser.parse_args()
 
     if args.command in ("anonymize", "anon"):
         sys.exit(cmd_anonymize(args))
+    elif args.command == "quick":
+        sys.exit(cmd_quick(args))
+    elif args.command == "quick-restore":
+        sys.exit(cmd_quick_restore(args))
+    elif args.command == "benchmark":
+        sys.exit(cmd_benchmark(args))
+    elif args.command in ("web", "local-web"):
+        sys.exit(cmd_web(args))
     elif args.command == "restore":
         sys.exit(cmd_restore(args))
     elif args.command == "serve":

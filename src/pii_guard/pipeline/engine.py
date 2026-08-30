@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import warnings
 from pathlib import Path
+from typing import cast
 
 from presidio_analyzer import AnalyzerEngine, RecognizerResult
 from presidio_anonymizer import AnonymizerEngine
@@ -57,10 +59,12 @@ def _build_analyzer(
     # in Chinese text (e.g. "信箱user@x.com" matched as full string instead of
     # just "user@x.com"), and its score=1.0 overrides our TwEmailRecognizer.
     _remove = {"EmailRecognizer", "CreditCardRecognizer"}
-    analyzer.registry.recognizers = [
-        r for r in analyzer.registry.recognizers
-        if r.name not in _remove
-    ]
+    filtered_recognizers = []
+    for recognizer in analyzer.registry.recognizers:
+        name = cast(str | None, getattr(recognizer, "name", None))
+        if name not in _remove:
+            filtered_recognizers.append(recognizer)
+    analyzer.registry.recognizers = filtered_recognizers
 
     for recognizer in get_all_tw_recognizers():
         analyzer.registry.add_recognizer(recognizer)
@@ -207,12 +211,17 @@ class PiiGuardEngine:
 
     def _raw_detect(self, text: str) -> list[RecognizerResult]:
         """Run analyzer + post-processing (merge spans, resolve conflicts)."""
-        results = self._analyzer.analyze(
-            text=text,
-            language="zh",
-            entities=SUPPORTED_ENTITIES,
-            score_threshold=self.score_threshold,
-        )
+        # Some NLP backends emit warning text containing the full input when
+        # token offsets cannot be aligned.  Never let that dependency output
+        # cross a caller's stderr/log boundary.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            results = self._analyzer.analyze(
+                text=text,
+                language="zh",
+                entities=SUPPORTED_ENTITIES,
+                score_threshold=self.score_threshold,
+            )
         results = _merge_adjacent_spans(results)
         results = _filter_person_over_date(results)
         return results

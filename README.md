@@ -78,22 +78,22 @@ Everything below is in Traditional Chinese. Start at [安裝](#安裝).
 
 ## 還在做的事
 
-下一步不是另做一套 gateway，而是把現有的人工補標頁擴成完整的本機網頁入口：選檔、選擇快速或加強模式、快審、再下載去識別化結果。CLI、商用 AI skill 與網頁介面會共用同一套私有工作目錄、對照表與還原邏輯；商用 AI 仍只讀取去識別化副本，不會讀到原文或對照表。
+第一階段的快速模式與完整本機網頁入口已完成。它們與 skill 的快速路徑共用同一個私有工作目錄、對照表與還原核心；一般 JSON、下載內容與 HTML 只會有去識別化文字、代號與工作編號。網頁伺服器預設只繫結 `127.0.0.1`，不提供加強模式的假入口。
 
-PDF 會提早支援文字抽取後的網頁快審，但要能保留原 PDF 版面並輸出去識別化 PDF，仍是後期工作。
+第二階段也已加入文字型 PDF 的本機快審：瀏覽器上傳後只在記憶體中抽取可選取文字，再交給同一套 quick 私有工作核心。可下載去識別化 UTF-8 文字或安全的獨立 HTML。這個階段**不保留原 PDF 版面，也不輸出去識別化 PDF**；掃描型／圖片型 PDF 與 OCR（文字辨識）留待後續工作。
 
 歡迎有興趣協作者一起試用，也歡迎所有的提意見跟 PR。
 
 ## 安裝
 
-需要 Python 3.13（3.11 以上可跑）、[uv](https://docs.astral.sh/uv/)、以及 [Ollama](https://ollama.com/)（只有 skill 的稽核層需要）。
+需要 Python 3.13（3.11 以上可跑）、[uv](https://docs.astral.sh/uv/)、以及 [Ollama](https://ollama.com/)（只有加強模式與 skill 的稽核層需要）。
 
 ```bash
 git clone https://github.com/danyuchn/pii-guard.git
 cd pii-guard
 uv sync
 
-# 需要 CLI 直接處理 .docx / .xlsx / .pdf 時再加裝
+# 本機網頁要處理 PDF，或 CLI 直接處理 .docx / .xlsx / .pdf 時再加裝
 uv sync --extra formats
 ```
 
@@ -137,6 +137,39 @@ python3 $S restore --job-id "<job_id>" --input "編輯後的.txt" --output "還�
 ### 進階／無瀏覽器環境
 
 `mask --terms <詞清單檔>`、`unmask --marker TYPE-N` 是同樣兩種操作的指令列版本，`review` 列出代號與真實值。`review` 會印出未遮蔽的內容，因此在輸出不是終端機時拒絕執行。`purge` 刪除一個工作目錄。
+
+### 本機網頁入口
+
+快速模式不啟動或呼叫 Ollama，只使用既有的 Presidio、台灣規則與 CKIP 中文辨識；反向對照表與原文快照留在 `~/.local/share/pii-safe-documents/jobs/<job_id>/`，檔案權限為 `0600`、工作目錄為 `0700`。
+
+```bash
+# 輸出安全 JSON；可加 -o 另存去識別化文字
+uv run python -m pii_guard quick tests/fixtures/phase1_chinese.txt
+uv run python -m pii_guard quick input.txt -o input.anonymized.txt
+
+# 用 quick 工作編號還原編輯後的去識別化文字；不需要知道 mapping 路徑
+uv run python -m pii_guard quick-restore <job_id> edited.anonymized.txt -o restored.txt
+
+# 開啟一頁式 localhost 流程：選檔 → 快速模式 → 快審／補遮 → 下載
+uv run python -m pii_guard web
+# 等價別名：uv run python -m pii_guard local-web
+
+# 加強模式在同一頁選擇；可明確指定本機模型與 loopback 位置
+uv run python -m pii_guard web \
+  --audit-model ornith-1.5:9b \
+  --ollama-url http://127.0.0.1:11434
+
+# 固定 fixture，可重跑並分開量測 cold start 與 warm processing
+uv run python -m pii_guard benchmark --fixture tests/fixtures/phase1_chinese.txt
+```
+
+網頁只在 client 端以固定邏輯顯示 `~/.local/share/pii-safe-documents/jobs/<job_id>/` 提示；若啟動時自訂 `jobs-root`，則顯示「啟動 CLI 設定的私有工作根目錄 + 工作編號」，API 不回傳絕對路徑。「產生還原檔」只會把結果寫回同一個私有工作目錄，不透過 HTTP 傳回原文；「刪除這個工作」是手動刪除單一工作與對照表，沒有自動 TTL。
+
+加強模式先建立與快速模式相同的私有基線，再由獨立本機工作執行 Ollama 稽核。每個送入模型的視窗取樣三次，三次都成功才取聯集；模型回報的文字必須能精確或唯一地對回目前文字，最後仍要逐字還原成功。工作尚未通過時，API 與頁面都不提供去識別化文字、代號、下載、人工補遮或還原；可以取消，失敗、取消或伺服器中斷後可以明確重跑。同一時間只執行一個加強工作，快速模式仍可使用且不會探測或呼叫 Ollama。程式會保守拒絕常見的提示注入文字，但這是有限規則，不代表能證明所有提示注入都無效；`passed` 只表示這套有界稽核與完整性檢查已完成，不是零漏網保證。
+
+超過 12,000 字的文件會先以固定規則挑出疑似段落，並連同前後段落送入模型；沒有命中或命中內容超過全文八成時，退回全文稽核。這項篩選只代表減少送入模型的文字量，不代表已證明速度提升或維持全文召回率。目前沒有新增可公開的真實文件效能或召回率數字。
+
+`quick-restore` 以 quick receipt 的工作編號和編輯後去識別化檔案操作同一個私有工作目錄與還原核心；輸出檔會以 `0600` 建立，既有輸出或 symlink 會拒絕覆寫。CLI 回執只回報工作編號、成功狀態與 round-trip 狀態，不回傳還原內容、mapping、digest 或私有路徑。
 
 ## 準確率
 
@@ -189,7 +222,7 @@ skill 的隔離做的是：原文與對照表從不經過主 agent 的輸出通�
 
 **支援的 PII 類型**：人名、組織、地名（CKIP）；身分證、外籍居留證、護照、統一編號、手機、市話、車牌、出生日期、銀行帳號（Regex）；Email、信用卡號（Presidio 內建）。
 
-**輸入限制**：skill 目前只吃 64 KiB 以內的 UTF-8 純文字（`.txt` `.md` `.csv` `.tsv` `.log` `.dat`）。CLI 加裝 `formats` 後可讀 `.docx` `.xlsx` `.pdf`。
+**輸入限制**：skill 與 quick 文字流程只吃 64 KiB 以內的 UTF-8 純文字（`.txt` `.md` `.csv` `.tsv` `.log` `.dat`）。本機網頁另接受文字型 `.pdf`：上傳最多 4 MiB、最多 50 頁，抽出的 UTF-8 文字仍不得超過 64 KiB；需要先用 `uv sync --extra formats` 安裝既有的 `pdfplumber` 選用依賴。PDF 解析會在每次請求建立的隔離子行程中進行，父行程只收受界線內的結構化結果；子行程有 15 秒牆鐘、10 秒 CPU 與 512 MiB 位址空間上限（平台支援時套用），逾時或崩潰會固定回報安全錯誤。加密、需要密碼、無可抽取文字、掃描／圖片型或不合格的 PDF 會安全拒絕。CLI 加裝 `formats` 後的既有多格式讀取仍是另一條 library 流程。
 
 ## 速度
 
@@ -206,26 +239,26 @@ skill 的稽核層開啟推理並對每個視窗取樣三次，**單份文件實
 
 ### 第一階段：快速模式與完整本機網頁入口
 
-- [ ] **快速模式**：不啟動 Ollama，使用規則與中文辨識模型做可逆去識別化。
-- [ ] **完整網頁入口**：把既有人工補標頁擴成選檔、選模式、快審與下載的一頁式本機流程。
-- [ ] **共用核心**：CLI、商用 AI skill 與網頁介面共用同一套工作目錄、私有對照表、去識別化與還原邏輯。
-- [ ] **JSON 與 HTML 邊界**：一般 JSON 只含去識別化文字、代號與工作編號；私有對照表只留在本機，HTML 僅用於本機快審且不嵌入真實個資。
-- [ ] **效能基準**：在固定中文文字檔與指定電腦上，分別量測首次啟動與後續處理；快速模式須通過完整還原驗證後，才主打速度。
-- [ ] **手動清除**：在網頁介面提供清楚的私有工作目錄與對照表刪除操作，不設定自動到期。
+- [x] **快速模式**：不啟動 Ollama，使用規則與中文辨識模型做可逆去識別化。
+- [x] **完整網頁入口**：把既有人工補標頁擴成選檔、選模式、快審與下載的一頁式本機流程；加強模式明確保留到第三階段。
+- [x] **共用核心**：CLI、`pii-safe-documents` skill 的快速路徑與網頁介面共用同一套工作目錄、私有對照表、去識別化與還原邏輯。
+- [x] **JSON 與 HTML 邊界**：一般 JSON 只含去識別化文字、代號與工作編號；私有對照表只留在本機，HTML 僅用於 localhost 快審且不嵌入真實個資。
+- [x] **效能基準**：固定中文 fixture 提供可重跑的 cold-start、warm-processing 與完整 round-trip 指標；目前只報實測數字，不宣稱速度門檻。
+- [x] **手動清除**：網頁介面提供清楚的私有工作目錄與單一工作刪除操作，不設定自動到期。
 
 ### 第二階段：PDF 快審
 
-- [ ] **PDF 文字快審**：抽取 PDF 文字後在本機 HTML 介面審閱，輸出去識別化文字或 HTML。
-- [ ] **格式說明**：明確說明此階段不保留原 PDF 版面；掃描型 PDF 與可輸出去識別化 PDF 留待後期。
+- [x] **PDF 文字快審**：抽取文字型 PDF 後在本機 HTML 介面審閱，沿用 quick 私有工作核心，輸出去識別化 UTF-8 文字或安全 HTML。
+- [x] **格式說明**：介面、HTML 下載檔與 README 都明確說明不保留原 PDF 版面、不輸出去識別化 PDF；掃描／圖片型 PDF 與 OCR 留待後期。
 
 ### 第三階段：加強模式
 
-- [ ] **Ollama 本地稽核**：在快速模式之外提供可選的多次本地稽核，清楚呈現速度與召回率的取捨。
-- [ ] **效能**：先用決定性規則篩出可疑段落再送模型，讓批量處理更可行。
+- [x] **Ollama 本地稽核**：在快速模式之外提供可選的三次本地稽核；背景工作可取消、失敗後重跑，通過前不釋出去識別化內容。
+- [x] **模型輸入篩選**：先用決定性規則選出可疑段落與相鄰內容；保守條件下退回全文稽核，不宣稱尚未量測的速度或召回率提升。
 
 ### 後期
 
-- [ ] **更多文件類型**：library 端已能讀 docx/xlsx/pdf；需要把解析移進私有行程並驗證警告訊息不會回吐原文。
+- [ ] **更多文件類型**：library 端已能讀 docx/xlsx；需要把其他解析移進私有行程並驗證警告訊息不會回吐原文。
 - [ ] **保留版面的 PDF 輸出**：研究 PDF 重排或遮罩技術，輸出去識別化 PDF。
 - [ ] **可公開的準確率**：另建不含私人資料的語料，才能公開接近真實文件的數字。
 - [ ] **CI**

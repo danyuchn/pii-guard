@@ -12,7 +12,6 @@ import pytest
 from pii_guard.hook_engine import create_regex_only_engine
 from pii_guard.pipeline.engine import PiiGuardEngine
 
-
 # ---------------------------------------------------------------------------
 # hook_engine tests
 # ---------------------------------------------------------------------------

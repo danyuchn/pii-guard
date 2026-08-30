@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from presidio_analyzer import LocalRecognizer, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpArtifacts
+
+if TYPE_CHECKING:
+    from spacy.language import Language
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +57,7 @@ class EnglishNerRecognizer(LocalRecognizer):
 
     def __init__(self, model_name: str = MODEL_NAME) -> None:
         self._model_name = model_name
-        self._nlp = None  # lazy-loaded
+        self._nlp: Language | None = None  # lazy-loaded
         super().__init__(
             supported_entities=self.SUPPORTED_ENTITIES,
             supported_language="zh",  # register for zh so it runs with CKIP
