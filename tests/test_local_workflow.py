@@ -9,6 +9,9 @@ import re
 import stat
 import subprocess
 import sys
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -17,12 +20,22 @@ import pii_guard.local_workflow as local_workflow
 from pii_guard.local_workflow import (
     LOCK_NAME,
     MANIFEST_NAME,
+    MAX_INPUT_BYTES,
+    MAX_PDF_BYTES,
+    MAX_PDF_PAGES,
     PRIVATE_MAP_NAME,
     REDACTED_NAME,
     RESTORED_NAME,
     SOURCE_NAME,
     PrivateJobStore,
     WorkflowError,
+    _extract_pdf_text_local,
+    extract_pdf_text,
+)
+from tests.pdf_fixtures import (
+    build_compressed_text_pdf,
+    build_image_only_pdf,
+    build_text_pdf,
 )
 
 
@@ -63,28 +76,175 @@ class LeakyFailureEngine:
         raise WorkflowError("DEPENDENCY_FAILURE", f"unsafe detail: {text}")
 
 
-ORIGINAL = (
-    "聯絡人王小明，身分證A123456789，手機0912345678，"
-    "信箱alice@example.com，統編04595257。"
-)
+ORIGINAL = "聯絡人王小明，身分證A123456789，手機0912345678，信箱alice@example.com，統編04595257。"
+
+
+def _noisy_pdf_worker(input_connection: object, output_connection: object) -> None:
+    with local_workflow._silence_pdf_worker_output():
+        input_connection.recv_bytes()  # type: ignore[attr-defined]
+        print("worker-source-must-not-escape")
+        print("worker-source-must-not-escape", file=sys.stderr)
+        output_connection.send_bytes(  # type: ignore[attr-defined]
+            b'{"ok":true,"page_count":1,"text":"safe"}'
+        )
+
+
+def _sleeping_pdf_worker(input_connection: object, _output_connection: object) -> None:
+    with local_workflow._silence_pdf_worker_output():
+        input_connection.recv_bytes()  # type: ignore[attr-defined]
+        time.sleep(5)
+
+
+def _leaky_crash_pdf_worker(input_connection: object, _output_connection: object) -> None:
+    with local_workflow._silence_pdf_worker_output():
+        input_connection.recv_bytes()  # type: ignore[attr-defined]
+        try:
+            raise RuntimeError("parser metadata must not escape")
+        except RuntimeError:
+            return
+
+
+def test_extract_pdf_text_preserves_page_boundaries_and_page_count() -> None:
+    extracted = extract_pdf_text(build_text_pdf("PAGE ONE", "PAGE TWO"))
+
+    assert extracted.page_count == 2
+    assert extracted.text == "PAGE ONE\n\nPAGE TWO"
+
+
+def test_pdf_extractor_rejects_signature_and_image_only_uploads() -> None:
+    with pytest.raises(WorkflowError, match="PDF_NOT_PDF"):
+        extract_pdf_text(b"not a pdf")
+    with pytest.raises(WorkflowError, match="PDF_IMAGE_ONLY"):
+        extract_pdf_text(build_image_only_pdf())
+
+
+def test_pdf_extractor_rejects_bounds_with_fixed_safe_errors() -> None:
+    with pytest.raises(WorkflowError, match="PDF_TOO_LARGE"):
+        extract_pdf_text(b"%PDF-" + b"x" * MAX_PDF_BYTES)
+    with pytest.raises(WorkflowError, match="PDF_TOO_MANY_PAGES"):
+        extract_pdf_text(build_text_pdf(*(["PAGE"] * (MAX_PDF_PAGES + 1))))
+    with pytest.raises(WorkflowError, match="PDF_TEXT_TOO_LARGE"):
+        extract_pdf_text(build_text_pdf("x" * (MAX_INPUT_BYTES + 1)))
+
+
+def test_compressed_pdf_expansion_is_rejected_and_parser_remains_usable() -> None:
+    expanded = build_compressed_text_pdf(MAX_INPUT_BYTES + 1024)
+    assert len(expanded) < MAX_INPUT_BYTES
+    with pytest.raises(WorkflowError, match="PDF_TEXT_TOO_LARGE"):
+        extract_pdf_text(expanded)
+    assert extract_pdf_text(build_text_pdf("after expansion")).text == "after expansion"
+
+
+def test_pdf_extractor_rejects_encrypted_document_with_fixed_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pdfplumber
+
+    class EncryptedDocument:
+        encryption = object()
+        is_extractable = True
+
+    class EncryptedPdf:
+        doc = EncryptedDocument()
+        pages: list[object] = []
+
+        def __enter__(self) -> EncryptedPdf:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(pdfplumber, "open", lambda *_args, **_kwargs: EncryptedPdf())
+    with pytest.raises(WorkflowError, match="PDF_ENCRYPTED"):
+        _extract_pdf_text_local(b"%PDF-1.4 encrypted fixture")
+
+
+def test_concurrent_pdf_workers_suppress_stdout_and_stderr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = build_text_pdf("worker input")
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [
+            executor.submit(
+                local_workflow._run_pdf_parser,
+                source,
+                worker_target=_noisy_pdf_worker,
+            )
+            for _ in range(3)
+        ]
+        results = [future.result() for future in futures]
+
+    assert results == [
+        {"ok": True, "page_count": 1, "text": "safe"},
+        {"ok": True, "page_count": 1, "text": "safe"},
+        {"ok": True, "page_count": 1, "text": "safe"},
+    ]
+    captured = capsys.readouterr()
+    assert "worker-source-must-not-escape" not in captured.out
+    assert "worker-source-must-not-escape" not in captured.err
+
+
+def test_pdf_parser_timeout_terminates_child_and_next_parse_works(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(local_workflow, "PDF_PARSE_TIMEOUT_SECONDS", 0.5)
+    started = time.monotonic()
+    with pytest.raises(WorkflowError, match="PDF_PARSE_TIMEOUT"):
+        local_workflow._run_pdf_parser(build_text_pdf("slow"), worker_target=_sleeping_pdf_worker)
+    assert time.monotonic() - started < 3
+
+    monkeypatch.setattr(local_workflow, "PDF_PARSE_TIMEOUT_SECONDS", 15.0)
+    extracted = extract_pdf_text(build_text_pdf("after timeout"))
+    assert extracted.text == "after timeout"
+
+
+def test_pdf_parser_crash_error_traceback_has_no_child_exception_detail() -> None:
+    with pytest.raises(WorkflowError) as raised:
+        local_workflow._run_pdf_parser(
+            build_text_pdf("crash"), worker_target=_leaky_crash_pdf_worker
+        )
+    assert raised.value.code == "PDF_PARSE_CRASHED"
+    assert "parser metadata must not escape" not in "".join(
+        traceback.format_exception(raised.value)
+    )
+
+
+def test_pdf_job_keeps_format_metadata_through_manual_review(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    public = store.create_quick_from_pdf_bytes(build_text_pdf("ID A123456789", "PHONE 0912345678"))
+    job_id = str(public["job_id"])
+    assert public["source_format"] == "pdf"
+    assert public["page_count"] == 2
+    assert "A123456789" not in json.dumps(public, ensure_ascii=False)
+    assert not (store.root / job_id / "upload.pdf").exists()
+
+    reviewed = store.mask_terms(job_id, ["PHONE"])
+    assert reviewed["source_format"] == "pdf"
+    assert reviewed["page_count"] == 2
+    state = store.load_state(job_id)
+    assert state.manifest["source_format"] == "pdf"
+    assert state.manifest["page_count"] == 2
+    restored = store.restore_to_private(job_id)
+    assert restored["roundtrip_equal"] is True
+    assert (store.root / job_id / RESTORED_NAME).read_text(encoding="utf-8") == (
+        "ID A123456789\n\nPHONE 0912345678"
+    )
+    store.delete(job_id)
+    assert not (store.root / job_id).exists()
 
 
 def _store(tmp_path: Path) -> PrivateJobStore:
     return PrivateJobStore(tmp_path / "jobs", engine=FakeEngine())
 
 
-def _mask_in_child(
-    root: str, job_id: str, term: str, barrier: object
-) -> None:
+def _mask_in_child(root: str, job_id: str, term: str, barrier: object) -> None:
     """Run one real cross-process mask operation for the lock regression test."""
 
     getattr(barrier, "wait")(timeout=10)
     PrivateJobStore(Path(root)).mask_terms(job_id, [term])
 
 
-def _assert_public_json_has_no_private_paths(
-    payload: object, tmp_path: Path
-) -> None:
+def _assert_public_json_has_no_private_paths(payload: object, tmp_path: Path) -> None:
     rendered = json.dumps(payload, ensure_ascii=False)
     assert "private_work_dir" not in rendered
     assert "restored_path" not in rendered
@@ -216,9 +376,7 @@ def test_edited_redacted_restore_allows_plain_text_edit(tmp_path: Path) -> None:
     edited = store.load_state(job_id).redacted.replace("聯絡人", "收件人")
     output = tmp_path / "edited-restored.txt"
 
-    result = store.restore_edited_redacted(
-        job_id, edited, output_path=output, overwrite=False
-    )
+    result = store.restore_edited_redacted(job_id, edited, output_path=output, overwrite=False)
 
     assert result.roundtrip_equal is False
     assert output.read_text(encoding="utf-8") == ORIGINAL.replace("聯絡人", "收件人")
@@ -266,18 +424,13 @@ def test_edited_redacted_literal_placeholder_sequence_fails_closed(
 
 
 @pytest.mark.parametrize("edit_kind", ["missing", "swapped", "foreign"])
-def test_edited_redacted_placeholder_integrity_fails_closed(
-    tmp_path: Path, edit_kind: str
-) -> None:
+def test_edited_redacted_placeholder_integrity_fails_closed(tmp_path: Path, edit_kind: str) -> None:
     store = _store(tmp_path)
     public = store.create_quick_from_text(ORIGINAL)
     job_id = str(public["job_id"])
     redacted = store.load_state(job_id).redacted
     markers = list(
-        dict.fromkeys(
-            match.group(0)
-            for match in re.finditer(r"\[\[PII-[^\]\r\n]+\]\]", redacted)
-        )
+        dict.fromkeys(match.group(0) for match in re.finditer(r"\[\[PII-[^\]\r\n]+\]\]", redacted))
     )
     assert len(markers) >= 2
     if edit_kind == "missing":
@@ -312,10 +465,9 @@ def test_manual_mask_is_reversible_but_public_state_has_no_value(tmp_path: Path)
     restored = store.restore_to_private(job_id)
     assert restored["roundtrip_equal"] is True
     _assert_public_json_has_no_private_paths(restored, tmp_path)
-    assert (
-        (store.root / job_id / RESTORED_NAME).read_text(encoding="utf-8")
-        == "未被規則抓到的張三要補遮。"
-    )
+    assert (store.root / job_id / RESTORED_NAME).read_text(
+        encoding="utf-8"
+    ) == "未被規則抓到的張三要補遮。"
 
 
 def test_literal_placeholder_is_not_treated_as_private_mapping(tmp_path: Path) -> None:
@@ -444,9 +596,7 @@ def test_partial_review_commit_fails_closed(
     job_id = str(public["job_id"])
     original_write = local_workflow._write_private
 
-    def fail_mapping_write(
-        path: Path, data: str, *, replace: bool = False
-    ) -> None:
+    def fail_mapping_write(path: Path, data: str, *, replace: bool = False) -> None:
         if replace and path.name == PRIVATE_MAP_NAME:
             raise OSError("injected mapping commit failure")
         original_write(path, data, replace=replace)

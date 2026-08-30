@@ -12,23 +12,38 @@ import fcntl
 import hashlib
 import io
 import json
+import logging
 import math
+import multiprocessing
 import os
 import re
 import shutil
 import stat
 import tempfile
+import threading
+import time
+import unicodedata
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+from multiprocessing.process import BaseProcess
 from pathlib import Path
-from typing import Final, Protocol
+from typing import Final, NoReturn, Protocol
 
 SUPPORTED_SUFFIXES: Final[frozenset[str]] = frozenset(
     {".txt", ".md", ".csv", ".tsv", ".log", ".dat"}
 )
+PDF_SUFFIX: Final[str] = ".pdf"
 MAX_INPUT_BYTES: Final[int] = 64 * 1024
+MAX_PDF_BYTES: Final[int] = 4 * 1024 * 1024
+MAX_PDF_PAGES: Final[int] = 50
+PDF_SIGNATURE: Final[bytes] = b"%PDF-"
+PDF_PARSE_TIMEOUT_SECONDS: Final[float] = 15.0
+PDF_PARSE_GRACE_SECONDS: Final[float] = 0.5
+PDF_WORKER_CPU_SECONDS: Final[int] = 10
+PDF_WORKER_ADDRESS_SPACE_BYTES: Final[int] = 512 * 1024 * 1024
+MAX_PDF_RESPONSE_BYTES: Final[int] = MAX_INPUT_BYTES + 16 * 1024
 MAX_ANNOTATION_TERMS: Final[int] = 500
 MAX_TERM_BYTES: Final[int] = 4096
 JOB_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{32}$")
@@ -36,16 +51,12 @@ PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(r"<[A-Z][A-Z0-9_]*_\d+>
 NAMESPACED_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"\[\[PII-[0-9a-f]{10}-[A-Z][A-Z0-9_]*-\d+\]\]"
 )
-ALL_NAMESPACED_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"\[\[PII-[^\]\r\n]+\]\]"
-)
+ALL_NAMESPACED_PATTERN: Final[re.Pattern[str]] = re.compile(r"\[\[PII-[^\]\r\n]+\]\]")
 ALL_LITERAL_PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"(?:\[\[PII-[0-9a-f]{10}-[A-Z][A-Z0-9_]*-\d+\]\]"
     r"|<[A-Z][A-Z0-9_]*_\d+>)"
 )
-PLACEHOLDER_TYPE_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"<([A-Z][A-Z0-9_]*)_(\d+)>"
-)
+PLACEHOLDER_TYPE_PATTERN: Final[re.Pattern[str]] = re.compile(r"<([A-Z][A-Z0-9_]*)_(\d+)>")
 NAMESPACED_PARTS_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"\[\[PII-([0-9a-f]{10})-([A-Z][A-Z0-9_]*)-(\d+)\]\]"
 )
@@ -108,6 +119,14 @@ class RestoreResult:
     output_path: Path
     restored_sha256: str
     roundtrip_equal: bool
+
+
+@dataclass(frozen=True)
+class PdfTextExtraction:
+    """Text extracted from one accepted, text-based PDF upload."""
+
+    text: str
+    page_count: int
 
 
 def default_jobs_root() -> Path:
@@ -314,6 +333,394 @@ def _read_utf8(path: Path, *, max_bytes: int | None = MAX_INPUT_BYTES) -> str:
         raise WorkflowError("INPUT_NOT_UTF8", "Input must be UTF-8 plain text.") from exc
 
 
+_PDF_ERROR_MESSAGES: Final[dict[str, str]] = {
+    "PDF_INVALID_UPLOAD": "PDF upload is invalid.",
+    "PDF_TOO_LARGE": "PDF upload exceeds the safety size limit.",
+    "PDF_NOT_PDF": "PDF signature is invalid.",
+    "PDF_UNAVAILABLE": "PDF text extraction is not available in this installation.",
+    "PDF_ENCRYPTED": "Encrypted or password-protected PDFs are not supported.",
+    "PDF_TOO_MANY_PAGES": "PDF has too many pages for local quick review.",
+    "PDF_IMAGE_ONLY": "Scanned or image-only PDFs are not supported.",
+    "PDF_NO_TEXT": "PDF contains no extractable text.",
+    "PDF_TEXT_TOO_LARGE": "Extracted PDF text exceeds the safety size limit.",
+    "PDF_MALFORMED": "PDF could not be parsed safely.",
+    "PDF_PARSE_TIMEOUT": "PDF parsing timed out safely.",
+    "PDF_PARSE_CRASHED": "PDF parser stopped unexpectedly.",
+    "PDF_PARSE_RESOURCE_LIMIT": "PDF parser exceeded the safety resource limit.",
+    "PDF_RESPONSE_TOO_LARGE": "PDF parser returned an unsafe response.",
+    "PDF_RESPONSE_INVALID": "PDF parser returned an invalid response.",
+    "PDF_IPC_FAILED": "PDF parser communication failed safely.",
+}
+
+
+def _raise_pdf_error(code: str) -> NoReturn:
+    """Raise only a fixed public-safe PDF error, without parser exception context."""
+
+    safe_code = code if code in _PDF_ERROR_MESSAGES else "PDF_MALFORMED"
+    raise WorkflowError(safe_code, _PDF_ERROR_MESSAGES[safe_code]) from None
+
+
+@contextmanager
+def _silence_pdf_worker_output() -> Iterator[None]:
+    """Discard parser output inside the isolated worker only."""
+
+    previous_disable = logging.root.manager.disable
+    saved_stdout = os.dup(1)
+    saved_stderr = os.dup(2)
+    null_descriptor = os.open(os.devnull, os.O_WRONLY)
+    logging.disable(logging.CRITICAL)
+    try:
+        os.dup2(null_descriptor, 1)
+        os.dup2(null_descriptor, 2)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            yield
+    finally:
+        os.dup2(saved_stdout, 1)
+        os.dup2(saved_stderr, 2)
+        os.close(saved_stdout)
+        os.close(saved_stderr)
+        os.close(null_descriptor)
+        logging.disable(previous_disable)
+
+
+def _is_pdf_encryption_error(error: BaseException) -> bool:
+    """Identify wrapped pdfminer encryption errors without inspecting messages."""
+
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if type(current).__name__ in {"PDFEncryptionError", "PDFPasswordIncorrect"}:
+            return True
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        pending.extend(argument for argument in current.args if isinstance(argument, BaseException))
+    return False
+
+
+def _extract_pdf_text_local(data: bytes) -> PdfTextExtraction:
+    """Extract PDF text in the worker process; never call this from a public adapter."""
+
+    try:
+        import pdfplumber
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise WorkflowError("PDF_UNAVAILABLE", _PDF_ERROR_MESSAGES["PDF_UNAVAILABLE"]) from exc
+
+    stream = io.BytesIO(data)
+    try:
+        with pdfplumber.open(
+            stream,
+            strict_metadata=False,
+            raise_unicode_errors=True,
+        ) as pdf:
+            document = getattr(pdf, "doc", None)
+            if document is None:
+                raise WorkflowError("PDF_MALFORMED", _PDF_ERROR_MESSAGES["PDF_MALFORMED"])
+            if getattr(document, "encryption", None) is not None or not getattr(
+                document, "is_extractable", True
+            ):
+                raise WorkflowError("PDF_ENCRYPTED", _PDF_ERROR_MESSAGES["PDF_ENCRYPTED"])
+
+            try:
+                from pdfminer.pdfpage import PDFPage
+            except (ImportError, ModuleNotFoundError) as exc:
+                raise WorkflowError(
+                    "PDF_UNAVAILABLE", _PDF_ERROR_MESSAGES["PDF_UNAVAILABLE"]
+                ) from exc
+            page_count = 0
+            for page_count, _ in enumerate(PDFPage.create_pages(document), start=1):
+                if page_count > MAX_PDF_PAGES:
+                    raise WorkflowError(
+                        "PDF_TOO_MANY_PAGES", _PDF_ERROR_MESSAGES["PDF_TOO_MANY_PAGES"]
+                    )
+
+            pages = pdf.pages
+            if len(pages) != page_count:
+                raise WorkflowError("PDF_MALFORMED", _PDF_ERROR_MESSAGES["PDF_MALFORMED"])
+
+            page_texts: list[str] = []
+            has_images = False
+            for page in pages:
+                extracted = page.extract_text()
+                if extracted is None:
+                    extracted = ""
+                if not isinstance(extracted, str):
+                    raise WorkflowError("PDF_MALFORMED", _PDF_ERROR_MESSAGES["PDF_MALFORMED"])
+                page_texts.append(extracted)
+                try:
+                    has_images = has_images or bool(page.images)
+                except Exception as exc:
+                    raise WorkflowError(
+                        "PDF_MALFORMED", _PDF_ERROR_MESSAGES["PDF_MALFORMED"]
+                    ) from exc
+
+            if not any(page_text.strip() for page_text in page_texts):
+                code = "PDF_IMAGE_ONLY" if has_images else "PDF_NO_TEXT"
+                raise WorkflowError(code, _PDF_ERROR_MESSAGES[code])
+
+            extracted_text = unicodedata.normalize("NFKC", "\n\n".join(page_texts))
+    finally:
+        stream.close()
+
+    try:
+        extracted_bytes = extracted_text.encode("utf-8")
+    except UnicodeError as exc:
+        raise WorkflowError("PDF_MALFORMED", _PDF_ERROR_MESSAGES["PDF_MALFORMED"]) from exc
+    if len(extracted_bytes) > MAX_INPUT_BYTES:
+        raise WorkflowError("PDF_TEXT_TOO_LARGE", _PDF_ERROR_MESSAGES["PDF_TEXT_TOO_LARGE"])
+    return PdfTextExtraction(text=extracted_text, page_count=page_count)
+
+
+def _set_pdf_worker_limits() -> None:
+    """Apply best-effort CPU and address-space limits inside the worker."""
+
+    try:
+        import resource
+    except ImportError:
+        return
+
+    limits = (
+        ("RLIMIT_CPU", PDF_WORKER_CPU_SECONDS),
+        ("RLIMIT_AS", PDF_WORKER_ADDRESS_SPACE_BYTES),
+    )
+    for name, requested_soft in limits:
+        limit = getattr(resource, name, None)
+        if limit is None:
+            continue
+        try:
+            current_soft, current_hard = resource.getrlimit(limit)
+            if current_soft == resource.RLIM_INFINITY:
+                selected_soft = requested_soft
+            else:
+                selected_soft = min(current_soft, requested_soft)
+            if current_hard != resource.RLIM_INFINITY:
+                selected_soft = min(selected_soft, current_hard)
+            resource.setrlimit(limit, (selected_soft, current_hard))
+        except (OSError, ValueError):
+            continue
+
+
+def _send_pdf_worker_result(connection: object, payload: dict[str, object]) -> None:
+    """Send a bounded JSON result without forwarding arbitrary exception data."""
+
+    try:
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except (TypeError, UnicodeError):
+        encoded = b'{"ok":false,"code":"PDF_RESPONSE_INVALID"}'
+    if len(encoded) > MAX_PDF_RESPONSE_BYTES:
+        encoded = b'{"ok":false,"code":"PDF_RESPONSE_TOO_LARGE"}'
+    try:
+        connection.send_bytes(encoded)  # type: ignore[attr-defined]
+    except (BrokenPipeError, EOFError, OSError):
+        return
+
+
+def _pdf_parser_worker(input_connection: object, output_connection: object) -> None:
+    """Spawn-safe target for all untrusted PDF parsing."""
+
+    with _silence_pdf_worker_output():
+        try:
+            _set_pdf_worker_limits()
+            data = input_connection.recv_bytes(MAX_PDF_BYTES + 1)  # type: ignore[attr-defined]
+            if len(data) > MAX_PDF_BYTES:
+                _send_pdf_worker_result(output_connection, {"ok": False, "code": "PDF_TOO_LARGE"})
+            else:
+                result = _extract_pdf_text_local(data)
+                _send_pdf_worker_result(
+                    output_connection,
+                    {"ok": True, "page_count": result.page_count, "text": result.text},
+                )
+        except WorkflowError as error:
+            code = error.code if error.code in _PDF_ERROR_MESSAGES else "PDF_MALFORMED"
+            _send_pdf_worker_result(output_connection, {"ok": False, "code": code})
+        except MemoryError:
+            _send_pdf_worker_result(
+                output_connection, {"ok": False, "code": "PDF_PARSE_RESOURCE_LIMIT"}
+            )
+        except BaseException:
+            _send_pdf_worker_result(output_connection, {"ok": False, "code": "PDF_MALFORMED"})
+        finally:
+            for connection in (input_connection, output_connection):
+                try:
+                    connection.close()  # type: ignore[attr-defined]
+                except (OSError, AttributeError):
+                    pass
+
+
+def _stop_pdf_worker(process: BaseProcess) -> None:
+    """Terminate then kill a parser child and always reap it."""
+
+    try:
+        alive = process.is_alive()
+    except AssertionError:
+        return
+    if alive:
+        process.terminate()
+        process.join(PDF_PARSE_GRACE_SECONDS)
+    try:
+        alive = process.is_alive()
+    except AssertionError:
+        return
+    if alive and hasattr(process, "kill"):
+        process.kill()
+        process.join(PDF_PARSE_GRACE_SECONDS)
+
+
+def _run_pdf_parser(
+    data: bytes,
+    *,
+    worker_target: Callable[[object, object], None] = _pdf_parser_worker,
+) -> dict[str, object]:
+    """Run the parser child with bounded input/output channels and a wall deadline."""
+
+    if not isinstance(data, bytes):
+        _raise_pdf_error("PDF_INVALID_UPLOAD")
+    if len(data) > MAX_PDF_BYTES:
+        _raise_pdf_error("PDF_TOO_LARGE")
+    context = multiprocessing.get_context("spawn")
+    input_read, input_write = context.Pipe(duplex=False)
+    output_read, output_write = context.Pipe(duplex=False)
+    process = context.Process(
+        target=worker_target,
+        args=(input_read, output_write),
+        daemon=True,
+    )
+    started = time.monotonic()
+    sender_errors: list[BaseException] = []
+    process_started = False
+
+    def send_input() -> None:
+        try:
+            input_write.send_bytes(data)
+        except BaseException as error:
+            sender_errors.append(error)
+
+    sender: threading.Thread | None = None
+    try:
+        process.start()
+        process_started = True
+        input_read.close()
+        output_write.close()
+        sender = threading.Thread(target=send_input, daemon=True)
+        sender.start()
+        deadline = started + PDF_PARSE_TIMEOUT_SECONDS
+        while sender.is_alive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _stop_pdf_worker(process)
+                _raise_pdf_error("PDF_PARSE_TIMEOUT")
+            sender.join(min(remaining, 0.05))
+        input_write.close()
+        if sender_errors:
+            if process.exitcode is not None:
+                if process.exitcode < 0:
+                    _raise_pdf_error("PDF_PARSE_RESOURCE_LIMIT")
+                _raise_pdf_error("PDF_PARSE_CRASHED")
+            _raise_pdf_error("PDF_IPC_FAILED")
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _stop_pdf_worker(process)
+                _raise_pdf_error("PDF_PARSE_TIMEOUT")
+            if output_read.poll(min(remaining, 0.05)):
+                break
+            if not process.is_alive():
+                process.join()
+                if process.exitcode is not None and process.exitcode < 0:
+                    _raise_pdf_error("PDF_PARSE_RESOURCE_LIMIT")
+                _raise_pdf_error("PDF_PARSE_CRASHED")
+        try:
+            payload = output_read.recv_bytes(MAX_PDF_RESPONSE_BYTES)
+        except EOFError:
+            # A cleanly closed output pipe without a result is a parser crash,
+            # even if the process has not published its exit code yet.
+            process.join(PDF_PARSE_GRACE_SECONDS)
+            if process.is_alive():
+                _stop_pdf_worker(process)
+            if process.exitcode is not None and process.exitcode < 0:
+                _raise_pdf_error("PDF_PARSE_RESOURCE_LIMIT")
+            _raise_pdf_error("PDF_PARSE_CRASHED")
+        except (BufferError, OSError):
+            if process.exitcode is not None or not process.is_alive():
+                process.join()
+                if process.exitcode is not None and process.exitcode < 0:
+                    _raise_pdf_error("PDF_PARSE_RESOURCE_LIMIT")
+                _raise_pdf_error("PDF_PARSE_CRASHED")
+            _stop_pdf_worker(process)
+            _raise_pdf_error("PDF_RESPONSE_TOO_LARGE")
+        if len(payload) > MAX_PDF_RESPONSE_BYTES:
+            _stop_pdf_worker(process)
+            _raise_pdf_error("PDF_RESPONSE_TOO_LARGE")
+        try:
+            decoded = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            _stop_pdf_worker(process)
+            _raise_pdf_error("PDF_RESPONSE_INVALID")
+        if not isinstance(decoded, dict):
+            _stop_pdf_worker(process)
+            _raise_pdf_error("PDF_RESPONSE_INVALID")
+        process.join(PDF_PARSE_GRACE_SECONDS)
+        if process.is_alive():
+            _stop_pdf_worker(process)
+        return decoded
+    except WorkflowError:
+        raise
+    except (OSError, RuntimeError):
+        if process_started:
+            _stop_pdf_worker(process)
+        _raise_pdf_error("PDF_PARSE_CRASHED")
+    finally:
+        if sender is not None and sender.is_alive():
+            input_write.close()
+            sender.join(PDF_PARSE_GRACE_SECONDS)
+        for connection in (input_read, input_write, output_read, output_write):
+            try:
+                connection.close()
+            except (OSError, AttributeError):
+                pass
+        if process_started:
+            if process.is_alive():
+                _stop_pdf_worker(process)
+            process.join()
+            process.close()
+
+
+def extract_pdf_text(data: bytes) -> PdfTextExtraction:
+    """Safely extract bounded PDF text in a fresh isolated parser process."""
+
+    if not isinstance(data, bytes):
+        _raise_pdf_error("PDF_INVALID_UPLOAD")
+    if len(data) > MAX_PDF_BYTES:
+        _raise_pdf_error("PDF_TOO_LARGE")
+    if not data.startswith(PDF_SIGNATURE):
+        _raise_pdf_error("PDF_NOT_PDF")
+
+    decoded = _run_pdf_parser(data)
+    if decoded.get("ok") is not True:
+        code = decoded.get("code")
+        _raise_pdf_error(code if isinstance(code, str) else "PDF_RESPONSE_INVALID")
+    text = decoded.get("text")
+    page_count = decoded.get("page_count")
+    if not isinstance(text, str) or not isinstance(page_count, int) or isinstance(page_count, bool):
+        _raise_pdf_error("PDF_RESPONSE_INVALID")
+    try:
+        text_bytes = text.encode("utf-8")
+    except UnicodeError:
+        _raise_pdf_error("PDF_RESPONSE_INVALID")
+    if len(text_bytes) > MAX_INPUT_BYTES:
+        _raise_pdf_error("PDF_RESPONSE_TOO_LARGE")
+    if not 1 <= page_count <= MAX_PDF_PAGES:
+        _raise_pdf_error("PDF_RESPONSE_INVALID")
+    return PdfTextExtraction(text=text, page_count=page_count)
+
+
 def read_source_path(path: Path) -> str:
     """Validate a supported plain-text source without echoing its contents."""
 
@@ -413,6 +820,8 @@ def _manifest_for(
     mapping: Mapping[str, str],
     model: str,
     source_path: Path,
+    source_format: str = "text",
+    page_count: int | None = None,
     previous: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     manifest: dict[str, object] = dict(previous or {})
@@ -422,6 +831,7 @@ def _manifest_for(
             "version": WORKFLOW_VERSION,
             "job_id": job_id,
             "mode": "quick",
+            "source_format": source_format,
             "redacted_file": REDACTED_NAME,
             "replacement_count": len(mapping),
             "entity_counts": _entity_counts(mapping),
@@ -449,6 +859,10 @@ def _manifest_for(
             ],
         }
     )
+    if source_format == "pdf":
+        manifest["page_count"] = page_count
+    else:
+        manifest.pop("page_count", None)
     return manifest
 
 
@@ -476,9 +890,7 @@ _PRIVATE_RESTORE_OUTPUT_PATTERN: Final[re.Pattern[str]] = re.compile(
 )
 
 
-def _validated_count_map(
-    value: object, *, error_code: str = "INVALID_MANIFEST"
-) -> dict[str, int]:
+def _validated_count_map(value: object, *, error_code: str = "INVALID_MANIFEST") -> dict[str, int]:
     if not isinstance(value, dict) or not all(
         isinstance(key, str)
         and isinstance(count, int)
@@ -496,23 +908,16 @@ def _validated_literal_markers(
     """Validate literal placeholder metadata before accepting namespaced text."""
 
     literal_counts = _validated_count_map(manifest.get("literal_placeholder_counts"))
-    if any(
-        ALL_LITERAL_PLACEHOLDER_PATTERN.fullmatch(marker) is None
-        for marker in literal_counts
-    ):
+    if any(ALL_LITERAL_PLACEHOLDER_PATTERN.fullmatch(marker) is None for marker in literal_counts):
         raise WorkflowError("INVALID_MANIFEST", "Private literal placeholders are invalid.")
     expected_sequence = ALL_LITERAL_PLACEHOLDER_PATTERN.findall(original)
     manifest_sequence = manifest.get("literal_placeholder_sequence")
     if not isinstance(manifest_sequence, list) or not all(
         isinstance(marker, str) for marker in manifest_sequence
     ):
-        raise WorkflowError(
-            "INVALID_MANIFEST", "Private literal placeholder sequence is invalid."
-        )
+        raise WorkflowError("INVALID_MANIFEST", "Private literal placeholder sequence is invalid.")
     if manifest_sequence != expected_sequence:
-        raise WorkflowError(
-            "INVALID_MANIFEST", "Private literal placeholder sequence is invalid."
-        )
+        raise WorkflowError("INVALID_MANIFEST", "Private literal placeholder sequence is invalid.")
     expected_counts = {marker: redacted.count(marker) for marker in expected_sequence}
     if literal_counts != expected_counts:
         raise WorkflowError("INVALID_MANIFEST", "Private literal placeholder counts are invalid.")
@@ -562,28 +967,17 @@ def _validate_edited_redacted(state: JobState, edited_redacted: str) -> None:
     ):
         expected_literal_sequence = list(expected_literal_sequence_value)
     else:
-        raise WorkflowError(
-            "INVALID_MANIFEST", "Private literal placeholder sequence is invalid."
-        )
+        raise WorkflowError("INVALID_MANIFEST", "Private literal placeholder sequence is invalid.")
     if set(expected_literal_sequence) != set(literal_counts) or any(
-        expected_literal_sequence.count(marker) != count
-        for marker, count in literal_counts.items()
+        expected_literal_sequence.count(marker) != count for marker, count in literal_counts.items()
     ):
-        raise WorkflowError(
-            "INVALID_MANIFEST", "Private literal placeholder sequence is invalid."
-        )
+        raise WorkflowError("INVALID_MANIFEST", "Private literal placeholder sequence is invalid.")
 
-    actual_counts = {
-        marker: edited_redacted.count(marker) for marker in state.mapping
-    }
+    actual_counts = {marker: edited_redacted.count(marker) for marker in state.mapping}
     actual_sequence = [
-        marker
-        for marker in NAMESPACED_PATTERN.findall(edited_redacted)
-        if marker in state.mapping
+        marker for marker in NAMESPACED_PATTERN.findall(edited_redacted) if marker in state.mapping
     ]
-    actual_literal_counts = {
-        marker: edited_redacted.count(marker) for marker in literal_counts
-    }
+    actual_literal_counts = {marker: edited_redacted.count(marker) for marker in literal_counts}
     actual_literal_sequence = [
         marker
         for marker in ALL_LITERAL_PLACEHOLDER_PATTERN.findall(edited_redacted)
@@ -655,9 +1049,7 @@ def _reject_symlink_components(path: Path) -> Path:
     return normalized
 
 
-def _validate_restore_output(
-    path: Path, job_dir: Path, *, overwrite: bool
-) -> Path:
+def _validate_restore_output(path: Path, job_dir: Path, *, overwrite: bool) -> Path:
     output = _reject_symlink_components(path)
     if output.exists() or output.is_symlink():
         if output.is_symlink():
@@ -712,9 +1104,7 @@ class PrivateJobStore:
             # even when the caller is the CLI rather than the isolated skill.
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 if self._engine_factory is not None:
-                    self._engine = self._engine_factory(
-                        self.ckip_model, self.score_threshold
-                    )
+                    self._engine = self._engine_factory(self.ckip_model, self.score_threshold)
                 else:
                     from pii_guard.pipeline.engine import PiiGuardEngine
 
@@ -744,6 +1134,8 @@ class PrivateJobStore:
         original: str,
         source_path: Path,
         model: str,
+        source_format: str = "text",
+        page_count: int | None = None,
     ) -> None:
         if len(original.encode("utf-8")) > MAX_INPUT_BYTES:
             raise WorkflowError("INPUT_TOO_LARGE", "Input exceeds the safety size limit.")
@@ -753,9 +1145,7 @@ class PrivateJobStore:
                 redacted_raw, raw_mapping = self._get_engine().anonymize(protected)
         except Exception as exc:
             raise WorkflowError("PII_GUARD_FAILED", "Quick redaction failed safely.") from exc
-        redacted, mapping = _namespace_anonymized(
-            redacted_raw, raw_mapping, job_id, literal_tokens
-        )
+        redacted, mapping = _namespace_anonymized(redacted_raw, raw_mapping, job_id, literal_tokens)
         if _replace_all(redacted, mapping) != original:
             raise WorkflowError(
                 "ROUNDTRIP_INTEGRITY_FAILED",
@@ -774,6 +1164,8 @@ class PrivateJobStore:
             mapping=mapping,
             model=model,
             source_path=source_path,
+            source_format=source_format,
+            page_count=page_count,
         )
         _write_private(
             job_dir / MANIFEST_NAME,
@@ -781,7 +1173,12 @@ class PrivateJobStore:
         )
 
     def create_quick_from_text(
-        self, text: str, *, source_name: str = "upload.txt"
+        self,
+        text: str,
+        *,
+        source_name: str = "upload.txt",
+        source_format: str = "text",
+        page_count: int | None = None,
     ) -> dict[str, object]:
         """Create a quick job and return only its public redacted receipt."""
 
@@ -790,10 +1187,22 @@ class PrivateJobStore:
         if len(text.encode("utf-8")) > MAX_INPUT_BYTES:
             raise WorkflowError("INPUT_TOO_LARGE", "Input exceeds the safety size limit.")
         suffix = Path(source_name).suffix.lower()
-        if suffix and suffix not in SUPPORTED_SUFFIXES:
+        if source_format not in {"text", "pdf"}:
+            raise WorkflowError("UNSUPPORTED_FORMAT", "Input format is not supported.")
+        if source_format == "text" and suffix and suffix not in SUPPORTED_SUFFIXES:
             raise WorkflowError(
                 "UNSUPPORTED_FORMAT", "Only verified UTF-8 plain-text files are supported."
             )
+        if source_format == "pdf" and suffix != PDF_SUFFIX:
+            raise WorkflowError("PDF_INVALID_UPLOAD", "PDF upload is invalid.")
+        if source_format == "pdf" and (
+            not isinstance(page_count, int)
+            or isinstance(page_count, bool)
+            or not 1 <= page_count <= MAX_PDF_PAGES
+        ):
+            raise WorkflowError("PDF_MALFORMED", "PDF page count is invalid.")
+        if source_format == "text" and page_count is not None:
+            raise WorkflowError("UNSUPPORTED_FORMAT", "Input format is not supported.")
         job_id = uuid.uuid4().hex
         job_dir = self.root / job_id
         job_dir.mkdir(mode=JOB_MODE)
@@ -809,11 +1218,24 @@ class PrivateJobStore:
                     original=text,
                     source_path=source_path,
                     model=self.ckip_model,
+                    source_format=source_format,
+                    page_count=page_count,
                 )
             return self.public_state(job_id)
         except BaseException:
             shutil.rmtree(job_dir, ignore_errors=True)
             raise
+
+    def create_quick_from_pdf_bytes(self, data: bytes) -> dict[str, object]:
+        """Extract and process a PDF without persisting the uploaded bytes."""
+
+        extraction = extract_pdf_text(data)
+        return self.create_quick_from_text(
+            extraction.text,
+            source_name="upload.pdf",
+            source_format="pdf",
+            page_count=extraction.page_count,
+        )
 
     def create_quick_from_path(self, path: Path) -> dict[str, object]:
         """Read one safe source path and create the corresponding private job."""
@@ -854,6 +1276,7 @@ class PrivateJobStore:
                 original=original,
                 source_path=source,
                 model=model,
+                source_format="text",
             )
 
     def _load_state_unlocked(self, job_id: str, job_dir: Path) -> JobState:
@@ -876,8 +1299,7 @@ class PrivateJobStore:
             raise WorkflowError("INVALID_MAPPING", "Private mapping is invalid.")
         mapping = dict(raw_mapping)
         if any(
-            NAMESPACED_PATTERN.fullmatch(key) is None or not value
-            for key, value in mapping.items()
+            NAMESPACED_PATTERN.fullmatch(key) is None or not value for key, value in mapping.items()
         ):
             raise WorkflowError("INVALID_MAPPING", "Private mapping markers are invalid.")
         marker_prefix = f"[[PII-{job_id[:10]}-"
@@ -898,6 +1320,19 @@ class PrivateJobStore:
             raise WorkflowError(
                 "INTEGRITY_CHECK_FAILED", "Private job integrity verification failed."
             )
+        source_format = raw_manifest.get("source_format", "text")
+        if source_format not in {"text", "pdf"}:
+            raise WorkflowError("INVALID_JOB", "Private source format is invalid.")
+        if source_format == "pdf":
+            page_count = raw_manifest.get("page_count")
+            if (
+                not isinstance(page_count, int)
+                or isinstance(page_count, bool)
+                or not 1 <= page_count <= MAX_PDF_PAGES
+            ):
+                raise WorkflowError("INVALID_JOB", "Private PDF page count is invalid.")
+        elif "page_count" in raw_manifest:
+            raise WorkflowError("INVALID_JOB", "Private source format is invalid.")
         literal_markers = _validated_literal_markers(raw_manifest, original, redacted)
         if literal_markers & set(mapping):
             raise WorkflowError("INVALID_MANIFEST", "Private placeholder identity is invalid.")
@@ -905,9 +1340,7 @@ class PrivateJobStore:
         if _replace_all(redacted, mapping) != original:
             raise WorkflowError("ROUNDTRIP_INTEGRITY_FAILED", "Private job no longer round-trips.")
         foreign_namespaced = (
-            set(ALL_NAMESPACED_PATTERN.findall(redacted))
-            - set(mapping)
-            - literal_markers
+            set(ALL_NAMESPACED_PATTERN.findall(redacted)) - set(mapping) - literal_markers
         )
         if foreign_namespaced:
             raise WorkflowError("INVALID_MAPPING", "Private mapping markers are inconsistent.")
@@ -933,15 +1366,19 @@ class PrivateJobStore:
                     "placeholder": placeholder,
                 }
             )
-        return {
+        result: dict[str, object] = {
             "ok": True,
             "job_id": state.job_id,
             "mode": "quick",
+            "source_format": state.manifest.get("source_format", "text"),
             "anonymized_text": state.redacted,
             "placeholders": placeholders,
             "replacement_count": len(state.mapping),
             "roundtrip_verified": True,
         }
+        if result["source_format"] == "pdf":
+            result["page_count"] = state.manifest["page_count"]
+        return result
 
     def public_state(self, job_id: str) -> dict[str, object]:
         """Return a JSON-safe state with no mapping values."""
@@ -1019,6 +1456,13 @@ class PrivateJobStore:
             raise WorkflowError(
                 "ROUNDTRIP_INTEGRITY_FAILED", "Review edit failed round-trip verification."
             )
+        source_format = state.manifest.get("source_format", "text")
+        source_page_count = state.manifest.get("page_count")
+        page_count = (
+            source_page_count
+            if isinstance(source_page_count, int) and not isinstance(source_page_count, bool)
+            else None
+        )
         manifest = _manifest_for(
             job_id=state.job_id,
             job_dir=state.job_dir,
@@ -1027,6 +1471,8 @@ class PrivateJobStore:
             mapping=mapping,
             model="quick",
             source_path=state.job_dir / SOURCE_NAME,
+            source_format=str(source_format),
+            page_count=page_count if source_format == "pdf" else None,
             previous=state.manifest,
         )
         history = manifest.get("manual_annotations", [])
@@ -1060,9 +1506,7 @@ class PrivateJobStore:
                     mapping,
                     annotation={"action": "mask", "applied": applied, "not_found": missing},
                 )
-            result = self._public_state_from_state(
-                self._load_state_unlocked(job_id, job_dir)
-            )
+            result = self._public_state_from_state(self._load_state_unlocked(job_id, job_dir))
             result.update(
                 {
                     "terms_masked": applied,

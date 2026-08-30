@@ -13,6 +13,7 @@ import pytest
 
 from pii_guard.local_workflow import RESTORED_NAME, PrivateJobStore
 from pii_guard.web import LocalWebApplication, WebConfig, create_server
+from tests.pdf_fixtures import build_image_only_pdf, build_text_pdf
 from tests.test_local_workflow import FakeEngine
 
 ORIGINAL = "聯絡人王小明，身分證A123456789，手機0912345678。"
@@ -64,15 +65,38 @@ def _request(
         return error.code, decoded
 
 
-def _multipart(text: str, mode: str = "quick") -> tuple[bytes, str]:
+def _multipart(
+    text: str,
+    mode: str = "quick",
+    *,
+    filename: str = "fixture.txt",
+    file_content_type: str = "text/plain",
+) -> tuple[bytes, str]:
     boundary = "phase1-test-boundary"
     pieces = [
-        f"--{boundary}\r\nContent-Disposition: form-data; name=\"mode\"\r\n\r\n{mode}\r\n",
-        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
-        f"filename=\"fixture.txt\"\r\nContent-Type: text/plain\r\n\r\n{text}\r\n",
+        f'--{boundary}\r\nContent-Disposition: form-data; name="mode"\r\n\r\n{mode}\r\n',
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+        f'filename="{filename}"\r\nContent-Type: {file_content_type}\r\n\r\n{text}\r\n',
         f"--{boundary}--\r\n",
     ]
     return "".join(pieces).encode("utf-8"), f"multipart/form-data; boundary={boundary}"
+
+
+def _multipart_bytes(
+    data: bytes,
+    *,
+    filename: str = "fixture.pdf",
+    mode: str = "quick",
+    file_content_type: str = "application/pdf",
+) -> tuple[bytes, str]:
+    boundary = "phase2-pdf-boundary"
+    prefix = (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="mode"\r\n\r\n'
+        f'{mode}\r\n--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+        f'filename="{filename}"\r\nContent-Type: {file_content_type}\r\n\r\n'
+    ).encode("ascii")
+    suffix = f"\r\n--{boundary}--\r\n".encode("ascii")
+    return prefix + data + suffix, f"multipart/form-data; boundary={boundary}"
 
 
 def _assert_public_json_has_no_private_paths(payload: object, store: PrivateJobStore) -> None:
@@ -177,6 +201,141 @@ def test_upload_review_download_private_restore_and_delete(
     status, _missing = _request(base, f"/api/jobs/{job_id}/state")
     assert status == 404
     assert not restored_path.exists()
+
+
+def test_pdf_upload_review_downloads_text_and_escaped_html_then_deletes(
+    running_server,
+) -> None:
+    base, _server, store = running_server
+    pdf = build_text_pdf(
+        "ID A123456789 <script>alert(1)</script>",
+        "PHONE 0912345678",
+    )
+    body, content_type = _multipart_bytes(pdf)
+    status, result = _request(
+        base, "/api/process", method="POST", data=body, content_type=content_type
+    )
+    assert status == 200
+    assert isinstance(result, dict)
+    assert result["source_format"] == "pdf"
+    assert result["page_count"] == 2
+    rendered = json.dumps(result, ensure_ascii=False)
+    assert "A123456789" not in rendered
+    assert "0912345678" not in rendered
+    assert "<script>" in rendered
+    _assert_public_json_has_no_private_paths(result, store)
+    job_id = str(result["job_id"])
+    job_dir = store.root / job_id
+    assert not (job_dir / "fixture.pdf").exists()
+    assert not any(path.suffix.lower() == ".pdf" for path in job_dir.iterdir())
+
+    status, masked = _request(
+        base,
+        f"/api/jobs/{job_id}/mask",
+        method="POST",
+        data=json.dumps({"terms": ["PHONE"]}).encode("utf-8"),
+        content_type="application/json",
+    )
+    assert status == 200
+    assert isinstance(masked, dict)
+    assert masked["source_format"] == "pdf"
+    assert masked["page_count"] == 2
+
+    status, text_download = _request(base, f"/api/jobs/{job_id}/download?format=text")
+    assert status == 200
+    assert isinstance(text_download, bytes)
+    assert b"A123456789" not in text_download
+    assert b"0912345678" not in text_download
+    assert b"<script>" in text_download
+
+    status, html_download = _request(base, f"/api/jobs/{job_id}/download?format=html")
+    assert status == 200
+    assert isinstance(html_download, bytes)
+    html_text = html_download.decode("utf-8")
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html_text
+    assert "<script" not in html_text.lower()
+    assert "http://" not in html_text.lower()
+    assert "https://" not in html_text.lower()
+    assert "<link" not in html_text.lower()
+    assert "不保留原 PDF 版面" in html_text
+    assert "去識別化 PDF" in html_text
+
+    html_request = urllib.request.Request(f"{base}/api/jobs/{job_id}/download?format=html")
+    with urllib.request.urlopen(html_request, timeout=5) as html_response:
+        assert html_response.headers.get_content_type() == "text/html"
+        assert html_response.headers["X-Content-Type-Options"] == "nosniff"
+        assert html_response.headers["Cache-Control"] == "no-store"
+        assert html_response.headers["Content-Security-Policy"].find("script-src 'none'") >= 0
+        assert (
+            'filename="pii-guard-anonymized.html"' in html_response.headers["Content-Disposition"]
+        )
+
+    status, invalid_format = _request(base, f"/api/jobs/{job_id}/download?format=pdf")
+    assert status == 400
+    assert isinstance(invalid_format, dict)
+    assert invalid_format["error_code"] == "INVALID_DOWNLOAD_FORMAT"
+    assert "pdf" not in json.dumps(invalid_format, ensure_ascii=False).lower()
+
+    status, restored = _request(
+        base,
+        f"/api/jobs/{job_id}/restore",
+        method="POST",
+        data=b"{}",
+        content_type="application/json",
+    )
+    assert status == 200
+    assert isinstance(restored, dict)
+    assert restored["roundtrip_equal"] is True
+    restored_path = job_dir / RESTORED_NAME
+    assert restored_path.read_text(encoding="utf-8") == (
+        "ID A123456789 <script>alert(1)</script>\n\nPHONE 0912345678"
+    )
+
+    status, deleted = _request(base, f"/api/jobs/{job_id}", method="DELETE")
+    assert status == 200
+    assert deleted == {"deleted": True, "job_id": job_id, "ok": True}
+    assert not job_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("data", "filename", "file_content_type", "error_code"),
+    [
+        (b"not a PDF", "claimed.pdf", "application/pdf", "PDF_NOT_PDF"),
+        (b"%PDF-1.4 spoof", "claimed.txt", "application/pdf", "PDF_FILENAME_MISMATCH"),
+        (b"not a PDF", "claimed.exe", "application/octet-stream", "UNSUPPORTED_FORMAT"),
+    ],
+)
+def test_pdf_filename_and_mime_spoofs_are_rejected(
+    running_server,
+    data: bytes,
+    filename: str,
+    file_content_type: str,
+    error_code: str,
+) -> None:
+    base, _server, store = running_server
+    body, content_type = _multipart_bytes(
+        data, filename=filename, file_content_type=file_content_type
+    )
+    status, result = _request(
+        base, "/api/process", method="POST", data=body, content_type=content_type
+    )
+    assert status == 400
+    assert isinstance(result, dict)
+    assert result["error_code"] == error_code
+    assert "not a PDF" not in json.dumps(result, ensure_ascii=False)
+    assert list(store.root.iterdir()) == []
+
+
+def test_pdf_image_only_upload_is_rejected_without_creating_a_job(running_server) -> None:
+    base, _server, store = running_server
+    body, content_type = _multipart_bytes(build_image_only_pdf())
+    status, result = _request(
+        base, "/api/process", method="POST", data=body, content_type=content_type
+    )
+    assert status == 400
+    assert isinstance(result, dict)
+    assert result["error_code"] == "PDF_IMAGE_ONLY"
+    assert list(store.root.iterdir()) == []
 
 
 def test_enhanced_mode_is_explicitly_unavailable(running_server) -> None:
