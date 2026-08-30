@@ -754,11 +754,13 @@ class AuditManager:
         if callable(finish):
             finish(attempt, status="cancelled", error_code="AUDIT_CANCELLED")
         self._cleanup_attempt_dir(self._attempt_dir)
+        # Join the monitor before releasing the active claim so a new start()
+        # cannot overlap with the previous attempt's teardown.
+        if monitor is not None and monitor is not threading.current_thread():
+            monitor.join(AUDIT_PROCESS_GRACE_SECONDS * 2)
         with self._lock:
             if self._attempt is attempt:
                 self._clear_active()
-        if monitor is not None and monitor is not threading.current_thread():
-            monitor.join(AUDIT_PROCESS_GRACE_SECONDS * 2)
         try:
             return getattr(self.store, "public_state")(job_id)
         except WorkflowError:

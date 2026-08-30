@@ -664,3 +664,46 @@ def test_enhanced_transaction_recovers_after_partial_replace(
     state = store.load_state(job_id)
     assert state.manifest["audit_status"] == "queued"
     assert not any((store.root / job_id).glob(".txn-*"))
+
+
+class FirstOccurrenceOnlyEngine(FakeEngine):
+    """Engine double that misses repeated mentions, like a real NER pass can."""
+
+    def anonymize(self, text: str) -> tuple[str, dict[str, str]]:
+        output = text.replace("王小明", "<PERSON_1>", 1)
+        return output, {"<PERSON_1>": "王小明"}
+
+
+def test_sweep_replaces_missed_occurrences_and_keeps_existing_markers(
+    tmp_path: Path,
+) -> None:
+    store = PrivateJobStore(tmp_path / "jobs", engine=FirstOccurrenceOnlyEngine())
+    original = "王小明說明天再找王小明；王小明會到。"
+    public = store.create_quick_from_text(original)
+    job_id = str(public["job_id"])
+
+    redacted = str(public["anonymized_text"])
+    assert "王小明" not in redacted
+    assert redacted.count("-PERSON-1]]") == 3
+    assert public["replacement_count"] == 1
+    restored = store.restore_to_private(job_id)
+    assert restored["roundtrip_equal"] is True
+    assert (store.root / job_id / RESTORED_NAME).read_text(encoding="utf-8") == original
+
+
+def test_manual_mask_batch_short_term_does_not_corrupt_new_marker(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    original = "編號1的張三與編號2的李四。"
+    public = store.create_quick_from_text(original)
+    job_id = str(public["job_id"])
+
+    edited = store.mask_terms(job_id, ["張三", "1"])
+    assert edited["terms_masked"] == 2
+    text = str(edited["anonymized_text"])
+    assert re.fullmatch(
+        r"編號\[\[PII-[0-9a-f]{10}-MANUAL-2\]\]的\[\[PII-[0-9a-f]{10}-MANUAL-1\]\]與編號2的李四。",
+        text,
+    )
+    restored = store.restore_to_private(job_id)
+    assert restored["roundtrip_equal"] is True
+    assert (store.root / job_id / RESTORED_NAME).read_text(encoding="utf-8") == original

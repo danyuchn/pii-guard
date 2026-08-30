@@ -959,10 +959,21 @@ def _restore_literals(text: str, tokens: Mapping[str, str]) -> str:
     return restored
 
 
+_NAMESPACED_SPLIT_PATTERN: Final[re.Pattern[str]] = re.compile(
+    "(" + NAMESPACED_PATTERN.pattern + ")"
+)
+
+
 def _replace_outside_markers(text: str, value: str, replacement: str) -> str:
+    """Replace ``value`` only in the text between generated markers.
+
+    ``re.split`` keeps the separators only when the pattern has a capturing
+    group; without one every existing marker would be dropped from the result.
+    """
+
     if not value or value not in text:
         return text
-    parts = NAMESPACED_PATTERN.split(text)
+    parts = _NAMESPACED_SPLIT_PATTERN.split(text)
     for index in range(0, len(parts), 2):
         parts[index] = parts[index].replace(value, replacement)
     return "".join(parts)
@@ -2258,12 +2269,15 @@ class PrivateJobStore:
         job_id: str,
         terms: Iterable[str],
     ) -> tuple[str, dict[str, str], int, int, int]:
-        shielded = redacted
-        sentinels: dict[str, str] = {}
-        for index, placeholder in enumerate(sorted(mapping, key=len, reverse=True)):
-            sentinel = f"\x00PII_SHIELD_{index}_{uuid.uuid4().hex[:12]}\x00"
-            sentinels[sentinel] = placeholder
-            shielded = shielded.replace(placeholder, sentinel)
+        # Work on (is_marker, chunk) segments so terms are only ever searched
+        # in plain text: never inside an existing marker, never inside a
+        # marker created earlier in the same batch, and without sentinel
+        # strings that a short term such as "1" could match.
+        segments = [
+            (index % 2 == 1, chunk)
+            for index, chunk in enumerate(_NAMESPACED_SPLIT_PATTERN.split(redacted))
+            if chunk
+        ]
         used = [
             parsed[1]
             for placeholder in mapping
@@ -2274,19 +2288,27 @@ class PrivateJobStore:
         missing = 0
         occurrences = 0
         for term in sorted(terms, key=len, reverse=True):
-            found = shielded.count(term)
+            found = sum(chunk.count(term) for is_marker, chunk in segments if not is_marker)
             if not found:
                 missing += 1
                 continue
             counter += 1
             placeholder = f"[[PII-{job_id[:10]}-MANUAL-{counter}]]"
-            shielded = shielded.replace(term, placeholder)
+            updated: list[tuple[bool, str]] = []
+            for is_marker, chunk in segments:
+                if is_marker or term not in chunk:
+                    updated.append((is_marker, chunk))
+                    continue
+                for piece_index, piece in enumerate(chunk.split(term)):
+                    if piece_index:
+                        updated.append((True, placeholder))
+                    if piece:
+                        updated.append((False, piece))
+            segments = updated
             mapping[placeholder] = term
             applied += 1
             occurrences += found
-        for sentinel, placeholder in sentinels.items():
-            shielded = shielded.replace(sentinel, placeholder)
-        return shielded, mapping, applied, missing, occurrences
+        return "".join(chunk for _, chunk in segments), mapping, applied, missing, occurrences
 
     def _commit_state(
         self,
