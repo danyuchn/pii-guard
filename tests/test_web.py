@@ -68,6 +68,7 @@ def _request(
     data: bytes | None = None,
     content_type: str | None = None,
     headers: dict[str, str] | None = None,
+    timeout: float = 5,
 ) -> tuple[int, dict[str, object] | bytes]:
     request = urllib.request.Request(_url(base, path), data=data, method=method)
     if content_type:
@@ -75,7 +76,7 @@ def _request(
     for key, value in (headers or {}).items():
         request.add_header(key, value)
     try:
-        with urllib.request.urlopen(request, timeout=5) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = response.read()
             if response.headers.get_content_type() == "application/json":
                 return response.status, json.loads(payload.decode("utf-8"))
@@ -519,6 +520,7 @@ def test_enhanced_http_cancel_and_restart(tmp_path: Path) -> None:
             method="POST",
             data=b"",
             content_type="application/json",
+            timeout=15,
         )
         assert cancel_status == 200
         assert isinstance(cancelled, dict)
