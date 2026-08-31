@@ -15,12 +15,17 @@ import pytest
 import pii_guard.audit_manager as audit_manager_module
 from pii_guard import enhanced_audit
 from pii_guard.audit_manager import AuditManager
-from pii_guard.local_workflow import RESTORED_NAME, PrivateJobStore
-from pii_guard.web import LocalWebApplication, WebConfig, create_server
+from pii_guard.local_workflow import RESTORED_NAME, PrivateJobStore, WorkflowError
+from pii_guard.web import LocalWebApplication, WebConfig, _error_status, create_server
 from tests.pdf_fixtures import build_image_only_pdf, build_text_pdf
 from tests.test_local_workflow import FakeEngine
 
 ORIGINAL = "聯絡人王小明，身分證A123456789，手機0912345678。"
+
+
+@pytest.mark.parametrize("code", ["DELETE_CONFLICT", "JOB_DELETING"])
+def test_delete_conflicts_use_http_conflict_status(code: str) -> None:
+    assert _error_status(WorkflowError(code, "safe")) == 409
 
 
 def passing_enhanced_audit(
@@ -63,6 +68,7 @@ def _request(
     data: bytes | None = None,
     content_type: str | None = None,
     headers: dict[str, str] | None = None,
+    timeout: float = 5,
 ) -> tuple[int, dict[str, object] | bytes]:
     request = urllib.request.Request(_url(base, path), data=data, method=method)
     if content_type:
@@ -70,7 +76,7 @@ def _request(
     for key, value in (headers or {}).items():
         request.add_header(key, value)
     try:
-        with urllib.request.urlopen(request, timeout=5) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = response.read()
             if response.headers.get_content_type() == "application/json":
                 return response.status, json.loads(payload.decode("utf-8"))
@@ -514,6 +520,7 @@ def test_enhanced_http_cancel_and_restart(tmp_path: Path) -> None:
             method="POST",
             data=b"",
             content_type="application/json",
+            timeout=15,
         )
         assert cancel_status == 200
         assert isinstance(cancelled, dict)

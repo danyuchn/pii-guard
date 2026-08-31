@@ -8,7 +8,6 @@ been explicitly started.
 
 from __future__ import annotations
 
-import fcntl
 import io
 import json
 import logging
@@ -23,8 +22,16 @@ from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+from pii_guard._compat import (
+    is_reparse_point,
+    lock_descriptor,
+    mode_matches,
+    owner_matches,
+    set_descriptor_mode,
+    unlock_descriptor,
+)
 from pii_guard.local_workflow import (
     JOB_MODE,
     EnhancedAttempt,
@@ -82,10 +89,18 @@ def _acquire_manager_lease(store: object) -> tuple[Path, int]:
                 0o600,
             )
             info = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            path_info = lease_path.lstat()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or not owner_matches(info)
+                or info.st_nlink != 1
+                or is_reparse_point(path_info)
+                or path_info.st_dev != info.st_dev
+                or path_info.st_ino != info.st_ino
+            ):
                 raise OSError("unsafe manager lease")
-            os.fchmod(descriptor, 0o600)
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            set_descriptor_mode(descriptor, 0o600)
+            lock_descriptor(descriptor, exclusive=True, blocking=False)
         except (BlockingIOError, OSError):
             if descriptor is not None:
                 os.close(descriptor)
@@ -100,7 +115,7 @@ def _release_manager_lease(root: Path, descriptor: int) -> None:
     with _LEASE_REGISTRY_LOCK:
         _LEASED_ROOTS.discard(root)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            unlock_descriptor(descriptor)
         finally:
             os.close(descriptor)
 
@@ -454,7 +469,8 @@ class AuditManager:
         try:
             import shutil
 
-            if path.is_dir() and not path.is_symlink():
+            info = path.lstat()
+            if stat.S_ISDIR(info.st_mode) and not is_reparse_point(info):
                 shutil.rmtree(path)
         except (OSError, ValueError):
             return
@@ -479,6 +495,14 @@ class AuditManager:
         path = Path(self.store.root) / attempt.job_id / f".attempt-{attempt.attempt_token}"
         path.mkdir(mode=JOB_MODE)
         path.chmod(JOB_MODE)
+        info = path.lstat()
+        if (
+            is_reparse_point(info)
+            or not stat.S_ISDIR(info.st_mode)
+            or not owner_matches(info)
+            or not mode_matches(info, JOB_MODE)
+        ):
+            raise WorkflowError("PERMISSION_CHECK_FAILED", "Private audit path is unsafe.")
         return path
 
     def _ensure_idle(self) -> None:
@@ -533,7 +557,9 @@ class AuditManager:
             try:
                 attempt_dir = self._new_attempt_dir(attempt)
                 context = multiprocessing.get_context("spawn")
-                output_read, output_write = context.Pipe(duplex=False)
+                raw_output_read, raw_output_write = context.Pipe(duplex=False)
+                output_read = cast(Connection, raw_output_read)
+                output_write = cast(Connection, raw_output_write)
                 process = context.Process(
                     target=_audit_worker,
                     args=(

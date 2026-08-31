@@ -48,7 +48,7 @@ def run_quick_benchmark(
     factory: EngineFactory = _regex_engine if regex_only else _default_engine
     with tempfile.TemporaryDirectory(prefix="pii-guard-benchmark-") as directory:
         store = PrivateJobStore(
-            Path(directory),
+            Path(directory) / "jobs",
             engine_factory=factory,
             ckip_model=model,
             score_threshold=threshold,

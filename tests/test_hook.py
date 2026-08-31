@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -116,12 +117,16 @@ class TestHookDetect:
             "tool_name": "Read",
             "tool_input": {"file_path": file_path},
         })
+        # Pin both pipe directions to UTF-8: on Windows the locale codec
+        # (e.g. cp950) cannot decode the child's UTF-8 output.
         return subprocess.run(
             [sys.executable, "-m", "pii_guard.hook_detect"],
             input=hook_input,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=30,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
 
     def test_pii_detected_returns_ask(self, pii_file: Path):

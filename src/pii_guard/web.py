@@ -428,7 +428,7 @@ def _error_status(error: WorkflowError) -> int:
         return 404
     if error.code in {"INPUT_TOO_LARGE", "REQUEST_TOO_LARGE"}:
         return 413
-    if error.code in {"ENHANCED_BUSY", "JOB_NOT_READY"}:
+    if error.code in {"DELETE_CONFLICT", "ENHANCED_BUSY", "JOB_DELETING", "JOB_NOT_READY"}:
         return 409
     if error.code == "AUDIT_UNAVAILABLE":
         return 503

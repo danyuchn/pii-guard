@@ -1,0 +1,52 @@
+name: Windows
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.5"
+          python-version: "3.11"
+          enable-cache: true
+
+      - name: Keep private test jobs inside the Windows user profile
+        shell: pwsh
+        run: |
+          $privateTemp = Join-Path $env:USERPROFILE "pii-guard-ci-temp"
+          New-Item -ItemType Directory -Force -Path $privateTemp | Out-Null
+          "TMP=$privateTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TEMP=$privateTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install locked dependencies
+        run: uv sync --locked --extra dev --extra formats
+
+      - name: Import the local web module
+        run: uv run python -c "import pii_guard.web"
+
+      - name: Run quick, restore, web, deletion, locking, and junction tests
+        run: uv run pytest -m "not slow" -q
+
+      - name: Type-check Windows and POSIX branches
+        run: |
+          uv run mypy src/
+          uv run mypy --platform linux src/
+
+      - name: Lint source and tests
+        run: uv run ruff check src/ tests/

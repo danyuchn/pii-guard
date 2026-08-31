@@ -99,6 +99,14 @@ uv sync --extra formats
 
 首次執行會下載 CKIP BERT NER 模型（約 500MB）。未加裝 `formats` 時，`tests/test_file_handlers.py` 的 10 個測試會因缺少套件而跳不過，屬預期行為。
 
+### 平台支援
+
+macOS 與 Linux 是主要平台。Windows（NTFS）可以跑核心流程——`anonymize`／`restore`、`quick`、`quick-restore`、本機網頁與 PDF 快審、測試套件——但有三件事必須知道：
+
+- **私有目錄 ACL**：NTFS 沒有 POSIX 權限位。Windows 新建 jobs root 時會移除繼承，限定目前使用者、SYSTEM 與 Administrators 完全控制，並在使用前讀回驗證。jobs root 必須位於使用者設定檔內；父目錄若允許其他帳號建立、刪除或置換子項目也會拒絕。既有或自訂 root 任一檢查不符便 fail-closed。[威脅模型](#威脅模型)一節的 `0600`／`0700` 敘述以 POSIX 為準。
+- **鎖語意**：Windows 以 `msvcrt` byte-range lock 替代 `flock`，共享鎖一律降級為互斥鎖——序列化變多，保護不變少。
+- **加強模式不可用**：Ollama listener 驗證依賴 `lsof`，Windows 上會以 `LOCAL_MODEL_UNVERIFIED` 拒絕啟動（fail-closed）。快速模式與人工補標不受影響。
+
 ## Claude Code Skill
 
 本 repo 內含 `pii-safe-documents` skill，位於 `.agents/skills/pii-safe-documents/`。它在 CLI 之外做兩件事：
