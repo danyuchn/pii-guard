@@ -56,7 +56,9 @@ class TestEvalRegexOnly:
 
     def test_precision_recall_regex(self, spacy_only_engine, corpus):
         predicted, expected = _aggregate(
-            spacy_only_engine, corpus, exclude_ner=True,
+            spacy_only_engine,
+            corpus,
+            exclude_ner=True,
         )
         metrics = compute_metrics(predicted, expected)
         print("\n" + format_report(metrics))

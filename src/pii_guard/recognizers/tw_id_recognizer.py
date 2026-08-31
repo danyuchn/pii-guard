@@ -21,7 +21,12 @@ class TwNationalIdRecognizer(PatternRecognizer):
         Pattern("TW_NATIONAL_ID", r"(?<![A-Za-z0-9])[A-Z][12]\d{8}(?![A-Za-z0-9])", 0.9),
     ]
     CONTEXT: ClassVar[list[str]] = [
-        "身分證", "身份證", "證號", "國民身分證", "身分證字號", "ID",
+        "身分證",
+        "身份證",
+        "證號",
+        "國民身分證",
+        "身分證字號",
+        "ID",
     ]
 
     def __init__(self) -> None:
@@ -42,7 +47,12 @@ class TwArcRecognizer(PatternRecognizer):
         Pattern("TW_ARC", r"(?<![A-Za-z0-9])[A-Z][A-D89]\d{8}(?![A-Za-z0-9])", 0.85),
     ]
     CONTEXT: ClassVar[list[str]] = [
-        "居留證", "外僑居留證", "外籍居留證", "ARC", "外籍", "居留",
+        "居留證",
+        "外僑居留證",
+        "外籍居留證",
+        "ARC",
+        "外籍",
+        "居留",
     ]
 
     def __init__(self) -> None:
@@ -69,7 +79,11 @@ class TwPassportRecognizer(PatternRecognizer):
         Pattern("TW_PASSPORT", r"(?<![A-Za-z0-9])[A-Z]\d{8}(?![A-Za-z0-9])", 0.6),
     ]
     CONTEXT: ClassVar[list[str]] = [
-        "護照", "passport", "護照號碼", "護照號", "出入境",
+        "護照",
+        "passport",
+        "護照號碼",
+        "護照號",
+        "出入境",
     ]
 
     def __init__(self) -> None:

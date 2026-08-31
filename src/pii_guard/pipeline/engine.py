@@ -127,9 +127,7 @@ def _create_nlp_engine(ckip_model: str):
         )
         from presidio_analyzer.nlp_engine import SpacyNlpEngine
 
-        return SpacyNlpEngine(
-            models=[{"lang_code": "zh", "model_name": "zh_core_web_sm"}]
-        )
+        return SpacyNlpEngine(models=[{"lang_code": "zh", "model_name": "zh_core_web_sm"}])
 
 
 def _merge_adjacent_spans(results: list[RecognizerResult]) -> list[RecognizerResult]:
@@ -169,7 +167,8 @@ def _filter_person_over_date(results: list[RecognizerResult]) -> list[Recognizer
     if not date_spans:
         return results
     return [
-        r for r in results
+        r
+        for r in results
         if not (
             r.entity_type == "PERSON"
             and any(ds <= r.start and r.end <= de for ds, de in date_spans)
@@ -242,8 +241,8 @@ class PiiGuardEngine:
             ``{placeholder: original_value}`` — needed for :meth:`deanonymize`.
         """
         # Shared mutable state for the operator lambdas (closure)
-        entity_mapping: dict[str, str] = {}   # original_value → placeholder
-        counters: dict[str, int] = {}          # entity_type → running count
+        entity_mapping: dict[str, str] = {}  # original_value → placeholder
+        counters: dict[str, int] = {}  # entity_type → running count
 
         def make_lambda(entity_type: str):
             def replace_fn(original: str) -> str:
@@ -256,11 +255,11 @@ class PiiGuardEngine:
                     placeholder = f"<{entity_type}_{counters[entity_type]}>"
                     entity_mapping[original] = placeholder
                 return entity_mapping[original]
+
             return replace_fn
 
         operators = {
-            et: OperatorConfig("custom", {"lambda": make_lambda(et)})
-            for et in SUPPORTED_ENTITIES
+            et: OperatorConfig("custom", {"lambda": make_lambda(et)}) for et in SUPPORTED_ENTITIES
         }
 
         results = self._raw_detect(text)

@@ -7,11 +7,61 @@ from pathlib import Path
 import pytest
 
 from pii_guard.file_handlers import (
+    FileHandlerError,
     get_output_extension,
     is_supported,
     read_file,
     write_file,
 )
+
+
+def _two_page_pdf_bytes() -> bytes:
+    """Build a dependency-free two-page PDF with one PII value per page."""
+
+    def stream(body: bytes) -> bytes:
+        return (
+            b"<< /Length "
+            + str(len(body)).encode("ascii")
+            + b" >>\nstream\n"
+            + body
+            + b"\nendstream"
+        )
+
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+        (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 5 0 R >> >> /Contents 6 0 R >>"
+        ),
+        (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 5 0 R >> >> /Contents 7 0 R >>"
+        ),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        stream(b"BT /F1 18 Tf 100 700 Td (ID: A123456789) Tj ET"),
+        stream(b"BT /F1 18 Tf 100 700 Td (Phone: 0912345678) Tj ET"),
+    ]
+    document = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for object_number, value in enumerate(objects, start=1):
+        offsets.append(len(document))
+        document.extend(f"{object_number} 0 obj\n".encode("ascii"))
+        document.extend(value)
+        document.extend(b"\nendobj\n")
+    xref_offset = len(document)
+    document.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    document.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        document.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    document.extend(
+        (
+            f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref_offset}\n%%EOF\n"
+        ).encode("ascii")
+    )
+    return bytes(document)
+
 
 # ---------------------------------------------------------------------------
 # is_supported / get_output_extension
@@ -19,7 +69,6 @@ from pii_guard.file_handlers import (
 
 
 class TestHelpers:
-
     def test_supported_txt(self):
         assert is_supported("data.txt")
 
@@ -44,8 +93,8 @@ class TestHelpers:
     def test_output_ext_xlsx(self):
         assert get_output_extension("report.xlsx") == ".xlsx"
 
-    def test_output_ext_pdf_becomes_txt(self):
-        assert get_output_extension("invoice.pdf") == ".txt"
+    def test_output_ext_pdf_is_pdf(self):
+        assert get_output_extension("invoice.pdf") == ".pdf"
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +103,6 @@ class TestHelpers:
 
 
 class TestPlainText:
-
     def test_read_txt(self, tmp_path: Path):
         f = tmp_path / "data.txt"
         f.write_text("身分證A123456789", encoding="utf-8")
@@ -78,13 +126,13 @@ class TestPlainText:
         assert "<TW_NATIONAL_ID_1>" in out.read_text(encoding="utf-8")
 
     def test_file_not_found(self):
-        with pytest.raises(FileNotFoundError):
+        with pytest.raises(FileHandlerError, match="FILE_NOT_FOUND"):
             read_file("/tmp/definitely_not_exist_pii_guard.txt")
 
     def test_unsupported_extension(self, tmp_path: Path):
         f = tmp_path / "data.pptx"
         f.write_bytes(b"fake")
-        with pytest.raises(ValueError, match="Unsupported"):
+        with pytest.raises(FileHandlerError, match="FILE_UNSUPPORTED"):
             read_file(f)
 
 
@@ -94,10 +142,10 @@ class TestPlainText:
 
 
 class TestExcel:
-
     @pytest.fixture()
     def sample_xlsx(self, tmp_path: Path) -> Path:
         import openpyxl
+
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Sheet1"
@@ -133,6 +181,7 @@ class TestExcel:
 
         # Read back and verify PII is replaced
         import openpyxl
+
         wb = openpyxl.load_workbook(str(out), read_only=True)
         ws = wb.active
         values = [str(c.value) for row in ws.iter_rows() for c in row if c.value]
@@ -147,10 +196,10 @@ class TestExcel:
 
 
 class TestDocx:
-
     @pytest.fixture()
     def sample_docx(self, tmp_path: Path) -> Path:
         from docx import Document
+
         doc = Document()
         doc.add_paragraph("客戶：張三")
         doc.add_paragraph("身分證字號：A123456789")
@@ -188,6 +237,7 @@ class TestDocx:
 
         # Read back and verify PII is replaced
         from docx import Document
+
         doc = Document(str(out))
         all_text = " ".join(p.text for p in doc.paragraphs)
         assert "A123456789" not in all_text
@@ -200,13 +250,13 @@ class TestDocx:
 
 
 class TestPdf:
-
     @pytest.fixture()
     def sample_pdf(self, tmp_path: Path) -> Path:
         """Create a minimal PDF with PII text using pdfplumber-compatible format."""
         # Use reportlab if available, otherwise create a minimal PDF manually
         try:
             from reportlab.pdfgen import canvas
+
             path = tmp_path / "data.pdf"
             c = canvas.Canvas(str(path))
             c.drawString(100, 750, "ID: A123456789")
@@ -248,14 +298,88 @@ class TestPdf:
         content = read_file(sample_pdf)
         assert content.cells == []
 
-    def test_write_pdf_outputs_txt(self, sample_pdf: Path, tmp_path: Path):
+    def test_write_pdf_preserves_pdf_layout_and_removes_text(
+        self, sample_pdf: Path, tmp_path: Path
+    ):
         content = read_file(sample_pdf)
         out = tmp_path / "output.pdf"
-        write_file(content, "anonymized content", {}, out)
-        # PDF write produces .txt
-        txt_out = tmp_path / "output.txt"
-        assert txt_out.exists()
-        assert "anonymized" in txt_out.read_text(encoding="utf-8")
+        import pypdfium2 as pdfium
+
+        original_pdf = pdfium.PdfDocument(content.source_bytes)
+        original_size = (original_pdf[0].get_width(), original_pdf[0].get_height())
+        original_pdf.close()
+        write_file(content, "", {"<TW_NATIONAL_ID_1>": "A123456789"}, out)
+        assert out.exists()
+        assert out.read_bytes().startswith(b"%PDF-")
+
+        # The generated PDF is intentionally image-only.  Its page count and
+        # physical size remain the same while the source PII is not exposed as
+        # selectable text or embedded metadata.
+        import pdfplumber
+
+        with pdfplumber.open(str(out)) as generated:
+            assert len(generated.pages) == 1
+            assert "A123456789" not in "\n".join(
+                page.extract_text() or "" for page in generated.pages
+            )
+        generated_pdf = pdfium.PdfDocument(out.read_bytes())
+        assert (generated_pdf[0].get_width(), generated_pdf[0].get_height()) == pytest.approx(
+            original_size, abs=0.5
+        )
+        generated_pdf.close()
+
+    def test_pdf_write_fails_closed_if_mapping_cannot_be_located(
+        self, sample_pdf: Path, tmp_path: Path
+    ):
+        content = read_file(sample_pdf)
+        out = tmp_path / "must-not-exist.pdf"
+        with pytest.raises(FileHandlerError) as error:
+            write_file(content, "", {"<PII_1>": "not-present-in-document"}, out)
+        assert error.value.code == "PDF_REDACTION_UNRESOLVED"
+        assert not out.exists()
+
+    def test_pdf_write_masks_values_across_pages(self, tmp_path: Path):
+        source = tmp_path / "two-page.pdf"
+        source.write_bytes(_two_page_pdf_bytes())
+        content = read_file(source)
+        out = tmp_path / "two-page-redacted.pdf"
+        mapping = {
+            "<TW_NATIONAL_ID_1>": "A123456789",
+            "<TW_MOBILE_1>": "0912345678",
+        }
+
+        write_file(content, "", mapping, out)
+
+        import pdfplumber
+
+        with pdfplumber.open(str(out)) as generated:
+            assert len(generated.pages) == 2
+            extracted = "\n".join(page.extract_text() or "" for page in generated.pages)
+        assert "A123456789" not in extracted
+        assert "0912345678" not in extracted
+
+    def test_file_errors_do_not_include_source_path(self, tmp_path: Path):
+        private_name = "private-customer-name-A123456789"
+        missing = tmp_path / private_name / "record.docx"
+        with pytest.raises(FileHandlerError) as error:
+            read_file(missing)
+        rendered = str(error.value)
+        assert private_name not in rendered
+        assert str(tmp_path) not in rendered
+
+    @pytest.mark.parametrize("extension", [".docx", ".xlsx", ".pdf"])
+    def test_malformed_format_error_is_fixed_and_does_not_echo_input(
+        self, tmp_path: Path, extension: str
+    ):
+        private_name = "private-customer-name-A123456789"
+        path = tmp_path / f"{private_name}{extension}"
+        path.write_bytes(b"malformed source A123456789")
+        with pytest.raises(FileHandlerError) as error:
+            read_file(path)
+        rendered = str(error.value)
+        assert error.value.code in {"FILE_MALFORMED", "FORMAT_UNAVAILABLE"}
+        assert private_name not in rendered
+        assert "A123456789" not in rendered
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +388,6 @@ class TestPdf:
 
 
 class TestFullRoundtrip:
-
     def test_txt_roundtrip(self, tmp_path: Path, spacy_only_engine):
         original = "客戶身分證A123456789，手機0912345678"
         f = tmp_path / "data.txt"
@@ -275,6 +398,7 @@ class TestFullRoundtrip:
         assert "A123456789" not in anonymized_text
 
         from pii_guard.pipeline.engine import PiiGuardEngine
+
         restored = PiiGuardEngine.deanonymize(anonymized_text, mapping)
         assert restored == original
 
@@ -288,6 +412,7 @@ class TestFullRoundtrip:
         assert "0912345678" not in anonymized_text
 
         from pii_guard.pipeline.engine import PiiGuardEngine
+
         restored = PiiGuardEngine.deanonymize(anonymized_text, mapping)
         assert restored == original
 

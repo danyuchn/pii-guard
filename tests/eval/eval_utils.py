@@ -21,10 +21,7 @@ def results_to_spans(results, offset: int = 0) -> set[Span]:
 
 def annotations_to_spans(annotations: list[dict], offset: int = 0) -> set[Span]:
     """Convert corpus annotation dicts to a set of :class:`Span`."""
-    return {
-        Span(a["entity_type"], a["start"] + offset, a["end"] + offset)
-        for a in annotations
-    }
+    return {Span(a["entity_type"], a["start"] + offset, a["end"] + offset) for a in annotations}
 
 
 @dataclass

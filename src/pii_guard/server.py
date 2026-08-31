@@ -77,15 +77,10 @@ def anonymize_file(file_path: str) -> dict:
         entity_count: 偵測到的 PII 實體數量
         original_path: 原始檔案路徑（供參考）
     """
-    from pii_guard.file_handlers import SUPPORTED_EXTENSIONS, is_supported, read_file
+    from pii_guard.file_handlers import FileHandlerError, is_supported, read_file
 
     if not is_supported(file_path):
-        from pathlib import Path as _Path
-        ext = _Path(file_path).suffix
-        raise ValueError(
-            f"Unsupported file type: {ext}. "
-            f"Supported: {sorted(SUPPORTED_EXTENSIONS)}"
-        )
+        raise FileHandlerError("FILE_UNSUPPORTED")
 
     content = read_file(file_path)
     engine = _get_engine()
