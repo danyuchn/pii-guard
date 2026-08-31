@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -32,9 +33,11 @@ from pathlib import Path
 from typing import Final, NoReturn, Protocol
 
 from pii_guard._compat import (
+    is_reparse_point,
     lock_descriptor,
     mode_matches,
     owner_matches,
+    secure_private_directory,
     set_descriptor_mode,
     unlock_descriptor,
 )
@@ -248,7 +251,7 @@ def _assert_owner_mode(path: Path, expected_mode: int, *, directory: bool) -> No
         info = path.lstat()
     except FileNotFoundError as exc:
         raise WorkflowError("JOB_NOT_FOUND", "Private job artifact was not found.") from exc
-    if path.is_symlink() or (directory and not stat.S_ISDIR(info.st_mode)):
+    if is_reparse_point(info) or (directory and not stat.S_ISDIR(info.st_mode)):
         raise WorkflowError("PERMISSION_CHECK_FAILED", "Private artifact is not safe.")
     if not directory and not stat.S_ISREG(info.st_mode):
         raise WorkflowError("PERMISSION_CHECK_FAILED", "Private artifact is not a file.")
@@ -334,13 +337,35 @@ def _job_lock(job_dir: Path, *, exclusive: bool) -> Iterator[None]:
 
 
 def _ensure_jobs_root(root: Path) -> Path:
-    expanded = root.expanduser()
-    if expanded.exists() and expanded.is_symlink():
-        raise WorkflowError("PERMISSION_CHECK_FAILED", "Private jobs root must not be a symlink.")
+    expanded = Path(os.path.abspath(str(root.expanduser())))
+    try:
+        initial_info = expanded.lstat()
+    except FileNotFoundError:
+        created = True
+    else:
+        created = False
+        if is_reparse_point(initial_info):
+            raise WorkflowError(
+                "PERMISSION_CHECK_FAILED",
+                "Private jobs root must not be a link or reparse point.",
+            )
     expanded.mkdir(parents=True, exist_ok=True, mode=JOB_MODE)
     expanded.chmod(JOB_MODE)
-    resolved = expanded.resolve()
+    current_info = expanded.lstat()
+    if is_reparse_point(current_info):
+        raise WorkflowError(
+            "PERMISSION_CHECK_FAILED",
+            "Private jobs root must not be a link or reparse point.",
+        )
+    resolved = expanded.resolve(strict=True)
     _assert_owner_mode(resolved, JOB_MODE, directory=True)
+    try:
+        secure_private_directory(resolved, created=created)
+    except OSError as exc:
+        raise WorkflowError(
+            "PERMISSION_CHECK_FAILED",
+            "Private jobs root permissions could not be verified.",
+        ) from exc
     return resolved
 
 
@@ -433,6 +458,7 @@ def _write_atomic_state(
     transaction = job_dir / f".txn-{uuid.uuid4().hex}"
     transaction.mkdir(mode=JOB_MODE)
     transaction.chmod(JOB_MODE)
+    _assert_owner_mode(transaction, JOB_MODE, directory=True)
     new_contents = {
         REDACTED_NAME: redacted,
         PRIVATE_MAP_NAME: _mapping_text(mapping),
@@ -480,19 +506,25 @@ def _recover_pending_transactions(job_dir: Path) -> None:
             "INTEGRITY_CHECK_FAILED", "Private state could not be inspected."
         ) from exc
     for transaction in entries:
+        try:
+            transaction_info = transaction.lstat()
+        except FileNotFoundError:
+            continue
+        if is_reparse_point(transaction_info):
+            raise WorkflowError("INVALID_JOB", "Private job contains an unsafe reparse point.")
         if (
-            not transaction.is_dir()
-            or transaction.is_symlink()
+            not stat.S_ISDIR(transaction_info.st_mode)
             or not TRANSACTION_PATTERN.fullmatch(transaction.name)
         ):
             continue
         _assert_owner_mode(transaction, JOB_MODE, directory=True)
         committed = transaction / TRANSACTION_COMMITTED_NAME
         ready = transaction / TRANSACTION_READY_NAME
-        if committed.exists() and not committed.is_symlink():
+        if committed.exists():
+            _assert_owner_mode(committed, PRIVATE_MODE, directory=False)
             shutil.rmtree(transaction)
             continue
-        if not ready.exists() or ready.is_symlink():
+        if not ready.exists():
             # A transaction without READY has not modified official state.
             shutil.rmtree(transaction)
             continue
@@ -521,7 +553,7 @@ def _read_utf8(path: Path, *, max_bytes: int | None = MAX_INPUT_BYTES) -> str:
         info = path.lstat()
     except FileNotFoundError as exc:
         raise WorkflowError("INPUT_NOT_FOUND", "Input path is not available.") from exc
-    if path.is_symlink() or not stat.S_ISREG(info.st_mode):
+    if is_reparse_point(info) or not stat.S_ISREG(info.st_mode):
         raise WorkflowError("INPUT_NOT_FOUND", "Input path must be a regular file.")
     if max_bytes is not None and info.st_size > max_bytes:
         raise WorkflowError("INPUT_TOO_LARGE", "Input exceeds the safety size limit.")
@@ -692,6 +724,8 @@ def _extract_pdf_text_local(data: bytes) -> PdfTextExtraction:
 def _set_pdf_worker_limits() -> None:
     """Apply best-effort CPU and address-space limits inside the worker."""
 
+    if sys.platform == "win32":
+        return
     try:
         import resource
     except ImportError:
@@ -1267,8 +1301,11 @@ def _reject_symlink_components(path: Path) -> Path:
             info = current.lstat()
         except FileNotFoundError:
             break
-        if stat.S_ISLNK(info.st_mode):
-            raise WorkflowError("OUTPUT_SYMLINK_REFUSED", "Output path must not use a symlink.")
+        if is_reparse_point(info):
+            raise WorkflowError(
+                "OUTPUT_SYMLINK_REFUSED",
+                "Output path must not use a link or reparse point.",
+            )
         if current != normalized and not stat.S_ISDIR(info.st_mode):
             raise WorkflowError("OUTPUT_PATH_INVALID", "Output parent is not a directory.")
     return normalized
@@ -1276,9 +1313,13 @@ def _reject_symlink_components(path: Path) -> Path:
 
 def _validate_restore_output(path: Path, job_dir: Path, *, overwrite: bool) -> Path:
     output = _reject_symlink_components(path)
-    if output.exists() or output.is_symlink():
-        if output.is_symlink():
-            raise WorkflowError("OUTPUT_SYMLINK_REFUSED", "Output path must not be a symlink.")
+    if os.path.lexists(output):
+        output_info = output.lstat()
+        if is_reparse_point(output_info):
+            raise WorkflowError(
+                "OUTPUT_SYMLINK_REFUSED",
+                "Output path must not be a link or reparse point.",
+            )
         if output.is_dir() or not overwrite:
             raise WorkflowError(
                 "OUTPUT_EXISTS", "Restore output already exists; overwrite refused."
@@ -1344,11 +1385,15 @@ class PrivateJobStore:
     def _job_dir(self, job_id: str) -> Path:
         _validate_job_id(job_id)
         candidate = self.root / job_id
-        if candidate.is_symlink():
+        try:
+            candidate_info = candidate.lstat()
+        except FileNotFoundError as exc:
+            raise WorkflowError("JOB_NOT_FOUND", "Private job was not found.") from exc
+        if is_reparse_point(candidate_info):
             raise WorkflowError("JOB_NOT_FOUND", "Private job was not found.")
         if candidate.parent != self.root:
             raise WorkflowError("INVALID_JOB_ID", "Job ID resolves outside the private jobs root.")
-        if not candidate.is_dir():
+        if not stat.S_ISDIR(candidate_info.st_mode):
             raise WorkflowError("JOB_NOT_FOUND", "Private job was not found.")
         _assert_owner_mode(candidate, JOB_MODE, directory=True)
         return candidate
@@ -1450,6 +1495,7 @@ class PrivateJobStore:
         job_dir = self.root / job_id
         job_dir.mkdir(mode=JOB_MODE)
         job_dir.chmod(JOB_MODE)
+        _assert_owner_mode(job_dir, JOB_MODE, directory=True)
         source_path = job_dir / SOURCE_NAME
         try:
             _ensure_lock_file(job_dir)
@@ -1972,9 +2018,14 @@ class PrivateJobStore:
         except OSError:
             return recovered
         for candidate in entries:
+            try:
+                candidate_info = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            if is_reparse_point(candidate_info):
+                continue
             if (
-                candidate.is_symlink()
-                or not candidate.is_dir()
+                not stat.S_ISDIR(candidate_info.st_mode)
                 or not JOB_ID_PATTERN.fullmatch(candidate.name)
             ):
                 continue
@@ -2027,13 +2078,17 @@ class PrivateJobStore:
 
         _validate_job_id(job_id)
         resolved_dir = job_dir
-        if resolved_dir.is_symlink() or resolved_dir.name != job_id:
+        try:
+            resolved_info = resolved_dir.lstat()
+        except FileNotFoundError as exc:
+            raise WorkflowError("INVALID_JOB_ID", "Private job directory is invalid.") from exc
+        if is_reparse_point(resolved_info) or resolved_dir.name != job_id:
             raise WorkflowError("INVALID_JOB_ID", "Private job directory is invalid.")
         if resolved_dir.parent != self.root:
             raise WorkflowError("INVALID_JOB_ID", "Private job directory is invalid.")
         _assert_owner_mode(resolved_dir, JOB_MODE, directory=True)
         source = source_path or (resolved_dir / SOURCE_NAME)
-        if source.is_symlink() or source != resolved_dir / SOURCE_NAME:
+        if source != resolved_dir / SOURCE_NAME:
             raise WorkflowError("INVALID_WORKER_PATH", "Private snapshot path is invalid.")
         with _job_lock(resolved_dir, exclusive=True):
             original = _read_utf8(source)
@@ -2504,35 +2559,82 @@ class PrivateJobStore:
             temporary_pattern = re.compile(
                 r"^\.[A-Za-z0-9._-]+\.(?:private\.txt|private\.json|safe\.json)$"
             )
+            validated_artifacts: list[tuple[Path, os.stat_result, bool]] = []
+            lock_info: os.stat_result | None = None
             for entry in job_dir.iterdir():
-                if entry.is_symlink():
-                    raise WorkflowError("INVALID_JOB", "Private job contains an unknown artifact.")
-                if entry.is_dir() and (
+                try:
+                    entry_info = entry.lstat()
+                except FileNotFoundError as exc:
+                    raise WorkflowError(
+                        "DELETE_FAILED", "Private job changed during deletion."
+                    ) from exc
+                if is_reparse_point(entry_info):
+                    raise WorkflowError(
+                        "INVALID_JOB", "Private job contains an unsafe reparse point."
+                    )
+                is_directory = stat.S_ISDIR(entry_info.st_mode)
+                if is_directory and (
                     TRANSACTION_PATTERN.fullmatch(entry.name)
                     or ATTEMPT_PATTERN.fullmatch(entry.name)
                 ):
-                    shutil.rmtree(entry)
+                    validated_artifacts.append((entry, entry_info, True))
                     continue
-                if not entry.is_file():
+                if not stat.S_ISREG(entry_info.st_mode):
                     raise WorkflowError("INVALID_JOB", "Private job contains an unknown artifact.")
                 if (
                     entry.name not in known_files
                     and temporary_pattern.fullmatch(entry.name) is None
                 ):
                     raise WorkflowError("INVALID_JOB", "Private job contains an unknown artifact.")
+                validated_artifacts.append((entry, entry_info, False))
+                if entry.name == LOCK_NAME:
+                    lock_info = entry_info
             manifest = _safe_json(job_dir / MANIFEST_NAME)
             if not isinstance(manifest, dict) or manifest.get("kind") != WORKFLOW_KIND:
                 raise WorkflowError("INVALID_JOB", "Private job metadata is invalid.")
             if manifest.get("job_id") != job_id:
                 raise WorkflowError("INVALID_JOB", "Private job identity is invalid.")
-            # Remove every private artifact while still holding the exclusive
-            # lock. The lock file itself stays: the lock descriptor keeps it
-            # open, and Windows cannot unlink an open file.
-            for entry in job_dir.iterdir():
-                if entry.is_dir():
+            if lock_info is None:
+                raise WorkflowError("DELETE_FAILED", "Private job lock is unavailable.")
+            # Remove only the artifacts validated in the locked snapshot. A
+            # late path is deliberately left behind for the final rmdir to
+            # detect instead of being swept up by a second recursive scan.
+            for entry, expected_info, is_directory in validated_artifacts:
+                if entry.name == LOCK_NAME:
+                    continue
+                try:
+                    current_info = entry.lstat()
+                except FileNotFoundError as exc:
+                    raise WorkflowError(
+                        "DELETE_FAILED", "Private job changed during deletion."
+                    ) from exc
+                if (
+                    is_reparse_point(current_info)
+                    or current_info.st_dev != expected_info.st_dev
+                    or current_info.st_ino != expected_info.st_ino
+                ):
+                    raise WorkflowError("DELETE_FAILED", "Private job changed during deletion.")
+                if is_directory:
                     shutil.rmtree(entry)
-                elif entry.name != LOCK_NAME:
+                else:
                     entry.unlink()
-        # Only the inert lock file remains; drop it and the emptied directory
-        # once the descriptor is released.
-        shutil.rmtree(job_dir)
+        # The open descriptor is now closed. Remove only the exact lock file
+        # seen under the lock, then use non-recursive rmdir as the race check.
+        lock_path = job_dir / LOCK_NAME
+        try:
+            current_lock = lock_path.lstat()
+            if (
+                is_reparse_point(current_lock)
+                or not stat.S_ISREG(current_lock.st_mode)
+                or current_lock.st_dev != lock_info.st_dev
+                or current_lock.st_ino != lock_info.st_ino
+            ):
+                raise WorkflowError("DELETE_FAILED", "Private job lock changed during deletion.")
+            lock_path.unlink()
+            job_dir.rmdir()
+        except WorkflowError:
+            raise
+        except OSError as exc:
+            raise WorkflowError(
+                "DELETE_FAILED", "Private job could not be removed safely."
+            ) from exc

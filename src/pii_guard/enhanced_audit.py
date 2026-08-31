@@ -14,6 +14,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import unicodedata
 import urllib.parse
 from collections.abc import Callable, Mapping
@@ -216,6 +217,10 @@ def _validate_loopback_url(value: str) -> urllib.parse.ParseResult:
 
 
 def _verify_local_ollama_listener(parsed: urllib.parse.ParseResult) -> None:
+    if sys.platform == "win32":
+        raise AuditError(
+            "LOCAL_MODEL_UNVERIFIED", "Could not verify the local Ollama process."
+        )
     port = parsed.port or 80
     command = ["/usr/sbin/lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpcu"]
     try:

@@ -1,0 +1,41 @@
+name: Windows
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install test dependencies
+        run: uv sync --extra dev --extra formats
+
+      - name: Import the local web module
+        run: uv run python -c "import pii_guard.web"
+
+      - name: Run quick, restore, web, deletion, locking, and junction tests
+        run: uv run pytest -m "not slow" -q
+
+      - name: Type-check Windows and POSIX branches
+        run: |
+          uv run mypy src/
+          uv run mypy --platform linux src/
+
+      - name: Lint source and tests
+        run: uv run ruff check src/ tests/

@@ -10,6 +10,7 @@ import re
 import stat
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -18,6 +19,7 @@ from pathlib import Path
 import pytest
 
 import pii_guard.local_workflow as local_workflow
+from pii_guard._compat import private_directory_acl_matches
 from pii_guard.local_workflow import (
     LOCK_NAME,
     MANIFEST_NAME,
@@ -258,6 +260,25 @@ def _mask_in_child(root: str, job_id: str, term: str, barrier: object) -> None:
 
     getattr(barrier, "wait")(timeout=10)
     PrivateJobStore(Path(root)).mask_terms(job_id, [term])
+
+
+def _hold_job_lock(root: str, job_id: str, ready: object, release: object) -> None:
+    """Hold one real process lock until the deletion regression releases it."""
+
+    job_dir = Path(root) / job_id
+    with local_workflow._job_lock(job_dir, exclusive=True):
+        getattr(ready, "set")()
+        if not getattr(release, "wait")(10):
+            raise RuntimeError("lock test release timed out")
+
+
+def _create_windows_junction(link: Path, target: Path) -> None:
+    completed = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        check=False,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
 
 
 def _assert_public_json_has_no_private_paths(payload: object, tmp_path: Path) -> None:
@@ -541,15 +562,152 @@ def test_delete_removes_single_job_and_not_other_jobs(tmp_path: Path) -> None:
     assert store.public_state(str(second["job_id"]))["ok"] is True
 
 
+def test_delete_waits_for_existing_job_lock(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    public = store.create_quick_from_text(ORIGINAL)
+    job_id = str(public["job_id"])
+    job_dir = store.root / job_id
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    holder = context.Process(
+        target=_hold_job_lock,
+        args=(str(store.root), job_id, ready, release),
+    )
+    holder.start()
+    started = threading.Event()
+
+    def delete_job() -> None:
+        started.set()
+        store.delete(job_id)
+
+    try:
+        assert ready.wait(10)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            deletion = executor.submit(delete_job)
+            assert started.wait(2)
+            time.sleep(0.2)
+            assert not deletion.done()
+            release.set()
+            deletion.result(timeout=10)
+    finally:
+        release.set()
+        holder.join(timeout=10)
+        if holder.is_alive():
+            holder.terminate()
+            holder.join(timeout=5)
+
+    assert holder.exitcode == 0
+    assert not job_dir.exists()
+
+
+def test_delete_preserves_file_created_after_unlock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    public = store.create_quick_from_text(ORIGINAL)
+    job_id = str(public["job_id"])
+    job_dir = store.root / job_id
+    lock_path = job_dir / LOCK_NAME
+    late_path = job_dir / "late-synthetic.txt"
+    real_unlink = Path.unlink
+
+    def unlink_then_inject(path: Path, missing_ok: bool = False) -> None:
+        real_unlink(path, missing_ok=missing_ok)
+        if path == lock_path:
+            late_path.write_text("synthetic late artifact", encoding="utf-8")
+
+    monkeypatch.setattr(Path, "unlink", unlink_then_inject)
+    with pytest.raises(WorkflowError, match="DELETE_FAILED"):
+        store.delete(job_id)
+
+    assert late_path.read_text(encoding="utf-8") == "synthetic late artifact"
+    monkeypatch.undo()
+    late_path.unlink()
+    job_dir.rmdir()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACLs are platform-specific")
+def test_windows_jobs_root_acl_is_verified_and_tampering_fails_closed(tmp_path: Path) -> None:
+    inherited_root = tmp_path / "inherited-jobs"
+    inherited_root.mkdir()
+    with pytest.raises(WorkflowError, match="PERMISSION_CHECK_FAILED"):
+        PrivateJobStore(inherited_root, engine=FakeEngine())
+
+    private_root = tmp_path / "private-jobs"
+    store = PrivateJobStore(private_root, engine=FakeEngine())
+    assert private_directory_acl_matches(store.root)
+
+    icacls = Path(os.environ["SystemRoot"]) / "System32" / "icacls.exe"
+    completed = subprocess.run(
+        [
+            str(icacls),
+            str(store.root),
+            "/grant",
+            "*S-1-1-0:(OI)(CI)R",
+            "/Q",
+        ],
+        check=False,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+    assert not private_directory_acl_matches(store.root)
+    with pytest.raises(WorkflowError, match="PERMISSION_CHECK_FAILED"):
+        PrivateJobStore(store.root, engine=FakeEngine())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junctions are platform-specific")
+def test_windows_junctions_are_rejected_at_root_job_and_contents(tmp_path: Path) -> None:
+    root_target = tmp_path / "root-target"
+    root_target.mkdir()
+    root_junction = tmp_path / "root-junction"
+    _create_windows_junction(root_junction, root_target)
+    try:
+        with pytest.raises(WorkflowError, match="PERMISSION_CHECK_FAILED"):
+            PrivateJobStore(root_junction, engine=FakeEngine())
+    finally:
+        root_junction.rmdir()
+
+    store = _store(tmp_path)
+    job_target = tmp_path / "job-target"
+    job_target.mkdir()
+    job_junction = store.root / ("a" * 32)
+    _create_windows_junction(job_junction, job_target)
+    try:
+        with pytest.raises(WorkflowError, match="JOB_NOT_FOUND"):
+            store.public_state(job_junction.name)
+    finally:
+        job_junction.rmdir()
+
+    public = store.create_quick_from_text(ORIGINAL)
+    job_id = str(public["job_id"])
+    job_dir = store.root / job_id
+    content_target = tmp_path / "content-target"
+    content_target.mkdir()
+    sentinel = content_target / "synthetic-sentinel.txt"
+    sentinel.write_text("outside", encoding="utf-8")
+    content_junction = job_dir / f".attempt-{'b' * 32}"
+    _create_windows_junction(content_junction, content_target)
+    try:
+        with pytest.raises(WorkflowError, match="INVALID_JOB"):
+            store.delete(job_id)
+        assert sentinel.read_text(encoding="utf-8") == "outside"
+    finally:
+        content_junction.rmdir()
+    store.delete(job_id)
+
+
 def test_quick_path_fails_if_ollama_transport_is_called(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    store = _store(tmp_path)
+
     def fail_if_called(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("quick mode must not call Ollama")
 
     monkeypatch.setattr(http.client, "HTTPConnection", fail_if_called)
     monkeypatch.setattr(subprocess, "run", fail_if_called)
-    store = _store(tmp_path)
     public = store.create_quick_from_text(ORIGINAL)
     assert public["roundtrip_verified"] is True
 

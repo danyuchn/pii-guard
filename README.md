@@ -103,7 +103,7 @@ uv sync --extra formats
 
 macOS 與 Linux 是主要平台。Windows（NTFS）可以跑核心流程——`anonymize`／`restore`、`quick`、`quick-restore`、本機網頁與 PDF 快審、測試套件——但有三件事必須知道：
 
-- **檔案權限退化**：NTFS 沒有 POSIX 權限位，`0600`／`0700` 加固在 Windows 上不生效；私有工作目錄的保護改為依賴使用者設定檔（`%USERPROFILE%`）的 NTFS ACL。[威脅模型](#威脅模型)一節的權限敘述以 POSIX 為準。
+- **私有目錄 ACL**：NTFS 沒有 POSIX 權限位。Windows 新建 jobs root 時會移除繼承，限定目前使用者、SYSTEM 與 Administrators 完全控制，並在使用前讀回驗證；既有或自訂 root 若無法驗證便 fail-closed。[威脅模型](#威脅模型)一節的 `0600`／`0700` 敘述以 POSIX 為準。
 - **鎖語意**：Windows 以 `msvcrt` byte-range lock 替代 `flock`，共享鎖一律降級為互斥鎖——序列化變多，保護不變少。
 - **加強模式不可用**：Ollama listener 驗證依賴 `lsof`，Windows 上會以 `LOCAL_MODEL_UNVERIFIED` 拒絕啟動（fail-closed）。快速模式與人工補標不受影響。
 
