@@ -16,7 +16,6 @@ import pytest
 from tests.eval.eval_utils import (
     Span,
     annotations_to_spans,
-    canonical_type,
     compute_metrics,
     format_report,
     results_to_spans,
@@ -36,14 +35,14 @@ def _aggregate(engine, corpus, *, exclude_ner: bool = False):
         if exclude_ner:
             annotations = [
                 a for a in annotations
-                if canonical_type(a["entity_type"]) not in _NER_TYPES
+                if a["entity_type"] not in _NER_TYPES
             ]
 
         results = engine.detect(sample["text"])
         if exclude_ner:
             results = [
                 r for r in results
-                if canonical_type(r.entity_type) not in _NER_TYPES
+                if r.entity_type not in _NER_TYPES
             ]
 
         all_predicted |= results_to_spans(results, offset)
@@ -59,7 +58,18 @@ def _aggregate(engine, corpus, *, exclude_ner: bool = False):
 
 @pytest.mark.eval
 class TestEvalRegexOnly:
-    """Evaluate regex recognizers against corpus (excludes PERSON/ORG/LOCATION)."""
+    """Evaluate regex recognizers, excluding only annotations produced by NER."""
+
+    def test_structured_address_is_counted(self, spacy_only_engine, corpus):
+        sample = next(item for item in corpus if item["id"] == "loc-001")
+
+        predicted, expected = _aggregate(
+            spacy_only_engine, [sample], exclude_ner=True,
+        )
+
+        address = Span("LOCATION", 4, 10)
+        assert predicted == {address}
+        assert expected == {address}
 
     def test_precision_recall_regex(self, spacy_only_engine, corpus):
         predicted, expected = _aggregate(

@@ -277,7 +277,7 @@
     "id": "loc-001",
     "text": "公司位於台北市信義區",
     "annotations": [
-      {"entity_type": "LOCATION", "start": 4, "end": 10, "text": "台北市信義區"}
+      {"entity_type": "TW_ADDRESS", "start": 4, "end": 10, "text": "台北市信義區"}
     ]
   },
   {
