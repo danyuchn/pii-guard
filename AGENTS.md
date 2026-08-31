@@ -70,7 +70,7 @@ uv run ruff check src/
 - **Phase 1 MVP** ✅ 2026-03-30：Presidio + 台灣 Regex 8 種，MCP Server 介面，89 tests
 - **Phase 2** ✅ 2026-03-30：CKIP BERT NER（人名/組織/地名）整合驗證，+4 種 PII 類型，MCP smoke test，152 tests total
 - **Phase 3** ✅ 2026-03-30，**2026-08-21 移除**：Ollama Qwen2.5:1.5b LLM fallback 偵測層。改由 `pii-safe-documents` skill 的多次取樣稽核取代；舊層無語料證據且與新層並存會讓使用者選錯。要在 CLI 端補回稽核，做法是下沉 skill 那套，不是重新啟用這個。
-- **Phase 4** ✅ 2026-03-30：eval corpus 53 筆標註語料 + precision/recall/F1 框架，修復 5 個偵測問題，Regex F1=98.0%、Full CKIP F1=96.1%（2026-08-30 實跑 `uv run pytest tests/eval -s`；53 筆語料未變，數字以當次輸出為準）
+- **Phase 4** ✅ 2026-03-30：eval corpus 53 筆標註語料 + precision/recall/F1 框架，修復 5 個偵測問題。2026-08-31 實跑 `uv run pytest tests/eval/ -v -m eval -s`：Regex 49 TP / 0 FP / 0 FN（F1=100%），Full CKIP 62 TP / 1 FP / 2 FN（F1=97.6%）。同日把 loc-001 的標註由 LOCATION 更正為 TW_ADDRESS，並在類別正規化前依 raw type 排除 NER-only 類型，使結構化地址確實貢獻 Regex TP；另修正 TW_PASSWORD 關鍵字邊界，避免把 "passport" 的 "port" 誤判為密碼。
 - **Phase 5** ✅：`pii-safe-documents` skill（顯式觸發、可逆、主 agent 隔離）。早期的 PreToolUse hook 已退役，見 `examples/claude-code-hook/`。
 - **Phase 6** ✅ 2026-03-31：多格式檔案支援（xlsx/docx/pdf）CLI + MCP，file_handlers 模組，MIT LICENSE
 

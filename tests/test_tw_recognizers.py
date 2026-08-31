@@ -531,6 +531,15 @@ class TestTwPasswordRecognizer:
         results = self.r.analyze("今天天氣很好", entities=["TW_PASSWORD"])
         assert len(results) == 0
 
+    def test_pass_inside_passport_is_not_a_label(self):
+        """'pass' embedded in 'passport' must not capture 'port' as a password."""
+        results = self.r.analyze("他的passport是B98765432", entities=["TW_PASSWORD"])
+        assert results == []
+
+    def test_pass_at_end_of_bypass_is_not_a_label(self):
+        results = self.r.analyze("bypass 1234 checks", entities=["TW_PASSWORD"])
+        assert results == []
+
 
 # ── TwCryptoSeedRecognizer ────────────────────────────────────────────────────
 
