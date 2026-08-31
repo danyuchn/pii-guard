@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Predicted types folded into the corpus annotation type they are equivalent
-# to. TW_ADDRESS (deterministic regex) and LOCATION (CKIP NER) both denote a
-# place and redact the span identically; scoring them as different types would
-# count a correct redaction as one FP plus one FN whenever the regex wins the
-# span. The corpus itself only ever annotates LOCATION.
+# Types folded together only after the regex-only/NER scope has been selected.
+# TW_ADDRESS (deterministic regex) and LOCATION (CKIP NER) both redact the same
+# location span, so the full evaluation treats them as equivalent. Keeping the
+# original type until after scope selection ensures address regex examples are
+# still measured by the regex-only evaluation.
 TYPE_EQUIVALENCE: dict[str, str] = {"TW_ADDRESS": "LOCATION"}
 
 

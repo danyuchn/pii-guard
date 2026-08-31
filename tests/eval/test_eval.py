@@ -11,12 +11,13 @@ Usage::
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from tests.eval.eval_utils import (
     Span,
     annotations_to_spans,
-    canonical_type,
     compute_metrics,
     format_report,
     results_to_spans,
@@ -34,17 +35,11 @@ def _aggregate(engine, corpus, *, exclude_ner: bool = False):
     for sample in corpus:
         annotations = sample["annotations"]
         if exclude_ner:
-            annotations = [
-                a for a in annotations
-                if canonical_type(a["entity_type"]) not in _NER_TYPES
-            ]
+            annotations = [a for a in annotations if a["entity_type"] not in _NER_TYPES]
 
         results = engine.detect(sample["text"])
         if exclude_ner:
-            results = [
-                r for r in results
-                if canonical_type(r.entity_type) not in _NER_TYPES
-            ]
+            results = [r for r in results if r.entity_type not in _NER_TYPES]
 
         all_predicted |= results_to_spans(results, offset)
         all_expected |= annotations_to_spans(annotations, offset)
@@ -52,6 +47,32 @@ def _aggregate(engine, corpus, *, exclude_ner: bool = False):
         offset += len(sample["text"]) + 10_000
 
     return all_predicted, all_expected
+
+
+def test_regex_only_keeps_address_example_before_type_folding():
+    """The deterministic address case must contribute a real regex TP."""
+
+    class AddressEngine:
+        @staticmethod
+        def detect(_text: str) -> list[SimpleNamespace]:
+            return [
+                SimpleNamespace(entity_type="TW_ADDRESS", start=4, end=10)
+            ]
+
+    corpus = [
+        {
+            "text": "公司位於台北市信義區",
+            "annotations": [
+                {"entity_type": "TW_ADDRESS", "start": 4, "end": 10}
+            ],
+        }
+    ]
+
+    predicted, expected = _aggregate(AddressEngine(), corpus, exclude_ner=True)
+
+    address = Span("LOCATION", 4, 10)
+    assert predicted == {address}
+    assert expected == {address}
 
 
 # ── Regex-only evaluation (fast, no model download) ──────────────────────
