@@ -120,8 +120,11 @@ REDACTED_NAME: Final[str] = "redacted.txt"
 SOURCE_NAME: Final[str] = ".source.private.txt"
 RESTORED_NAME: Final[str] = ".restored.private.txt"
 LOCK_NAME: Final[str] = ".job.lock"
+DELETE_MARKER_NAME: Final[str] = ".delete.pending"
 PRIVATE_MODE: Final[int] = 0o600
 JOB_MODE: Final[int] = 0o700
+DELETE_LOCK_RETRIES: Final[int] = 20
+DELETE_LOCK_RETRY_SECONDS: Final[float] = 0.05
 TRANSACTION_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\.txn-[0-9a-f]{32}$")
 ATTEMPT_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\.attempt-[0-9a-f]{32}$")
 TRANSACTION_READY_NAME: Final[str] = "READY"
@@ -287,7 +290,12 @@ def _ensure_lock_file(job_dir: Path) -> Path:
 
 
 @contextmanager
-def _job_lock(job_dir: Path, *, exclusive: bool) -> Iterator[None]:
+def _job_lock(
+    job_dir: Path,
+    *,
+    exclusive: bool,
+    allow_deleting: bool = False,
+) -> Iterator[None]:
     """Hold a validated per-job advisory lock across one complete operation."""
 
     lock_path = _ensure_lock_file(job_dir)
@@ -321,6 +329,15 @@ def _job_lock(job_dir: Path, *, exclusive: bool) -> Iterator[None]:
                 or current_info.st_ino != descriptor_info.st_ino
             ):
                 raise WorkflowError("LOCK_FAILED", "Private job lock changed unexpectedly.")
+            delete_marker = job_dir / DELETE_MARKER_NAME
+            try:
+                delete_marker.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                _assert_owner_mode(delete_marker, PRIVATE_MODE, directory=False)
+                if not allow_deleting:
+                    raise WorkflowError("JOB_DELETING", "Private job deletion is in progress.")
         except WorkflowError:
             raise
         except OSError as exc:
@@ -334,6 +351,92 @@ def _job_lock(job_dir: Path, *, exclusive: bool) -> Iterator[None]:
                 pass
         if descriptor >= 0:
             os.close(descriptor)
+
+
+@dataclass(frozen=True)
+class _DeletionEntry:
+    path: Path
+    device: int
+    inode: int
+    directory: bool
+
+
+def _snapshot_deletion_tree(path: Path) -> list[_DeletionEntry]:
+    """Record exact private entries so later arrivals are never deleted."""
+
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise WorkflowError(
+            "DELETE_CONFLICT",
+            "Private job deletion stopped because the directory changed.",
+        ) from exc
+    if is_reparse_point(info):
+        raise WorkflowError("INVALID_JOB", "Private job contains an unknown artifact.")
+    if stat.S_ISDIR(info.st_mode):
+        _assert_owner_mode(path, JOB_MODE, directory=True)
+        entries: list[_DeletionEntry] = []
+        try:
+            children = list(path.iterdir())
+        except OSError as exc:
+            raise WorkflowError(
+                "DELETE_CONFLICT",
+                "Private job deletion stopped because the directory changed.",
+            ) from exc
+        for child in children:
+            entries.extend(_snapshot_deletion_tree(child))
+        entries.append(_DeletionEntry(path, info.st_dev, info.st_ino, True))
+        return entries
+    _assert_owner_mode(path, PRIVATE_MODE, directory=False)
+    return [_DeletionEntry(path, info.st_dev, info.st_ino, False)]
+
+
+def _remove_deletion_entry(entry: _DeletionEntry, *, rename_retries: int = 1) -> None:
+    """Atomically quarantine and remove one still-identical private entry."""
+
+    tombstone = entry.path.parent / f".delete-{uuid.uuid4().hex}.tombstone"
+    for attempt in range(rename_retries):
+        try:
+            entry.path.rename(tombstone)
+            break
+        except PermissionError as exc:
+            if attempt + 1 == rename_retries:
+                raise WorkflowError(
+                    "DELETE_CONFLICT",
+                    "Private job deletion could not finish while another operation was closing.",
+                ) from exc
+            time.sleep(DELETE_LOCK_RETRY_SECONDS)
+        except OSError as exc:
+            raise WorkflowError(
+                "DELETE_CONFLICT",
+                "Private job deletion stopped because the directory changed.",
+            ) from exc
+    try:
+        current = tombstone.lstat()
+        current_is_directory = stat.S_ISDIR(current.st_mode)
+        if (
+            is_reparse_point(current)
+            or current.st_dev != entry.device
+            or current.st_ino != entry.inode
+            or current_is_directory != entry.directory
+        ):
+            raise OSError("private deletion entry changed")
+        if entry.directory:
+            tombstone.rmdir()
+        else:
+            tombstone.unlink()
+    except OSError as exc:
+        raise WorkflowError(
+            "DELETE_CONFLICT",
+            "Private job deletion stopped because the directory changed.",
+        ) from exc
+
+
+def _remove_deletion_snapshot(entries: Iterable[_DeletionEntry]) -> None:
+    """Remove only paths whose identity still matches the validated snapshot."""
+
+    for entry in entries:
+        _remove_deletion_entry(entry)
 
 
 def _ensure_jobs_root(root: Path) -> Path:
@@ -512,9 +615,8 @@ def _recover_pending_transactions(job_dir: Path) -> None:
             continue
         if is_reparse_point(transaction_info):
             raise WorkflowError("INVALID_JOB", "Private job contains an unsafe reparse point.")
-        if (
-            not stat.S_ISDIR(transaction_info.st_mode)
-            or not TRANSACTION_PATTERN.fullmatch(transaction.name)
+        if not stat.S_ISDIR(transaction_info.st_mode) or not TRANSACTION_PATTERN.fullmatch(
+            transaction.name
         ):
             continue
         _assert_owner_mode(transaction, JOB_MODE, directory=True)
@@ -2024,9 +2126,8 @@ class PrivateJobStore:
                 continue
             if is_reparse_point(candidate_info):
                 continue
-            if (
-                not stat.S_ISDIR(candidate_info.st_mode)
-                or not JOB_ID_PATTERN.fullmatch(candidate.name)
+            if not stat.S_ISDIR(candidate_info.st_mode) or not JOB_ID_PATTERN.fullmatch(
+                candidate.name
             ):
                 continue
             try:
@@ -2547,7 +2648,9 @@ class PrivateJobStore:
                 # Deletion remains authoritative; an already-dead manager is
                 # harmless because the attempt token prevents stale promotion.
                 pass
-        with _job_lock(job_dir, exclusive=True):
+        delete_marker = job_dir / DELETE_MARKER_NAME
+        lock_path = job_dir / LOCK_NAME
+        with _job_lock(job_dir, exclusive=True, allow_deleting=True):
             known_files = {
                 SOURCE_NAME,
                 REDACTED_NAME,
@@ -2555,29 +2658,28 @@ class PrivateJobStore:
                 MANIFEST_NAME,
                 RESTORED_NAME,
                 LOCK_NAME,
+                DELETE_MARKER_NAME,
             }
             temporary_pattern = re.compile(
                 r"^\.[A-Za-z0-9._-]+\.(?:private\.txt|private\.json|safe\.json)$"
             )
-            validated_artifacts: list[tuple[Path, os.stat_result, bool]] = []
-            lock_info: os.stat_result | None = None
+            deletion_snapshot: list[_DeletionEntry] = []
             for entry in job_dir.iterdir():
                 try:
                     entry_info = entry.lstat()
                 except FileNotFoundError as exc:
                     raise WorkflowError(
-                        "DELETE_FAILED", "Private job changed during deletion."
+                        "DELETE_CONFLICT",
+                        "Private job deletion stopped because the directory changed.",
                     ) from exc
                 if is_reparse_point(entry_info):
-                    raise WorkflowError(
-                        "INVALID_JOB", "Private job contains an unsafe reparse point."
-                    )
+                    raise WorkflowError("INVALID_JOB", "Private job contains an unknown artifact.")
                 is_directory = stat.S_ISDIR(entry_info.st_mode)
                 if is_directory and (
                     TRANSACTION_PATTERN.fullmatch(entry.name)
                     or ATTEMPT_PATTERN.fullmatch(entry.name)
                 ):
-                    validated_artifacts.append((entry, entry_info, True))
+                    deletion_snapshot.extend(_snapshot_deletion_tree(entry))
                     continue
                 if not stat.S_ISREG(entry_info.st_mode):
                     raise WorkflowError("INVALID_JOB", "Private job contains an unknown artifact.")
@@ -2586,55 +2688,49 @@ class PrivateJobStore:
                     and temporary_pattern.fullmatch(entry.name) is None
                 ):
                     raise WorkflowError("INVALID_JOB", "Private job contains an unknown artifact.")
-                validated_artifacts.append((entry, entry_info, False))
-                if entry.name == LOCK_NAME:
-                    lock_info = entry_info
-            manifest = _safe_json(job_dir / MANIFEST_NAME)
-            if not isinstance(manifest, dict) or manifest.get("kind") != WORKFLOW_KIND:
-                raise WorkflowError("INVALID_JOB", "Private job metadata is invalid.")
-            if manifest.get("job_id") != job_id:
+                if entry.name not in {LOCK_NAME, DELETE_MARKER_NAME}:
+                    deletion_snapshot.extend(_snapshot_deletion_tree(entry))
+
+            manifest_path = job_dir / MANIFEST_NAME
+            if manifest_path.exists():
+                manifest = _safe_json(manifest_path)
+                if not isinstance(manifest, dict) or manifest.get("kind") != WORKFLOW_KIND:
+                    raise WorkflowError("INVALID_JOB", "Private job metadata is invalid.")
+                if manifest.get("job_id") != job_id:
+                    raise WorkflowError("INVALID_JOB", "Private job identity is invalid.")
+            elif not delete_marker.exists():
                 raise WorkflowError("INVALID_JOB", "Private job identity is invalid.")
-            if lock_info is None:
-                raise WorkflowError("DELETE_FAILED", "Private job lock is unavailable.")
-            # Remove only the artifacts validated in the locked snapshot. A
-            # late path is deliberately left behind for the final rmdir to
-            # detect instead of being swept up by a second recursive scan.
-            for entry, expected_info, is_directory in validated_artifacts:
-                if entry.name == LOCK_NAME:
-                    continue
-                try:
-                    current_info = entry.lstat()
-                except FileNotFoundError as exc:
-                    raise WorkflowError(
-                        "DELETE_FAILED", "Private job changed during deletion."
-                    ) from exc
-                if (
-                    is_reparse_point(current_info)
-                    or current_info.st_dev != expected_info.st_dev
-                    or current_info.st_ino != expected_info.st_ino
-                ):
-                    raise WorkflowError("DELETE_FAILED", "Private job changed during deletion.")
-                if is_directory:
-                    shutil.rmtree(entry)
-                else:
-                    entry.unlink()
-        # The open descriptor is now closed. Remove only the exact lock file
-        # seen under the lock, then use non-recursive rmdir as the race check.
-        lock_path = job_dir / LOCK_NAME
+
+            if not delete_marker.exists():
+                _write_private(delete_marker, "pending")
+
+            lock_snapshot = _snapshot_deletion_tree(lock_path)[0]
+            marker_snapshot = _snapshot_deletion_tree(delete_marker)[0]
+
+            # The marker makes new and waiting operations fail closed. Remove
+            # only the exact snapshot validated above. Anything arriving later
+            # remains in place and makes the final rmdir fail closed.
+            _remove_deletion_snapshot(deletion_snapshot)
+
+        # Windows cannot rename an open lock descriptor. Once released, remove
+        # only the exact lock and marker snapshots, then require an empty job.
         try:
-            current_lock = lock_path.lstat()
-            if (
-                is_reparse_point(current_lock)
-                or not stat.S_ISREG(current_lock.st_mode)
-                or current_lock.st_dev != lock_info.st_dev
-                or current_lock.st_ino != lock_info.st_ino
-            ):
-                raise WorkflowError("DELETE_FAILED", "Private job lock changed during deletion.")
-            lock_path.unlink()
+            _remove_deletion_entry(
+                lock_snapshot,
+                rename_retries=DELETE_LOCK_RETRIES,
+            )
+            _remove_deletion_entry(marker_snapshot)
             job_dir.rmdir()
-        except WorkflowError:
-            raise
-        except OSError as exc:
+        except (OSError, WorkflowError) as exc:
+            try:
+                job_info = job_dir.lstat()
+                if stat.S_ISDIR(job_info.st_mode) and not is_reparse_point(job_info):
+                    _ensure_lock_file(job_dir)
+                    if not delete_marker.exists():
+                        _write_private(delete_marker, "pending")
+            except (OSError, WorkflowError):
+                pass
             raise WorkflowError(
-                "DELETE_FAILED", "Private job could not be removed safely."
+                "DELETE_CONFLICT",
+                "Private job deletion stopped because the directory changed.",
             ) from exc

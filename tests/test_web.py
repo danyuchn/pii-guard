@@ -15,12 +15,17 @@ import pytest
 import pii_guard.audit_manager as audit_manager_module
 from pii_guard import enhanced_audit
 from pii_guard.audit_manager import AuditManager
-from pii_guard.local_workflow import RESTORED_NAME, PrivateJobStore
-from pii_guard.web import LocalWebApplication, WebConfig, create_server
+from pii_guard.local_workflow import RESTORED_NAME, PrivateJobStore, WorkflowError
+from pii_guard.web import LocalWebApplication, WebConfig, _error_status, create_server
 from tests.pdf_fixtures import build_image_only_pdf, build_text_pdf
 from tests.test_local_workflow import FakeEngine
 
 ORIGINAL = "聯絡人王小明，身分證A123456789，手機0912345678。"
+
+
+@pytest.mark.parametrize("code", ["DELETE_CONFLICT", "JOB_DELETING"])
+def test_delete_conflicts_use_http_conflict_status(code: str) -> None:
+    assert _error_status(WorkflowError(code, "safe")) == 409
 
 
 def passing_enhanced_audit(

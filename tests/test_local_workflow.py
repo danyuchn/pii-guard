@@ -18,9 +18,11 @@ from pathlib import Path
 
 import pytest
 
+import pii_guard._compat as compat
 import pii_guard.local_workflow as local_workflow
 from pii_guard._compat import private_directory_acl_matches
 from pii_guard.local_workflow import (
+    DELETE_MARKER_NAME,
     LOCK_NAME,
     MANIFEST_NAME,
     MAX_INPUT_BYTES,
@@ -609,23 +611,126 @@ def test_delete_preserves_file_created_after_unlock(
     public = store.create_quick_from_text(ORIGINAL)
     job_id = str(public["job_id"])
     job_dir = store.root / job_id
-    lock_path = job_dir / LOCK_NAME
     late_path = job_dir / "late-synthetic.txt"
-    real_unlink = Path.unlink
+    real_rmdir = Path.rmdir
 
-    def unlink_then_inject(path: Path, missing_ok: bool = False) -> None:
-        real_unlink(path, missing_ok=missing_ok)
-        if path == lock_path:
+    def inject_before_final_rmdir(path: Path) -> None:
+        if path == job_dir:
             late_path.write_text("synthetic late artifact", encoding="utf-8")
+        real_rmdir(path)
 
-    monkeypatch.setattr(Path, "unlink", unlink_then_inject)
-    with pytest.raises(WorkflowError, match="DELETE_FAILED"):
+    monkeypatch.setattr(Path, "rmdir", inject_before_final_rmdir)
+    with pytest.raises(WorkflowError, match="DELETE_CONFLICT"):
         store.delete(job_id)
 
     assert late_path.read_text(encoding="utf-8") == "synthetic late artifact"
-    monkeypatch.undo()
-    late_path.unlink()
-    job_dir.rmdir()
+
+
+def test_delete_marker_makes_waiting_operations_fail_closed(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    public = store.create_quick_from_text(ORIGINAL)
+    job_id = str(public["job_id"])
+    marker = store.root / job_id / DELETE_MARKER_NAME
+    local_workflow._write_private(marker, "pending")
+
+    with pytest.raises(WorkflowError, match="JOB_DELETING"):
+        store.public_state(job_id)
+
+    store.delete(job_id)
+    assert not (store.root / job_id).exists()
+
+
+def test_broken_delete_marker_link_fails_closed(tmp_path: Path) -> None:
+    _require_symlinks(tmp_path)
+    store = _store(tmp_path)
+    public = store.create_quick_from_text(ORIGINAL)
+    job_id = str(public["job_id"])
+    marker = store.root / job_id / DELETE_MARKER_NAME
+    marker.symlink_to(store.root / "missing-delete-target")
+
+    with pytest.raises(WorkflowError, match="PERMISSION_CHECK_FAILED"):
+        store.public_state(job_id)
+
+
+def test_delete_retries_while_windows_lock_waiter_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    public = store.create_quick_from_text(ORIGINAL)
+    job_id = str(public["job_id"])
+    lock_path = store.root / job_id / LOCK_NAME
+    original_rename = Path.rename
+    attempts = 0
+
+    def briefly_busy(path: Path, target: Path) -> Path:
+        nonlocal attempts
+        if path == lock_path:
+            attempts += 1
+            if attempts < 3:
+                raise PermissionError("lock still open")
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", briefly_busy)
+
+    store.delete(job_id)
+
+    assert attempts == 3
+    assert not (store.root / job_id).exists()
+
+
+def test_delete_preserves_content_added_after_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    public = store.create_quick_from_text(ORIGINAL)
+    job_id = str(public["job_id"])
+    job_dir = store.root / job_id
+    foreign = job_dir / "foreign-after-validation.txt"
+    original_write = local_workflow._write_private
+
+    def inject_after_validation(path: Path, data: str, *, replace: bool = False) -> None:
+        original_write(path, data, replace=replace)
+        if path.name == DELETE_MARKER_NAME:
+            foreign.write_text("must survive", encoding="utf-8")
+
+    monkeypatch.setattr(local_workflow, "_write_private", inject_after_validation)
+
+    with pytest.raises(WorkflowError, match="DELETE_CONFLICT"):
+        store.delete(job_id)
+
+    assert foreign.read_text(encoding="utf-8") == "must survive"
+
+
+def test_delete_preserves_replacement_made_before_atomic_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    public = store.create_quick_from_text(ORIGINAL)
+    job_id = str(public["job_id"])
+    job_dir = store.root / job_id
+    source = job_dir / SOURCE_NAME
+    displaced = job_dir / "displaced-original.private.txt"
+    original_rename = Path.rename
+    replaced = False
+
+    def replace_before_rename(path: Path, target: Path) -> Path:
+        nonlocal replaced
+        if path == source and not replaced:
+            replaced = True
+            original_rename(path, displaced)
+            path.write_text("foreign replacement", encoding="utf-8")
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", replace_before_rename)
+
+    with pytest.raises(WorkflowError, match="DELETE_CONFLICT"):
+        store.delete(job_id)
+
+    tombstones = list(job_dir.glob(".delete-*.tombstone"))
+    assert replaced
+    assert len(tombstones) == 1
+    assert tombstones[0].read_text(encoding="utf-8") == "foreign replacement"
+    assert displaced.read_text(encoding="utf-8") == ORIGINAL
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows ACLs are platform-specific")
@@ -655,6 +760,39 @@ def test_windows_jobs_root_acl_is_verified_and_tampering_fails_closed(tmp_path: 
     assert not private_directory_acl_matches(store.root)
     with pytest.raises(WorkflowError, match="PERMISSION_CHECK_FAILED"):
         PrivateJobStore(store.root, engine=FakeEngine())
+
+    shared_parent = tmp_path / "shared-parent"
+    shared_parent.mkdir()
+    completed = subprocess.run(
+        [
+            str(icacls),
+            str(shared_parent),
+            "/grant",
+            "*S-1-1-0:(OI)(CI)F",
+            "/Q",
+        ],
+        check=False,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+    with pytest.raises(WorkflowError, match="PERMISSION_CHECK_FAILED"):
+        PrivateJobStore(shared_parent / "jobs", engine=FakeEngine())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACLs are platform-specific")
+def test_windows_parent_chain_rejects_untrusted_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = tmp_path / "parent" / "jobs"
+    candidate.mkdir(parents=True)
+    monkeypatch.setattr(compat, "_current_user_sid", lambda: "S-1-5-21-1000")
+    monkeypatch.setattr(
+        compat,
+        "_private_acl_payload",
+        lambda _path: {"owner_sid": "S-1-5-21-2000", "rules": []},
+    )
+
+    assert not compat.private_parent_chain_is_safe(candidate)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows junctions are platform-specific")

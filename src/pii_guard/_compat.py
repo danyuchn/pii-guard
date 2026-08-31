@@ -32,6 +32,16 @@ if sys.platform == "win32":
     _OWNER_RIGHTS_SID: Final[str] = "S-1-3-4"
     _SYSTEM_SID: Final[str] = "S-1-5-18"
     _ADMINISTRATORS_SID: Final[str] = "S-1-5-32-544"
+    _DANGEROUS_PARENT_RIGHTS: Final[int] = (
+        0x00000002  # FILE_ADD_FILE
+        | 0x00000004  # FILE_ADD_SUBDIRECTORY
+        | 0x00000040  # FILE_DELETE_CHILD
+        | 0x00010000  # DELETE
+        | 0x00040000  # WRITE_DAC
+        | 0x00080000  # WRITE_OWNER
+        | 0x10000000  # GENERIC_ALL
+        | 0x40000000  # GENERIC_WRITE
+    )
     _SID_PATTERN: Final[re.Pattern[bytes]] = re.compile(rb"S-\d-\d+(?:-\d+)+")
     _ACL_PROBE_SCRIPT: Final[str] = r"""
 $ErrorActionPreference = "Stop"
@@ -146,9 +156,64 @@ $rules = @($acl.GetAccessRules(
             observed_sids.add(sid)
         return required_sids <= observed_sids <= allowed_sids
 
+    def private_parent_chain_is_safe(path: Path) -> bool:
+        """Reject replaceable roots by checking every parent up to the profile."""
+
+        try:
+            current_sid = _current_user_sid()
+            profile = Path.home().resolve(strict=True)
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(profile)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        trusted_sids = {
+            current_sid,
+            _SYSTEM_SID,
+            _ADMINISTRATORS_SID,
+            _OWNER_RIGHTS_SID,
+        }
+        trusted_owner_sids = {current_sid, _SYSTEM_SID, _ADMINISTRATORS_SID}
+        current = resolved.parent
+        while True:
+            try:
+                info = current.lstat()
+                if is_reparse_point(info):
+                    return False
+                payload = _private_acl_payload(current)
+            except (OSError, subprocess.TimeoutExpired, UnicodeError, json.JSONDecodeError):
+                return False
+            rules = payload.get("rules")
+            if payload.get("owner_sid") not in trusted_owner_sids or not isinstance(rules, list):
+                return False
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    return False
+                sid = rule.get("sid")
+                rule_type = rule.get("type")
+                rights = rule.get("rights")
+                if (
+                    rule_type == 0
+                    and isinstance(sid, str)
+                    and sid not in trusted_sids
+                    and isinstance(rights, int)
+                    and rights & _DANGEROUS_PARENT_RIGHTS
+                ):
+                    return False
+                if (
+                    not isinstance(sid, str)
+                    or not isinstance(rule_type, int)
+                    or not isinstance(rights, int)
+                ):
+                    return False
+            if current == profile:
+                return True
+            current = current.parent
+
     def secure_private_directory(path: Path, *, created: bool) -> None:
         """Secure a new jobs root and verify every jobs root fail-closed."""
 
+        if not private_parent_chain_is_safe(path):
+            raise OSError("Windows private-directory parent ACL is unsafe")
         if created:
             current_sid = _current_user_sid()
             try:
@@ -216,6 +281,11 @@ else:
 
     def private_directory_acl_matches(path: Path) -> bool:
         """POSIX privacy is verified through owner and mode checks."""
+
+        return True
+
+    def private_parent_chain_is_safe(path: Path) -> bool:
+        """POSIX parent replacement is covered by owner and mode checks."""
 
         return True
 
