@@ -217,7 +217,20 @@ $rules = @($acl.GetAccessRules(
         if created:
             current_sid = _current_user_sid()
             try:
-                completed = subprocess.run(
+                owner_completed = subprocess.run(
+                    [
+                        _system_tool("icacls.exe"),
+                        str(path),
+                        "/setowner",
+                        f"*{current_sid}",
+                        "/Q",
+                    ],
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=10,
+                )
+                acl_completed = subprocess.run(
                     [
                         _system_tool("icacls.exe"),
                         str(path),
@@ -235,7 +248,7 @@ $rules = @($acl.GetAccessRules(
                 )
             except subprocess.TimeoutExpired as exc:
                 raise OSError("Windows private-directory ACL application timed out") from exc
-            if completed.returncode != 0:
+            if owner_completed.returncode != 0 or acl_completed.returncode != 0:
                 raise OSError("Windows private-directory ACL could not be applied")
         if not private_directory_acl_matches(path):
             raise OSError("Windows private-directory ACL could not be verified")
