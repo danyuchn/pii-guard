@@ -67,6 +67,10 @@ FILE_WORKER_CPU_SECONDS: Final[int] = 10
 FILE_WORKER_ADDRESS_SPACE_BYTES: Final[int] = 512 * 1024 * 1024
 PDF_MAX_PAGES: Final[int] = 50
 PDF_RENDER_SCALE: Final[float] = 2.0
+# pypdfium2 renders a page's CropBox. If it ever clips that CropBox back to
+# the page's MediaBox (e.g. a malformed box), the rendered pixel size will
+# disagree with pdfplumber's CropBox size by more than float rounding noise.
+PDF_CROPBOX_RENDER_TOLERANCE_POINTS: Final[float] = 1.0
 
 _FILE_ERROR_MESSAGES: Final[dict[str, str]] = {
     "FILE_NOT_FOUND": "Input file is not available.",
@@ -593,11 +597,42 @@ def _write_pdf_bytes(data: bytes, mapping: Mapping[str, str]) -> bytes:
                 for page_index, parsed_page in enumerate(parsed_pdf.pages):
                     try:
                         rendered_page = rendered_document[page_index]
-                        page_width = float(rendered_page.get_width())
-                        page_height = float(rendered_page.get_height())
+                        rendered_width = float(rendered_page.get_width())
+                        rendered_height = float(rendered_page.get_height())
                         bitmap = rendered_page.render(scale=PDF_RENDER_SCALE)
                         image = bitmap.to_pil().convert("RGB")
                     except Exception:
+                        _raise_file_error("PDF_OUTPUT_INVALID")
+
+                    # pdfplumber's char coordinates are relative to the
+                    # page's CropBox (not necessarily the MediaBox origin),
+                    # and that is also what pypdfium2 renders -- see
+                    # pdfplumber.display.PageImage._reproject. Scale from
+                    # the CropBox, not the raw rendered pixel size, so a
+                    # non-zero MediaBox origin or a CropBox smaller than the
+                    # MediaBox still lines the mask up with the glyphs.
+                    try:
+                        crop_x0, crop_top, crop_x1, crop_bottom = (
+                            float(value) for value in parsed_page.cropbox
+                        )
+                    except Exception:
+                        _raise_file_error("PDF_OUTPUT_INVALID")
+                    if any(
+                        not value == value or value in (float("inf"), float("-inf"))
+                        for value in (crop_x0, crop_top, crop_x1, crop_bottom)
+                    ):
+                        _raise_file_error("PDF_OUTPUT_INVALID")
+                    crop_width = crop_x1 - crop_x0
+                    crop_height = crop_bottom - crop_top
+                    if crop_width <= 0 or crop_height <= 0:
+                        _raise_file_error("PDF_OUTPUT_INVALID")
+                    # Fail closed if pypdfium2 did not actually render the
+                    # CropBox extent we are about to scale coordinates
+                    # against (e.g. it clipped to the MediaBox instead).
+                    if (
+                        abs(rendered_width - crop_width) > PDF_CROPBOX_RENDER_TOLERANCE_POINTS
+                        or abs(rendered_height - crop_height) > PDF_CROPBOX_RENDER_TOLERANCE_POINTS
+                    ):
                         _raise_file_error("PDF_OUTPUT_INVALID")
 
                     chars = [char for char in parsed_page.chars if isinstance(char, dict)]
@@ -607,14 +642,19 @@ def _write_pdf_bytes(data: bytes, mapping: Mapping[str, str]) -> bytes:
                             found_values.add(original)
                         for match in matches:
                             for x0, top, x1, bottom in _group_boxes(match):
-                                x_scale = image.width / page_width
-                                y_scale = image.height / page_height
+                                x_scale = image.width / crop_width
+                                y_scale = image.height / crop_height
                                 padding_x = max(2.0, x_scale * 1.0)
                                 padding_y = max(2.0, y_scale * 1.0)
-                                left = max(0.0, x0 * x_scale - padding_x)
-                                upper = max(0.0, top * y_scale - padding_y)
-                                right = min(float(image.width), x1 * x_scale + padding_x)
-                                lower = min(float(image.height), bottom * y_scale + padding_y)
+                                left = max(0.0, (x0 - crop_x0) * x_scale - padding_x)
+                                upper = max(0.0, (top - crop_top) * y_scale - padding_y)
+                                right = min(
+                                    float(image.width), (x1 - crop_x0) * x_scale + padding_x
+                                )
+                                lower = min(
+                                    float(image.height),
+                                    (bottom - crop_top) * y_scale + padding_y,
+                                )
                                 draw = ImageDraw.Draw(image)
                                 draw.rectangle((left, upper, right, lower), fill="white")
                                 draw.rectangle((left, upper, right, lower), outline="black")

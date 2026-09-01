@@ -63,6 +63,95 @@ def _two_page_pdf_bytes() -> bytes:
     return bytes(document)
 
 
+def _boxed_pdf_bytes(
+    media_box: str,
+    extra_page_entries: str = "",
+    text: str = "SECRET A123456789",
+    position: tuple[float, float] = (120, 600),
+    font_size: int = 24,
+) -> bytes:
+    """Build a dependency-free one-page PDF with a configurable page box.
+
+    ``extra_page_entries`` lets a case add e.g. ``/CropBox [...]`` or
+    ``/Rotate 90`` to the page dictionary -- the two attributes that make a
+    page's CropBox differ from its MediaBox, which is what the PDF
+    redaction mask-alignment fix in ``_write_pdf_bytes`` has to handle.
+    """
+
+    def stream(body: bytes) -> bytes:
+        return (
+            b"<< /Length "
+            + str(len(body)).encode("ascii")
+            + b" >>\nstream\n"
+            + body
+            + b"\nendstream"
+        )
+
+    x, y = position
+    content = f"BT /F1 {font_size} Tf {x:g} {y:g} Td ({text}) Tj ET".encode("ascii")
+    page_dict = (
+        f"<< /Type /Page /Parent 2 0 R /MediaBox {media_box} {extra_page_entries} "
+        "/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+    ).encode("ascii")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        page_dict,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        stream(content),
+    ]
+    document = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for object_number, value in enumerate(objects, start=1):
+        offsets.append(len(document))
+        document.extend(f"{object_number} 0 obj\n".encode("ascii"))
+        document.extend(value)
+        document.extend(b"\nendobj\n")
+    xref_offset = len(document)
+    document.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    document.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        document.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    document.extend(
+        (
+            f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref_offset}\n%%EOF\n"
+        ).encode("ascii")
+    )
+    return bytes(document)
+
+
+def _render_pdf_page(data: bytes, scale: float = 1.0):
+    """Render a single-page PDF's first page to a PIL RGB image."""
+
+    import pypdfium2 as pdfium
+
+    document = pdfium.PdfDocument(data)
+    try:
+        return document[0].render(scale=scale).to_pil().convert("RGB")
+    finally:
+        document.close()
+
+
+def _dark_pixel_mask(image) -> bytes:
+    """Return a 0/1-per-pixel dark mask (grayscale < 128) as raw bytes."""
+
+    return image.convert("L").point(lambda level: 1 if level < 128 else 0).tobytes()
+
+
+def _still_dark_fraction(source_image, output_image) -> float:
+    """Fraction of originally-dark source pixels that are still dark in output."""
+
+    source_mask = _dark_pixel_mask(source_image)
+    output_mask = _dark_pixel_mask(output_image)
+    assert len(source_mask) == len(output_mask)
+    source_dark = source_mask.count(1)
+    if source_dark == 0:
+        return 0.0
+    still_dark = sum(1 for s, o in zip(source_mask, output_mask, strict=True) if s and o)
+    return still_dark / source_dark
+
+
 # ---------------------------------------------------------------------------
 # is_supported / get_output_extension
 # ---------------------------------------------------------------------------
@@ -357,6 +446,62 @@ class TestPdf:
             extracted = "\n".join(page.extract_text() or "" for page in generated.pages)
         assert "A123456789" not in extracted
         assert "0912345678" not in extracted
+
+    # -----------------------------------------------------------------
+    # Mask/glyph coordinate alignment across page-box variants.
+    #
+    # ``_write_pdf_bytes`` used to scale pdfplumber's character coordinates
+    # by the raw rendered pixel size (``rendered_page.get_width()/height()``
+    # against the pixel size at ``PDF_RENDER_SCALE``). That only matches
+    # pdfplumber's coordinate space when a page's CropBox equals its
+    # MediaBox and both start at the origin. A non-zero MediaBox origin, or
+    # a CropBox smaller than the MediaBox, drew the mask tens of points
+    # away from the actual glyphs while still reporting success.
+    # -----------------------------------------------------------------
+
+    _PDF_BOX_CASES: dict[str, tuple[str, str]] = {
+        "plain page": ("[0 0 612 792]", ""),
+        "non-zero MediaBox origin": ("[100 100 712 892]", ""),
+        "CropBox smaller than MediaBox": ("[0 0 612 792]", "/CropBox [50 400 562 750]"),
+        "Rotate 90": ("[0 0 612 792]", "/Rotate 90"),
+    }
+
+    @pytest.mark.parametrize("case_name", list(_PDF_BOX_CASES))
+    def test_mask_covers_glyphs_regardless_of_page_box(self, tmp_path: Path, case_name: str):
+        pytest.importorskip("pdfplumber")
+        pytest.importorskip("pypdfium2")
+        pytest.importorskip("PIL")
+
+        media_box, extra_page_entries = self._PDF_BOX_CASES[case_name]
+        source = tmp_path / "source.pdf"
+        source.write_bytes(_boxed_pdf_bytes(media_box, extra_page_entries))
+
+        content = read_file(source)
+        assert content.file_type == "pdf"
+        assert "A123456789" in content.text
+
+        out = tmp_path / "redacted.pdf"
+        write_file(content, "", {"<TW_NATIONAL_ID_1>": "A123456789"}, out)
+        assert out.exists()
+
+        source_image = _render_pdf_page(content.source_bytes)
+        output_image = _render_pdf_page(out.read_bytes())
+        assert source_image.size == output_image.size
+
+        # The fixture draws "SECRET A123456789"; only "A123456789" is
+        # mapped, so "SECRET " (with its trailing space) is left un-redacted
+        # by design. Empirically, roughly 58% of the rendered ink belongs to
+        # "A123456789" and ~42% to the literal "SECRET " prefix, so a
+        # correctly-aligned mask leaves about 42% of the source's dark
+        # pixels still dark. The coordinate bug drew the mask tens of
+        # points away from the glyphs, leaving ~99% still dark. 0.60 sits
+        # comfortably above the correct value and below the bug's value.
+        still_dark_fraction = _still_dark_fraction(source_image, output_image)
+        assert still_dark_fraction < 0.60, (
+            f"{case_name}: {still_dark_fraction:.2%} of the source's dark "
+            "pixels are still dark after redaction -- the mask is "
+            "misaligned with the glyphs"
+        )
 
     def test_file_errors_do_not_include_source_path(self, tmp_path: Path):
         private_name = "private-customer-name-A123456789"
