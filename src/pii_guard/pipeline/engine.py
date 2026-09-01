@@ -15,6 +15,7 @@ from presidio_analyzer import AnalyzerEngine, RecognizerResult
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import ConflictResolutionStrategy, OperatorConfig
 
+from pii_guard._compat import is_reparse_point
 from pii_guard.recognizers.tw_recognizers import TW_ENTITY_TYPES, get_all_tw_recognizers
 
 logger = logging.getLogger(__name__)
@@ -92,14 +93,20 @@ def validate_org_allowlist(values: Iterable[str] | None) -> tuple[str, ...]:
 def load_org_allowlist_file(path: Path) -> tuple[str, ...]:
     """Read and validate one newline-delimited organization allowlist."""
 
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    if no_follow is None:
-        _invalid_org_allowlist()
+    # O_NOFOLLOW does not exist on Windows. Treating that as fatal made this
+    # rule file unusable there, so reject links with the platform-neutral
+    # reparse-point check and confirm the opened file is the one we checked.
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
     descriptor = -1
     try:
-        descriptor = os.open(path, os.O_RDONLY | no_follow)
+        path_status = path.lstat()
+        if is_reparse_point(path_status) or not stat.S_ISREG(path_status.st_mode):
+            _invalid_org_allowlist()
+        descriptor = os.open(path, os.O_RDONLY | no_follow | getattr(os, "O_BINARY", 0))
         file_status = os.fstat(descriptor)
         if not stat.S_ISREG(file_status.st_mode):
+            _invalid_org_allowlist()
+        if file_status.st_dev != path_status.st_dev or file_status.st_ino != path_status.st_ino:
             _invalid_org_allowlist()
         if file_status.st_size > MAX_ORG_ALLOWLIST_FILE_BYTES:
             _invalid_org_allowlist()
