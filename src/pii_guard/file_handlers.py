@@ -166,7 +166,10 @@ def _read_source_bytes(path: Path) -> bytes:
     if info.st_size > MAX_FILE_BYTES:
         _raise_file_error("FILE_TOO_LARGE")
 
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # Windows opens descriptors in text mode unless O_BINARY is set, which
+    # stops the read at the first 0x1A and rewrites CRLF. Every format this
+    # module handles is binary, so the read has to be byte-exact.
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except (OSError, ValueError):
@@ -968,7 +971,15 @@ def _write_output_bytes(output_path: Path, data: bytes) -> None:
         output.parent.mkdir(parents=True, exist_ok=True)
         if output.parent.is_symlink():
             _raise_file_error("FILE_WRITE_FAILED")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        # O_BINARY for the same reason as the read path: without it Windows
+        # expands LF to CRLF and corrupts the generated xlsx/docx/pdf.
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_TRUNC
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
         descriptor = os.open(output, flags, 0o600)
     except FileHandlerError:
         raise

@@ -8,6 +8,8 @@ import pytest
 
 from pii_guard.file_handlers import (
     FileHandlerError,
+    _read_source_bytes,
+    _write_output_bytes,
     get_output_extension,
     is_supported,
     read_file,
@@ -502,6 +504,26 @@ class TestPdf:
             "pixels are still dark after redaction -- the mask is "
             "misaligned with the glyphs"
         )
+
+    # Byte-exactness of the raw file IO. Windows opens os.open descriptors in
+    # text mode unless O_BINARY is set: the read then stops at the first 0x1A
+    # and CRLF is rewritten, which silently truncated every xlsx/docx to a few
+    # dozen bytes. These assertions are trivially true on POSIX and are the
+    # regression guard on Windows.
+
+    def test_read_source_bytes_is_byte_exact(self, tmp_path: Path):
+        path = tmp_path / "binary.xlsx"
+        payload = b"PK\x03\x04" + bytes(range(256)) + b"\r\n\x1a" + b"tail" * 64
+        path.write_bytes(payload)
+
+        assert _read_source_bytes(path) == payload
+
+    def test_write_output_bytes_is_byte_exact(self, tmp_path: Path):
+        out = tmp_path / "binary-out.xlsx"
+        payload = b"PK\x03\x04" + bytes(range(256)) + b"\r\n\x1a" + b"tail" * 64
+        _write_output_bytes(out, payload)
+
+        assert out.read_bytes() == payload
 
     def test_file_errors_do_not_include_source_path(self, tmp_path: Path):
         private_name = "private-customer-name-A123456789"
