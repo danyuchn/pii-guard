@@ -21,6 +21,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Final
 
+from opencc import OpenCC
+
 DEFAULT_AUDIT_MODEL: Final[str] = "ornith-1.5:9b"
 DEFAULT_OLLAMA_URL: Final[str] = "http://127.0.0.1:11434"
 AUDIT_WINDOW_CHARS: Final[int] = 3_600
@@ -33,6 +35,7 @@ HTTP_TIMEOUT_SECONDS: Final[int] = 600
 MIN_SPLIT_CHARS: Final[int] = 400
 MAX_SPLIT_DEPTH: Final[int] = 3
 MAX_MODEL_CALLS: Final[int] = 180
+_TRADITIONAL_TO_SIMPLIFIED: Final[OpenCC] = OpenCC("t2s.json")
 
 _PLACEHOLDER = re.compile(r"\[\[PII-[^\]\r\n]+\]\]")
 _PROMPT_INJECTION_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
@@ -308,7 +311,7 @@ def _extract_entities(
 def _align_value(value: str, text: str) -> str:
     if value in text:
         return value
-    needle = "".join(character.casefold() for character in value if character.isalnum())
+    needle = _alignment_key(value)
     minimum = 2 if any("㐀" <= character <= "鿿" for character in needle) else 4
     if len(needle) < minimum:
         raise AuditError(
@@ -318,7 +321,7 @@ def _align_value(value: str, text: str) -> str:
     positions: list[int] = []
     for position, character in enumerate(text):
         if character.isalnum():
-            folded = character.casefold()
+            folded = _alignment_key(character)
             normalized.extend(folded)
             positions.extend([position] * len(folded))
     haystack = "".join(normalized)
@@ -333,6 +336,18 @@ def _align_value(value: str, text: str) -> str:
             "LOCAL_AUDIT_UNRESOLVED", "Local audit value could not be matched exactly."
         )
     return matches.pop()
+
+
+def _alignment_key(value: str) -> str:
+    """Return a conservative comparison key for audited visible text.
+
+    OpenCC is used only to bridge simplified and Traditional Chinese in a
+    model response.  The caller still requires one exact source substring, so
+    this key cannot turn an ambiguous or approximate model value into a match.
+    """
+
+    converted = _TRADITIONAL_TO_SIMPLIFIED.convert(value)
+    return "".join(character.casefold() for character in converted if character.isalnum())
 
 
 def _call_ollama(window: str, *, alignment_text: str, config: AuditConfig) -> list[tuple[str, str]]:

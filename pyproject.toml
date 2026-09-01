@@ -17,6 +17,7 @@ dependencies = [
     "spacy-transformers>=1.3.0",
     "spacy-huggingface-pipelines>=0.0.4",
     "mcp>=1.0.0",
+    "opencc>=1.4.2,<1.5",
 ]
 
 [project.optional-dependencies]
