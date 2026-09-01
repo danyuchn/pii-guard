@@ -572,7 +572,10 @@ class TestFullRoundtrip:
     def test_csv_roundtrip(self, tmp_path: Path, spacy_only_engine):
         original = "name,phone\n張三,0912345678\n李四,0923456789"
         f = tmp_path / "data.csv"
-        f.write_text(original, encoding="utf-8")
+        # write_bytes, not write_text: write_text translates newlines on
+        # Windows, so the on-disk file would not be what this test compares
+        # the round-trip against.
+        f.write_bytes(original.encode("utf-8"))
 
         content = read_file(f)
         anonymized_text, mapping = spacy_only_engine.anonymize(content.text)

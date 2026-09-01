@@ -25,6 +25,16 @@
 
 ### 修正
 
+- **Windows：`.docx`／`.xlsx`／`.pdf` 讀寫修正。** `os.open` 在 Windows 預設是文字模式，
+  讀檔會在第一個 `0x1A` 截斷、寫檔會把 LF 膨脹成 CRLF，導致多格式檔案被讀成數十位元組
+  而以 `FILE_MALFORMED` 失敗，二進位輸出也會損毀。讀寫兩端都改為二進位模式，並補上
+  逐位元組比對的回歸測試。純文字寫回一併停用換行轉換，維持與讀取端一致的位元組保真。
+- **Windows：`--allow-org-file` 修正。** `os.O_NOFOLLOW` 在 Windows 不存在，原本被當成
+  致命錯誤，使該選項在 Windows 完全無法使用。改以跨平台的 reparse point 檢查擋下連結，
+  並比對開啟前後的裝置與 inode 確認是同一個檔案。
+- **PDF 遮蔽座標修正。** 遮罩位置原本以算圖後的像素尺寸換算，頁面若有非零 `MediaBox`
+  原點或另設 `CropBox`，遮罩會偏離文字，輸出的去識別化 PDF 上個資仍清晰可讀而系統照常
+  回報成功。改以頁面 CropBox 對齊，並在算圖尺寸與 CropBox 不符時 fail-closed。
 - 加強稽核現在可把模型回傳的簡體姓名以 OpenCC 轉成比較鍵，仍限定唯一的來源文字命中，
   所以會保留原文件字形而不放寬成模糊匹配。
 - `anonymize` 新增僅限本次處理的 `--allow-org` 與 `--allow-org-file`：只對完全相同的

@@ -1023,7 +1023,10 @@ def write_file(
     out = Path(output_path)
     if content.file_type == "plain":
         try:
-            out.write_text(anonymized_text, encoding="utf-8")
+            # newline="" keeps the write byte-faithful: the read path
+            # preserves the file's own line endings, so translating them
+            # here would turn a CRLF document into CRCRLF on Windows.
+            out.write_text(anonymized_text, encoding="utf-8", newline="")
         except (OSError, ValueError):
             _raise_file_error("FILE_WRITE_FAILED")
         return
