@@ -18,6 +18,7 @@ from presidio_analyzer.predefined_recognizers import CreditCardRecognizer
 
 # ── Email ─────────────────────────────────────────────────────────────────────
 
+
 class TwEmailRecognizer(PatternRecognizer):
     """Email recognizer for zh context with lookaround-based boundaries.
 
@@ -36,7 +37,12 @@ class TwEmailRecognizer(PatternRecognizer):
         ),
     ]
     CONTEXT: ClassVar[list[str]] = [
-        "信箱", "電郵", "email", "e-mail", "郵件", "寄信",
+        "信箱",
+        "電郵",
+        "email",
+        "e-mail",
+        "郵件",
+        "寄信",
     ]
 
     def __init__(self) -> None:
@@ -50,6 +56,7 @@ class TwEmailRecognizer(PatternRecognizer):
 
 
 # ── Credit Card ───────────────────────────────────────────────────────────────
+
 
 class TwCreditCardRecognizer(CreditCardRecognizer):
     """Credit card recognizer for zh context.

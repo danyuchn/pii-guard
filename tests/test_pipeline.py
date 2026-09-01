@@ -5,6 +5,125 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+from presidio_analyzer import RecognizerResult
+
+from pii_guard.cli import _org_allowlist_from_args, build_parser
+from pii_guard.pipeline.engine import (
+    MAX_ORG_ALLOWLIST_CHARS,
+    OrgAllowlistError,
+    PiiGuardEngine,
+    load_org_allowlist_file,
+    validate_org_allowlist,
+)
+
+
+class TestOrganizationAllowlist:
+    """Explicit organization rules must never relax other PII categories."""
+
+    def test_only_exact_org_span_is_preserved(self) -> None:
+        text = "臺灣士林地方法院，王小明"
+        results = [
+            RecognizerResult(entity_type="ORG", start=0, end=8, score=0.9),
+            RecognizerResult(entity_type="PERSON", start=9, end=12, score=0.9),
+        ]
+
+        filtered = PiiGuardEngine._filter_allowed_orgs(
+            text,
+            results,
+            ("臺灣士林地方法院",),
+        )
+
+        assert [item.entity_type for item in filtered] == ["PERSON"]
+
+    def test_same_literal_person_is_not_preserved(self) -> None:
+        text = "王小明"
+        results = [
+            RecognizerResult(entity_type="ORG", start=0, end=3, score=0.9),
+            RecognizerResult(entity_type="PERSON", start=0, end=3, score=0.9),
+        ]
+
+        filtered = PiiGuardEngine._filter_allowed_orgs(text, results, ("王小明",))
+
+        assert [item.entity_type for item in filtered] == ["PERSON"]
+
+    def test_anonymize_applies_allowlist_only_to_this_call(self) -> None:
+        class FixedAnalyzer:
+            def analyze(self, **_kwargs: object) -> list[RecognizerResult]:
+                return [
+                    RecognizerResult(entity_type="ORG", start=0, end=3, score=0.9),
+                    RecognizerResult(entity_type="PERSON", start=4, end=7, score=0.9),
+                ]
+
+        engine = object.__new__(PiiGuardEngine)
+        engine._analyzer = FixedAnalyzer()
+        from presidio_anonymizer import AnonymizerEngine
+
+        engine._anonymizer = AnonymizerEngine()
+        engine.score_threshold = 0.5
+
+        text = "甲公司，王小明"
+        allowed, allowed_mapping = engine.anonymize(text, allow_orgs=("甲公司",))
+        default, default_mapping = engine.anonymize(text)
+
+        assert allowed == "甲公司，<PERSON_1>"
+        assert set(allowed_mapping.values()) == {"王小明"}
+        assert "<ORG_1>" in default
+        assert set(default_mapping.values()) == {"甲公司", "王小明"}
+
+    def test_non_exact_org_value_is_not_preserved(self) -> None:
+        text = "臺灣士林地方法院"
+        results = [RecognizerResult(entity_type="ORG", start=0, end=len(text), score=0.9)]
+
+        assert PiiGuardEngine._filter_allowed_orgs(text, results, ("士林地方法院",)) == results
+
+    @pytest.mark.parametrize("values", [("",), ("A\nB",), ("甲" * (MAX_ORG_ALLOWLIST_CHARS + 1),)])
+    def test_invalid_values_are_rejected(self, values: tuple[str, ...]) -> None:
+        with pytest.raises(OrgAllowlistError):
+            validate_org_allowlist(values)
+
+    def test_file_rule_ignores_comments_and_blank_lines(self, tmp_path: Path) -> None:
+        rules = tmp_path / "organisations.txt"
+        rules.write_text("# confirmed public\n\n 臺灣士林地方法院 \n", encoding="utf-8")
+
+        assert load_org_allowlist_file(rules) == ("臺灣士林地方法院",)
+
+    def test_file_rule_rejects_symlink(self, tmp_path: Path) -> None:
+        target = tmp_path / "target.txt"
+        target.write_text("臺灣士林地方法院\n", encoding="utf-8")
+        link = tmp_path / "organisations.txt"
+        link.symlink_to(target)
+
+        with pytest.raises(OrgAllowlistError):
+            load_org_allowlist_file(link)
+
+    def test_cli_combines_repeatable_value_and_one_file_rule(self, tmp_path: Path) -> None:
+        rules = tmp_path / "organisations.txt"
+        rules.write_text("臺灣高等法院\n", encoding="utf-8")
+        args = build_parser().parse_args(
+            [
+                "anonymize",
+                "-",
+                "--allow-org",
+                "臺灣士林地方法院",
+                "--allow-org-file",
+                str(rules),
+            ]
+        )
+
+        assert _org_allowlist_from_args(args) == ("臺灣士林地方法院", "臺灣高等法院")
+
+    def test_cli_rejects_multiple_allowlist_files(self, tmp_path: Path) -> None:
+        first = tmp_path / "first.txt"
+        second = tmp_path / "second.txt"
+        first.write_text("甲公司\n", encoding="utf-8")
+        second.write_text("乙公司\n", encoding="utf-8")
+        args = build_parser().parse_args(
+            ["anonymize", "-", "--allow-org-file", str(first), "--allow-org-file", str(second)]
+        )
+
+        with pytest.raises(OrgAllowlistError):
+            _org_allowlist_from_args(args)
 
 class TestPiiGuardEngineAnonymize:
     """Tests using spacy_only_engine (no CKIP model download)."""
@@ -76,6 +195,26 @@ class TestPiiGuardEngineRoundtrip:
         anonymized, mapping = spacy_only_engine.anonymize(original)
         restored = spacy_only_engine.deanonymize(anonymized, mapping)
         assert restored == original
+
+    def test_partially_overlapping_entity_types_roundtrip(self) -> None:
+        class FixedAnalyzer:
+            def analyze(self, **_kwargs: object) -> list[RecognizerResult]:
+                return [
+                    RecognizerResult(entity_type="LOCATION", start=0, end=4, score=0.7),
+                    RecognizerResult(entity_type="ORG", start=2, end=6, score=0.9),
+                ]
+
+        engine = object.__new__(PiiGuardEngine)
+        engine._analyzer = FixedAnalyzer()
+        from presidio_anonymizer import AnonymizerEngine
+
+        engine._anonymizer = AnonymizerEngine()
+        engine.score_threshold = 0.5
+
+        original = "ABCDEF"
+        anonymized, mapping = engine.anonymize(original)
+
+        assert PiiGuardEngine.deanonymize(anonymized, mapping) == original
 
 
 class TestRepeatedEntities:

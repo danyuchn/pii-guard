@@ -88,8 +88,7 @@ class TestHookDetect:
     def pii_file(self, tmp_path: Path) -> Path:
         f = tmp_path / "data.txt"
         f.write_text(
-            "客戶張大明，身分證A123456789，手機0912345678，"
-            "email: test@example.com",
+            "客戶張大明，身分證A123456789，手機0912345678，email: test@example.com",
             encoding="utf-8",
         )
         return f
@@ -113,10 +112,12 @@ class TestHookDetect:
         return f
 
     def _run_hook(self, file_path: str) -> subprocess.CompletedProcess:
-        hook_input = json.dumps({
-            "tool_name": "Read",
-            "tool_input": {"file_path": file_path},
-        })
+        hook_input = json.dumps(
+            {
+                "tool_name": "Read",
+                "tool_input": {"file_path": file_path},
+            }
+        )
         # Pin both pipe directions to UTF-8: on Windows the locale codec
         # (e.g. cp950) cannot decode the child's UTF-8 output.
         return subprocess.run(
@@ -158,6 +159,7 @@ class TestHookDetect:
     def test_pii_detected_no_temp_files(self, pii_file: Path):
         """Hook must NOT create temp files in /tmp/pii-guard-hook/."""
         import glob
+
         before = set(glob.glob("/tmp/pii-guard-hook/*"))
         self._run_hook(str(pii_file))
         after = set(glob.glob("/tmp/pii-guard-hook/*"))

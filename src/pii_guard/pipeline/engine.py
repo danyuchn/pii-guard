@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import stat
 import warnings
+from collections.abc import Iterable
 from pathlib import Path
-from typing import cast
+from typing import NoReturn, cast
 
 from presidio_analyzer import AnalyzerEngine, RecognizerResult
 from presidio_anonymizer import AnonymizerEngine
@@ -34,6 +37,93 @@ _CKIP_LABEL_MAP: dict[str, str] = {
     "GPE": "LOCATION",
     "FAC": "LOCATION",
 }
+
+MAX_ORG_ALLOWLIST_ENTRIES = 1_000
+MAX_ORG_ALLOWLIST_CHARS = 512
+MAX_ORG_ALLOWLIST_FILE_BYTES = 1_024_000
+_ORG_ALLOWLIST_ERROR_CODE = "INVALID_ALLOW_ORG"
+_ORG_ALLOWLIST_ERROR_MESSAGE = "Organization allowlist is invalid."
+
+
+class OrgAllowlistError(ValueError):
+    """A fixed, caller-safe organization allowlist validation error."""
+
+    code = _ORG_ALLOWLIST_ERROR_CODE
+    message = _ORG_ALLOWLIST_ERROR_MESSAGE
+
+    def __init__(self) -> None:
+        super().__init__(self.message)
+
+    def __str__(self) -> str:
+        return self.message
+
+
+def _invalid_org_allowlist() -> NoReturn:
+    raise OrgAllowlistError() from None
+
+
+def validate_org_allowlist(values: Iterable[str] | None) -> tuple[str, ...]:
+    """Validate one invocation's exact organization values."""
+
+    if values is None:
+        return ()
+    if isinstance(values, str):
+        values = (values,)
+
+    validated: list[str] = []
+    try:
+        for value in values:
+            if len(validated) >= MAX_ORG_ALLOWLIST_ENTRIES:
+                _invalid_org_allowlist()
+            if not isinstance(value, str):
+                _invalid_org_allowlist()
+            if not value.strip() or any(character in value for character in "\r\n\u2028\u2029"):
+                _invalid_org_allowlist()
+            if len(value) > MAX_ORG_ALLOWLIST_CHARS:
+                _invalid_org_allowlist()
+            validated.append(value)
+    except OrgAllowlistError:
+        raise
+    except Exception:
+        _invalid_org_allowlist()
+    return tuple(validated)
+
+
+def load_org_allowlist_file(path: Path) -> tuple[str, ...]:
+    """Read and validate one newline-delimited organization allowlist."""
+
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        _invalid_org_allowlist()
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | no_follow)
+        file_status = os.fstat(descriptor)
+        if not stat.S_ISREG(file_status.st_mode):
+            _invalid_org_allowlist()
+        if file_status.st_size > MAX_ORG_ALLOWLIST_FILE_BYTES:
+            _invalid_org_allowlist()
+        data = os.read(descriptor, MAX_ORG_ALLOWLIST_FILE_BYTES + 1)
+        if len(data) > MAX_ORG_ALLOWLIST_FILE_BYTES:
+            _invalid_org_allowlist()
+        contents = data.decode("utf-8")
+    except OrgAllowlistError:
+        raise
+    except (OSError, UnicodeError, TypeError, ValueError, OverflowError):
+        _invalid_org_allowlist()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    values: list[str] = []
+    for line in contents.split("\n"):
+        if line.endswith("\r"):
+            line = line[:-1]
+        value = line.strip(" \t\v\f\r")
+        if not value or value.startswith("#"):
+            continue
+        values.append(value)
+    return validate_org_allowlist(values)
 
 
 def _build_analyzer(
@@ -127,9 +217,7 @@ def _create_nlp_engine(ckip_model: str):
         )
         from presidio_analyzer.nlp_engine import SpacyNlpEngine
 
-        return SpacyNlpEngine(
-            models=[{"lang_code": "zh", "model_name": "zh_core_web_sm"}]
-        )
+        return SpacyNlpEngine(models=[{"lang_code": "zh", "model_name": "zh_core_web_sm"}])
 
 
 def _merge_adjacent_spans(results: list[RecognizerResult]) -> list[RecognizerResult]:
@@ -169,7 +257,8 @@ def _filter_person_over_date(results: list[RecognizerResult]) -> list[Recognizer
     if not date_spans:
         return results
     return [
-        r for r in results
+        r
+        for r in results
         if not (
             r.entity_type == "PERSON"
             and any(ds <= r.start and r.end <= de for ds, de in date_spans)
@@ -230,7 +319,32 @@ class PiiGuardEngine:
     # Public API
     # ------------------------------------------------------------------
 
-    def anonymize(self, text: str) -> tuple[str, dict[str, str]]:
+    @staticmethod
+    def _filter_allowed_orgs(
+        text: str,
+        results: list[RecognizerResult],
+        allow_orgs: Iterable[str],
+    ) -> list[RecognizerResult]:
+        """Drop only exact ORG spans named by this invocation's allowlist."""
+
+        allowed = frozenset(allow_orgs)
+        if not allowed:
+            return results
+        return [
+            result
+            for result in results
+            if not (
+                result.entity_type == "ORG"
+                and 0 <= result.start <= result.end <= len(text)
+                and text[result.start : result.end] in allowed
+            )
+        ]
+
+    def anonymize(
+        self,
+        text: str,
+        allow_orgs: Iterable[str] | None = None,
+    ) -> tuple[str, dict[str, str]]:
         """
         Anonymize PII in *text*.
 
@@ -240,10 +354,14 @@ class PiiGuardEngine:
             Text with PII replaced by numbered placeholders, e.g. ``<PERSON_1>``.
         mapping : dict[str, str]
             ``{placeholder: original_value}`` — needed for :meth:`deanonymize`.
+        allow_orgs : Iterable[str] | None
+            Exact organization spans to leave visible for this invocation only.
         """
         # Shared mutable state for the operator lambdas (closure)
-        entity_mapping: dict[str, str] = {}   # original_value → placeholder
-        counters: dict[str, int] = {}          # entity_type → running count
+        entity_mapping: dict[str, str] = {}  # original_value → placeholder
+        counters: dict[str, int] = {}  # entity_type → running count
+
+        requested_allowlist = validate_org_allowlist(allow_orgs)
 
         def make_lambda(entity_type: str):
             def replace_fn(original: str) -> str:
@@ -256,14 +374,18 @@ class PiiGuardEngine:
                     placeholder = f"<{entity_type}_{counters[entity_type]}>"
                     entity_mapping[original] = placeholder
                 return entity_mapping[original]
+
             return replace_fn
 
         operators = {
-            et: OperatorConfig("custom", {"lambda": make_lambda(et)})
-            for et in SUPPORTED_ENTITIES
+            et: OperatorConfig("custom", {"lambda": make_lambda(et)}) for et in SUPPORTED_ENTITIES
         }
 
-        results = self._raw_detect(text)
+        results = self._filter_allowed_orgs(
+            text,
+            self._raw_detect(text),
+            requested_allowlist,
+        )
 
         anonymized_result = self._anonymizer.anonymize(
             text=text,

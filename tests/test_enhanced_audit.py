@@ -204,6 +204,17 @@ def test_align_value_rejects_ambiguous_normalized_match() -> None:
     assert captured.value.code == "LOCAL_AUDIT_UNRESOLVED"
 
 
+def test_align_value_returns_traditional_source_for_simplified_model_value() -> None:
+    assert enhanced_audit._align_value("张三", "聯絡人：張三") == "張三"
+
+
+def test_align_value_rejects_multiple_traditional_sources_with_same_simplified_key() -> None:
+    with pytest.raises(enhanced_audit.AuditError) as captured:
+        enhanced_audit._align_value("发", "髮與發")
+
+    assert captured.value.code == "LOCAL_AUDIT_UNRESOLVED"
+
+
 def test_entity_parser_rejects_placeholder_fragment() -> None:
     marker = "[[PII-aaaaaaaaaa-PERSON-1]]"
     raw = '{"entities":[{"type":"PERSON","value":"PII-aaaaaaaaaa"}]}'

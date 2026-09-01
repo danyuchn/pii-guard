@@ -27,8 +27,8 @@ def mock_server(spacy_only_engine, monkeypatch):
 
 # ── anonymize_text ────────────────────────────────────────────────────────────
 
-class TestAnonymizeText:
 
+class TestAnonymizeText:
     def test_returns_expected_fields(self):
         result = srv.anonymize_text("身分證A123456789")
         assert "anonymized_text" in result
@@ -58,8 +58,8 @@ class TestAnonymizeText:
 
 # ── anonymize_file ───────────────────────────────────────────────────────────
 
-class TestAnonymizeFile:
 
+class TestAnonymizeFile:
     def test_returns_expected_fields(self, tmp_path):
         f = tmp_path / "data.txt"
         f.write_text("身分證A123456789", encoding="utf-8")
@@ -86,7 +86,9 @@ class TestAnonymizeFile:
         assert restored == original
 
     def test_file_not_found_raises(self):
-        with pytest.raises(FileNotFoundError):
+        from pii_guard.file_handlers import FileHandlerError
+
+        with pytest.raises(FileHandlerError, match="FILE_NOT_FOUND"):
             srv.anonymize_file("/tmp/definitely_does_not_exist_pii_guard.txt")
 
     def test_no_pii_file(self, tmp_path):
@@ -105,8 +107,8 @@ class TestAnonymizeFile:
 
 # ── restore_text ──────────────────────────────────────────────────────────────
 
-class TestRestoreText:
 
+class TestRestoreText:
     def test_roundtrip(self):
         original = "身分證A123456789，手機0912345678"
         result = srv.anonymize_text(original)
@@ -132,8 +134,8 @@ class TestRestoreText:
 
 # ── save_mapping / restore_from_file ─────────────────────────────────────────
 
-class TestSaveAndRestoreMapping:
 
+class TestSaveAndRestoreMapping:
     def test_save_creates_valid_json(self, tmp_path):
         result = srv.anonymize_text("身分證A123456789")
         path = str(tmp_path / "mapping.json")

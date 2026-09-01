@@ -7,7 +7,14 @@ import json
 import math
 import os
 import sys
+from collections.abc import Iterable
 from pathlib import Path
+
+from pii_guard.pipeline.engine import (
+    OrgAllowlistError,
+    load_org_allowlist_file,
+    validate_org_allowlist,
+)
 
 
 def _safe_error(error_code: str, message: str) -> int:
@@ -34,6 +41,28 @@ def _threshold_arg(raw: str) -> float:
     if not math.isfinite(value) or not 0 <= value <= 1:
         raise argparse.ArgumentTypeError("threshold must be a finite number from 0 to 1")
     return value
+
+
+def _org_allowlist_from_args(args: argparse.Namespace) -> tuple[str, ...]:
+    """Load one invocation's exact organization allowlist without echoing it."""
+
+    direct_values: Iterable[str] = getattr(args, "allow_org", ()) or ()
+    values = list(validate_org_allowlist(direct_values))
+    file_values = getattr(args, "allow_org_file", ()) or ()
+    if isinstance(file_values, (str, Path)):
+        file_values = (file_values,)
+    try:
+        paths = tuple(file_values)
+    except Exception:
+        raise OrgAllowlistError() from None
+    if len(paths) > 1:
+        raise OrgAllowlistError() from None
+    if paths:
+        try:
+            values.extend(load_org_allowlist_file(Path(paths[0])))
+        except (OSError, TypeError, ValueError):
+            raise OrgAllowlistError() from None
+    return validate_org_allowlist(values)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -79,6 +108,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=_threshold_arg,
         default=0.5,
         help="Presidio 信心分數閾值（預設：0.5）",
+    )
+    anon.add_argument(
+        "--allow-org",
+        action="append",
+        default=[],
+        metavar="VALUE",
+        help="本次執行保留的組織名稱；可重複指定",
+    )
+    anon.add_argument(
+        "--allow-org-file",
+        action="append",
+        default=[],
+        type=Path,
+        metavar="PATH",
+        help="本次執行的組織名稱清單（每行一個；可指定一次）",
     )
 
     # ── quick (shared private job workflow) ─────────────────────────────
@@ -253,52 +297,60 @@ def _default_restore_output_path(input_path: str) -> Path:
 
 
 def cmd_anonymize(args: argparse.Namespace) -> int:
-    from pii_guard.file_handlers import is_supported, read_file, write_file
+    from pii_guard.file_handlers import FileHandlerError, is_supported, read_file, write_file
     from pii_guard.pipeline.engine import PiiGuardEngine
 
-    is_stdin = args.input == "-"
+    try:
+        allow_orgs = _org_allowlist_from_args(args)
+    except OrgAllowlistError as error:
+        return _safe_error(error.code, error.message)
 
-    print("[pii-guard] 載入模型中，首次執行需要下載 CKIP 模型…", file=sys.stderr)
-    engine = PiiGuardEngine(
-        ckip_model=args.model,
-        score_threshold=args.threshold,
-    )
+    try:
+        is_stdin = args.input == "-"
 
-    if is_stdin:
-        # stdin: plain text only
-        text = sys.stdin.read()
-        anonymized, mapping = engine.anonymize(text)
-        _write_output(anonymized, args.output)
+        print("[pii-guard] 載入模型中，首次執行需要下載 CKIP 模型…", file=sys.stderr)
+        engine = PiiGuardEngine(
+            ckip_model=args.model,
+            score_threshold=args.threshold,
+        )
+
+        if is_stdin:
+            # stdin: plain text only
+            text = sys.stdin.read()
+            anonymized, mapping = engine.anonymize(text, allow_orgs=allow_orgs)
+            _write_output(anonymized, args.output)
+            engine.save_mapping(mapping, args.mapping)
+            print(f"\n[pii-guard] 偵測到 {len(mapping)} 個 PII 實體", file=sys.stderr)
+            print(f"[pii-guard] mapping 已儲存至：{args.mapping}", file=sys.stderr)
+            return 0
+
+        # File input: use the isolated file-handler boundary.
+        input_path = Path(args.input)
+        if not is_supported(input_path):
+            return _safe_error("FILE_UNSUPPORTED", "Input file format is not supported.")
+
+        content = read_file(input_path)
+        anonymized_text, mapping = engine.anonymize(content.text, allow_orgs=allow_orgs)
+        output_path = args.output or _default_output_path(args.input)
+
+        if content.file_type == "plain":
+            _write_output(anonymized_text, output_path)
+        else:
+            # Structured formats and PDF output are written in an isolated
+            # worker. PDF failures are fail-closed and produce no artifact.
+            write_file(content, anonymized_text, mapping, output_path)
+
         engine.save_mapping(mapping, args.mapping)
-        print(f"\n[pii-guard] 偵測到 {len(mapping)} 個 PII 實體", file=sys.stderr)
+
+        entity_count = len(mapping)
+        print(f"\n[pii-guard] 偵測到 {entity_count} 個 PII 實體", file=sys.stderr)
+        print(f"[pii-guard] 去識別化檔案：{output_path}", file=sys.stderr)
         print(f"[pii-guard] mapping 已儲存至：{args.mapping}", file=sys.stderr)
         return 0
-
-    # File input: use file_handlers for multi-format support
-    input_path = Path(args.input)
-    if not is_supported(input_path):
-        print(f"[pii-guard] 不支援的檔案格式：{input_path.suffix}", file=sys.stderr)
-        print("[pii-guard] 支援的格式：.txt .csv .tsv .xlsx .docx .pdf 等", file=sys.stderr)
-        return 1
-
-    content = read_file(input_path)
-    anonymized_text, mapping = engine.anonymize(content.text)
-
-    output_path = args.output or _default_output_path(args.input)
-
-    if content.file_type == "plain" or content.file_type == "pdf":
-        _write_output(anonymized_text, output_path)
-    else:
-        # Structured format: write back with per-cell anonymization
-        write_file(content, anonymized_text, mapping, output_path)
-
-    engine.save_mapping(mapping, args.mapping)
-
-    entity_count = len(mapping)
-    print(f"\n[pii-guard] 偵測到 {entity_count} 個 PII 實體", file=sys.stderr)
-    print(f"[pii-guard] 去識別化檔案：{output_path}", file=sys.stderr)
-    print(f"[pii-guard] mapping 已儲存至：{args.mapping}", file=sys.stderr)
-    return 0
+    except FileHandlerError as error:
+        return _safe_error(error.code, error.message)
+    except (OSError, ValueError):
+        return _safe_error("FILE_WRITE_FAILED", "The requested output could not be written safely.")
 
 
 def cmd_quick(args: argparse.Namespace) -> int:
@@ -412,41 +464,45 @@ def cmd_web(args: argparse.Namespace) -> int:
 
 
 def cmd_restore(args: argparse.Namespace) -> int:
-    from pii_guard.file_handlers import is_supported, read_file, write_file
+    from pii_guard.file_handlers import FileHandlerError, is_supported, read_file, write_file
     from pii_guard.pipeline.engine import PiiGuardEngine
 
-    mapping = PiiGuardEngine.load_mapping(args.mapping)
-    is_stdin = args.input == "-"
+    try:
+        mapping = PiiGuardEngine.load_mapping(args.mapping)
+        is_stdin = args.input == "-"
 
-    if is_stdin:
-        text = sys.stdin.read()
-        restored = PiiGuardEngine.deanonymize(text, mapping)
-        _write_output(restored, args.output)
-        return 0
-
-    input_path = Path(args.input)
-
-    if is_supported(input_path) and input_path.suffix.lower() not in {".pdf"}:
-        content = read_file(input_path)
-
-        if content.file_type == "plain":
-            restored = PiiGuardEngine.deanonymize(content.text, mapping)
+        if is_stdin:
+            text = sys.stdin.read()
+            restored = PiiGuardEngine.deanonymize(text, mapping)
             _write_output(restored, args.output)
-        else:
-            # Structured format: reverse mapping to restore per-cell.
-            # Binary formats can't go to stdout, so fall back to a derived
-            # filename (never the input path itself) rather than silently
-            # overwriting the de-identified file the caller passed in.
-            reverse_mapping = {v: k for k, v in mapping.items()}
-            output_path = args.output or _default_restore_output_path(args.input)
-            write_file(content, "", reverse_mapping, output_path)
-    else:
-        # Fallback: treat as plain text
-        text = _read_input(args.input)
-        restored = PiiGuardEngine.deanonymize(text, mapping)
-        _write_output(restored, args.output)
+            return 0
 
-    return 0
+        input_path = Path(args.input)
+
+        if is_supported(input_path) and input_path.suffix.lower() not in {".pdf"}:
+            content = read_file(input_path)
+
+            if content.file_type == "plain":
+                restored = PiiGuardEngine.deanonymize(content.text, mapping)
+                _write_output(restored, args.output)
+            else:
+                # Structured format: reverse mapping to restore per-cell.
+                # Binary formats can't go to stdout, so fall back to a derived
+                # filename rather than silently overwriting the input.
+                reverse_mapping = {v: k for k, v in mapping.items()}
+                output_path = args.output or _default_restore_output_path(args.input)
+                write_file(content, "", reverse_mapping, output_path)
+        else:
+            # Fallback: treat as plain text
+            text = _read_input(args.input)
+            restored = PiiGuardEngine.deanonymize(text, mapping)
+            _write_output(restored, args.output)
+
+        return 0
+    except FileHandlerError as error:
+        return _safe_error(error.code, error.message)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return _safe_error("FILE_WRITE_FAILED", "The requested output could not be written safely.")
 
 
 def cmd_serve(args: argparse.Namespace) -> int:

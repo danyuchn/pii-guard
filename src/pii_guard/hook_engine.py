@@ -21,9 +21,7 @@ def create_regex_only_engine(score_threshold: float = 0.5) -> PiiGuardEngine:
     email, credit card, passport, license plate, birth date, bank account.
     It does NOT detect PERSON/ORG/LOCATION (those require CKIP BERT).
     """
-    nlp_engine = SpacyNlpEngine(
-        models=[{"lang_code": "zh", "model_name": "zh_core_web_sm"}]
-    )
+    nlp_engine = SpacyNlpEngine(models=[{"lang_code": "zh", "model_name": "zh_core_web_sm"}])
     registry = RecognizerRegistry(recognizers=[], supported_languages=["zh"])
     for r in get_all_tw_recognizers():
         registry.add_recognizer(r)

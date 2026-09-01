@@ -23,8 +23,17 @@ class TwBusinessIdRecognizer(LocalRecognizer):
     # breaking boundary detection in Chinese text.
     PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"(?<!\d)\d{8}(?!\d)")
     CONTEXT_KEYWORDS: ClassVar[list[str]] = [
-        "統一編號", "統編", "公司", "廠商", "發票", "稅籍", "法人", "營業",
-        "企業", "行號", "商號",
+        "統一編號",
+        "統編",
+        "公司",
+        "廠商",
+        "發票",
+        "稅籍",
+        "法人",
+        "營業",
+        "企業",
+        "行號",
+        "商號",
     ]
     CONTEXT_WINDOW: ClassVar[int] = 50
     _WEIGHTS: ClassVar[list[int]] = [1, 2, 1, 2, 1, 2, 4, 1]
@@ -72,10 +81,7 @@ class TwBusinessIdRecognizer(LocalRecognizer):
         """
         if len(number) != 8 or not number.isdigit():
             return False
-        total = sum(
-            (int(d) * w) // 10 + (int(d) * w) % 10
-            for d, w in zip(number, cls._WEIGHTS)
-        )
+        total = sum((int(d) * w) // 10 + (int(d) * w) % 10 for d, w in zip(number, cls._WEIGHTS))
         if total % 10 == 0:
             return True
         # Special case: 7 × 4 = 28 can also be counted as 9 (alternative path)

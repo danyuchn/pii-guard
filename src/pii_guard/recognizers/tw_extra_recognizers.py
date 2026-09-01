@@ -33,6 +33,7 @@ def _has_context(text: str, start: int, end: int, keywords: list[str]) -> bool:
 
 # ── License Plate ──────────────────────────────────────────────────────────────
 
+
 class TwLicensePlateRecognizer(LocalRecognizer):
     """Taiwan vehicle license plates (new and old formats) with context filter.
 
@@ -47,10 +48,19 @@ class TwLicensePlateRecognizer(LocalRecognizer):
     # Compile with re.ASCII so [A-Z] / \d only match ASCII characters
     _PATTERNS: ClassVar[list[re.Pattern[str]]] = [
         re.compile(r"(?<![A-Za-z0-9])[A-Z]{2,3}-\d{4}(?![A-Za-z0-9])", re.ASCII),  # new
-        re.compile(r"(?<!\d)\d{3,4}-[A-Z]{2}(?![A-Za-z0-9])", re.ASCII),            # old
+        re.compile(r"(?<!\d)\d{3,4}-[A-Z]{2}(?![A-Za-z0-9])", re.ASCII),  # old
     ]
     CONTEXT_KEYWORDS: ClassVar[list[str]] = [
-        "車牌", "牌照", "車號", "車輛", "汽車", "機車", "行照", "號牌", "車籍", "車",
+        "車牌",
+        "牌照",
+        "車號",
+        "車輛",
+        "汽車",
+        "機車",
+        "行照",
+        "號牌",
+        "車籍",
+        "車",
     ]
 
     def __init__(self) -> None:
@@ -89,6 +99,7 @@ class TwLicensePlateRecognizer(LocalRecognizer):
 
 # ── Birth Date ─────────────────────────────────────────────────────────────────
 
+
 class TwBirthDateRecognizer(LocalRecognizer):
     """Taiwan birth dates: Minguo calendar or Western ISO-style.
 
@@ -110,8 +121,16 @@ class TwBirthDateRecognizer(LocalRecognizer):
         _FLAGS,
     )
     CONTEXT_KEYWORDS: ClassVar[list[str]] = [
-        "生日", "出生", "出生日期", "出生年月日", "出生日", "DOB", "birthday",
-        "生日期", "出生年", "年齡",
+        "生日",
+        "出生",
+        "出生日期",
+        "出生年月日",
+        "出生日",
+        "DOB",
+        "birthday",
+        "生日期",
+        "出生年",
+        "年齡",
     ]
     _WESTERN_WINDOW: ClassVar[int] = 30  # tighter window for Western dates
 
@@ -160,6 +179,7 @@ class TwBirthDateRecognizer(LocalRecognizer):
 
 # ── International Mobile (+886) ────────────────────────────────────────────────
 
+
 class TwIntlMobileRecognizer(PatternRecognizer):
     """Taiwan mobile in international dialling format: +886-9XX-XXX-XXX.
 
@@ -180,7 +200,13 @@ class TwIntlMobileRecognizer(PatternRecognizer):
         ),
     ]
     CONTEXT: ClassVar[list[str]] = [
-        "手機", "電話", "mobile", "phone", "聯絡", "聯繫", "行動電話",
+        "手機",
+        "電話",
+        "mobile",
+        "phone",
+        "聯絡",
+        "聯繫",
+        "行動電話",
     ]
 
     def __init__(self) -> None:
@@ -195,6 +221,7 @@ class TwIntlMobileRecognizer(PatternRecognizer):
 
 # ── Bank Account ───────────────────────────────────────────────────────────────
 
+
 class TwBankAccountRecognizer(LocalRecognizer):
     """Taiwan bank account numbers (12–16 digits) with mandatory context filter.
 
@@ -207,8 +234,18 @@ class TwBankAccountRecognizer(LocalRecognizer):
     SUPPORTED_ENTITY: ClassVar[str] = "TW_BANK_ACCOUNT"
     PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"(?<!\d)\d{12,16}(?!\d)", re.ASCII)
     CONTEXT_KEYWORDS: ClassVar[list[str]] = [
-        "帳號", "帳戶", "存摺", "銀行", "轉帳", "匯款", "戶號", "銀行帳戶",
-        "銀行帳號", "帳", "存款", "金融帳號",
+        "帳號",
+        "帳戶",
+        "存摺",
+        "銀行",
+        "轉帳",
+        "匯款",
+        "戶號",
+        "銀行帳戶",
+        "銀行帳號",
+        "帳",
+        "存款",
+        "金融帳號",
     ]
 
     def __init__(self) -> None:
@@ -270,6 +307,7 @@ class TwBankAccountRecognizer(LocalRecognizer):
 # name) is not emitted — it isn't specific enough to count as an address on
 # its own; at least two tiers must merge for a match.
 
+
 class TwAddressRecognizer(LocalRecognizer):
     """Structured Taiwan address recognizer using a tiered merge algorithm.
 
@@ -307,10 +345,13 @@ class TwAddressRecognizer(LocalRecognizer):
         # Township-level 縣轄市 names are out of scope for this simplified
         # tier; only 鄉/鎮/區 are recognized at tier 8.
         (8, re.compile(rf"{_NAME}{{1,3}}(?:鄉|鎮|區)")),
-        (7, re.compile(
-            rf"{_NAME}{{1,6}}(?:路|街|道|大道)"
-            r"(?:[一二三四五六七八九十]+段)?"
-        )),
+        (
+            7,
+            re.compile(
+                rf"{_NAME}{{1,6}}(?:路|街|道|大道)"
+                r"(?:[一二三四五六七八九十]+段)?"
+            ),
+        ),
         (6, re.compile(r"\d+(?:巷|弄)")),
         (5, re.compile(r"\d+(?:之\d+)?號")),  # house number — privacy threshold
         (4, re.compile(rf"{_NAME}{{1,6}}(?:大樓|大廈|社區|中心|廣場|園區)")),
@@ -385,6 +426,7 @@ class TwAddressRecognizer(LocalRecognizer):
 
 
 # ── Secrets: verification code, password, crypto seed, private key ─────────────
+
 
 class TwVerificationCodeRecognizer(LocalRecognizer):
     """One-time verification codes (4-8 alphanumeric chars after a labelling keyword)."""
@@ -489,7 +531,13 @@ class TwCryptoSeedRecognizer(LocalRecognizer):
         r"(?:[a-z]{3,8}[ \t]+){11,23}[a-z]{3,8}", re.IGNORECASE
     )
     CONTEXT_KEYWORDS: ClassVar[list[str]] = [
-        "助記詞", "助记词", "種子詞", "种子词", "seed phrase", "mnemonic", "recovery phrase",
+        "助記詞",
+        "助记词",
+        "種子詞",
+        "种子词",
+        "seed phrase",
+        "mnemonic",
+        "recovery phrase",
     ]
 
     def __init__(self) -> None:

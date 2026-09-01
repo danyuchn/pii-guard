@@ -22,7 +22,12 @@ class TwMobileRecognizer(PatternRecognizer):
         Pattern("TW_MOBILE_DASHED", r"(?<!\d)09\d{2}[-\s]\d{3}[-\s]\d{3}(?!\d)", 0.9),
     ]
     CONTEXT: ClassVar[list[str]] = [
-        "手機", "行動電話", "手機號碼", "行動", "mobile", "cell",
+        "手機",
+        "行動電話",
+        "手機號碼",
+        "行動",
+        "mobile",
+        "cell",
     ]
 
     def __init__(self) -> None:
@@ -48,7 +53,14 @@ class TwLandlineRecognizer(PatternRecognizer):
         Pattern("TW_LANDLINE_HYPHEN", r"(?<!\d)0[2-8]-\d{7,8}(?!\d)", 0.85),
     ]
     CONTEXT: ClassVar[list[str]] = [
-        "電話", "市話", "辦公室", "公司電話", "聯絡電話", "分機", "phone", "tel",
+        "電話",
+        "市話",
+        "辦公室",
+        "公司電話",
+        "聯絡電話",
+        "分機",
+        "phone",
+        "tel",
     ]
 
     def __init__(self) -> None:

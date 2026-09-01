@@ -125,10 +125,7 @@ class TestCkipCombinedWithTwRegex:
         assert ckip_engine.deanonymize(anonymized, mapping) == original
 
     def test_person_org_nid_mobile_roundtrip(self, ckip_engine):
-        original = (
-            "員工陳雅琳，身分證A123456789，手機0912345678，"
-            "任職台積電，統一編號04595257。"
-        )
+        original = "員工陳雅琳，身分證A123456789，手機0912345678，任職台積電，統一編號04595257。"
         anonymized, mapping = ckip_engine.anonymize(original)
         assert "A123456789" not in anonymized
         assert "0912345678" not in anonymized

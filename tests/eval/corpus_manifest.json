@@ -1,0 +1,9 @@
+{
+  "name": "pii-guard-public-synthetic-v1",
+  "status": "public-synthetic",
+  "contains_private_data": false,
+  "source": "Hand-authored synthetic examples for regression testing; no customer or production documents.",
+  "annotation_schema": "exact UTF-8 character offsets with entity_type and text",
+  "corpus_file": "eval_corpus.json",
+  "sample_count": 53
+}
