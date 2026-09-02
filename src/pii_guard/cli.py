@@ -243,7 +243,10 @@ def build_parser() -> argparse.ArgumentParser:
 def _read_input(input_path: str) -> str:
     if input_path == "-":
         return sys.stdin.read()
-    return Path(input_path).read_text(encoding="utf-8")
+    # newline="" keeps the document's own line endings; the default universal
+    # newline mode would silently rewrite CRLF to LF before anonymization.
+    with open(input_path, encoding="utf-8", newline="") as handle:
+        return handle.read()
 
 
 def _write_output(text: str, output: Path | None) -> None:
@@ -251,7 +254,10 @@ def _write_output(text: str, output: Path | None) -> None:
         sys.stdout.write(text)
         sys.stdout.flush()
     else:
-        output.write_text(text, encoding="utf-8")
+        # The read path preserves the file's real line endings, so the write
+        # must not translate them again: on Windows the default newline mode
+        # turns a CRLF document into CRCRLF.
+        output.write_text(text, encoding="utf-8", newline="")
 
 
 def _write_quick_output(text: str, output: Path) -> None:
@@ -266,7 +272,7 @@ def _write_quick_output(text: str, output: Path) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(target, flags, 0o600)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
             descriptor = -1
             handle.write(text)
             handle.flush()

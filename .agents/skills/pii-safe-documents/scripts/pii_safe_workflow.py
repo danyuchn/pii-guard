@@ -334,9 +334,25 @@ def _pii_guard_python(project: Path) -> Path:
     return interpreter
 
 
+_LSOF_CANDIDATES: Final[tuple[str, ...]] = ("/usr/sbin/lsof", "/usr/bin/lsof")
+
+
+def _lsof_path() -> str:
+    """Return the first fixed lsof location present; never consult PATH.
+
+    macOS installs lsof under /usr/sbin, most Linux distributions under
+    /usr/bin.  Hard-coding only the first made every Linux audit fail closed
+    with LOCAL_MODEL_UNVERIFIED.
+    """
+    for candidate in _LSOF_CANDIDATES:
+        if os.path.isfile(candidate):
+            return candidate
+    raise SafeFailure("LOCAL_MODEL_UNVERIFIED", "Could not verify the local Ollama process.")
+
+
 def _verify_local_ollama_listener() -> None:
     command = [
-        "/usr/sbin/lsof",
+        _lsof_path(),
         "-nP",
         "-iTCP:11434",
         "-sTCP:LISTEN",

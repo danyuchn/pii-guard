@@ -560,3 +560,31 @@ def test_host_header_and_job_traversal_are_rejected(running_server) -> None:
     status, result = _request(base, "/api/jobs/../state")
     assert status in {400, 404}
     assert isinstance(result, dict)
+
+
+def test_idle_keepalive_connection_does_not_block_other_requests(running_server) -> None:
+    """One idle browser socket must not stall the next request for the idle timeout.
+
+    ``http.server.HTTPServer`` handles a single socket at a time; with HTTP/1.1
+    keep-alive that meant a speculative or post-load idle browser connection
+    blocked every other request for the full 10-second handler timeout.
+    """
+    import socket
+
+    base, _server, _store = running_server
+    host, port_text = base.split("//", 1)[1].split("/", 1)[0].split(":")
+    port = int(port_text)
+    token = base.rsplit("/", 1)[1]
+    idle = socket.create_connection((host, port))
+    try:
+        idle.sendall(f"GET /{token}/ HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode())
+        idle.settimeout(5)
+        assert idle.recv(65536).startswith(b"HTTP/1.1 200")
+        # Leave ``idle`` open and silent, then make an unrelated request.
+        started = time.monotonic()
+        status, _payload = _request(base, "/", timeout=5)
+        elapsed = time.monotonic() - started
+    finally:
+        idle.close()
+    assert status == 200
+    assert elapsed < 2.0, f"second request waited {elapsed:.2f}s behind an idle connection"

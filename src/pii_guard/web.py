@@ -308,8 +308,18 @@ class WebConfig:
     ollama_url: str | None = None
 
 
-class _SilentHTTPServer(http.server.HTTPServer):
-    """Keep parser/socket failures from writing request data to stderr."""
+class _SilentHTTPServer(http.server.ThreadingHTTPServer):
+    """Keep parser/socket failures from writing request data to stderr.
+
+    The server is threaded on purpose.  A single-threaded ``HTTPServer`` with
+    HTTP/1.1 keep-alive serves exactly one socket at a time, so one idle
+    browser connection (a speculative preconnect, or the socket left open
+    after the page load) blocks every other request for the whole 10-second
+    idle timeout.  ``LocalWebApplication`` guards all private state with its
+    own lock, so concurrent handler threads only overlap on request parsing.
+    """
+
+    daemon_threads = True
 
     def __init__(
         self,
@@ -438,10 +448,11 @@ def _error_status(error: WorkflowError) -> int:
 class LocalWebApplication:
     """Application object shared by the HTTP handler and integration tests.
 
-    The HTTP server is deliberately single-threaded.  Quick redaction happens
-    in its request as before; enhanced model work is handed to the injected
-    manager from a daemon thread so state polling, cancellation, and quick
-    requests remain responsive while the local model runs.
+    Every public method takes ``self.lock``, so the threaded HTTP server can
+    never run two store operations at once.  Quick redaction happens inside
+    its request; enhanced model work is handed to the injected manager from a
+    daemon thread so state polling, cancellation, and quick requests remain
+    responsive while the local model runs.
     """
 
     def __init__(

@@ -573,7 +573,11 @@ class AuditManager:
                     daemon=True,
                 )
                 process.start()
-            except (OSError, RuntimeError, TypeError, ValueError):
+            except Exception:
+                # Spawn pickles the attempt, config, and runner; a pickling
+                # failure surfaces as PicklingError or AttributeError, which
+                # the previous narrower clause let escape with the manifest
+                # stuck in "running" and both pipe ends still open.
                 if output_read is not None:
                     output_read.close()
                 if output_write is not None:

@@ -907,13 +907,21 @@ def test_existing_namespaced_literal_placeholder_roundtrips(tmp_path: Path) -> N
 def test_partial_review_commit_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A commit that fails before its journal is READY leaves the job untouched.
+
+    This used to assert that the job became permanently unloadable
+    (INTEGRITY_CHECK_FAILED).  Quick-mode commits now go through the journaled
+    ``_write_atomic_state``, so a failure must leave the previous generation
+    intact and loadable instead.
+    """
     store = _store(tmp_path)
     public = store.create_quick_from_text("未被規則抓到的張三要補遮。")
     job_id = str(public["job_id"])
+    before = store.public_state(job_id)
     original_write = local_workflow._write_private
 
     def fail_mapping_write(path: Path, data: str, *, replace: bool = False) -> None:
-        if replace and path.name == PRIVATE_MAP_NAME:
+        if path.name == f".new-{PRIVATE_MAP_NAME}":
             raise OSError("injected mapping commit failure")
         original_write(path, data, replace=replace)
 
@@ -922,8 +930,10 @@ def test_partial_review_commit_fails_closed(
         store.mask_terms(job_id, ["張三"])
     monkeypatch.undo()
 
-    with pytest.raises(WorkflowError, match="INTEGRITY_CHECK_FAILED"):
-        store.load_state(job_id)
+    after = store.public_state(job_id)
+    assert after == before
+    assert "張三" in str(after["anonymized_text"])
+    assert store.load_state(job_id).mapping == store.load_state(job_id).mapping
 
 
 def test_concurrent_mask_operations_preserve_both_updates(tmp_path: Path) -> None:
@@ -1023,3 +1033,58 @@ def test_manual_mask_batch_short_term_does_not_corrupt_new_marker(tmp_path: Path
     restored = store.restore_to_private(job_id)
     assert restored["roundtrip_equal"] is True
     assert (store.root / job_id / RESTORED_NAME).read_text(encoding="utf-8") == original
+
+
+def test_quick_mask_commit_rolls_back_when_a_state_write_is_interrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A quick-job manual mask must commit all three state files or none.
+
+    The quick path used three separate replace-in-place writes.  A failure (or
+    a kill) between them left the redacted text and the manifest digests
+    disagreeing, so the job could never be loaded or restored again.
+    """
+    store = PrivateJobStore(tmp_path / "jobs", engine=FakeEngine())
+    job_id = str(store.create_quick_from_text(ORIGINAL)["job_id"])
+    before = store.public_state(job_id)
+    real_replace = os.replace
+    failures = {"remaining": 1}
+
+    def flaky_replace(source: object, destination: object) -> None:
+        if Path(str(destination)).name == PRIVATE_MAP_NAME and failures["remaining"]:
+            failures["remaining"] -= 1
+            raise OSError("simulated interruption between state files")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(local_workflow.os, "replace", flaky_replace)
+    with pytest.raises(OSError, match="simulated interruption"):
+        store.mask_terms(job_id, ["聯絡人"])
+    monkeypatch.setattr(local_workflow.os, "replace", real_replace)
+
+    after = store.public_state(job_id)
+    assert after == before
+    assert "[[PII-" + job_id[:10] + "-MANUAL-1]]" not in str(after["anonymized_text"])
+    assert store.restore_to_private(job_id)["roundtrip_equal"] is True
+    leftovers = [entry.name for entry in (tmp_path / "jobs" / job_id).iterdir()]
+    assert not [name for name in leftovers if name.startswith(".txn-")]
+
+
+def test_cancelled_attempt_reports_cancellation_not_the_incidental_crash(tmp_path: Path) -> None:
+    """The monitor can observe the terminated child before cancel() publishes.
+
+    When a cancel is pending, whatever the monitor saw (a crash, a timeout) is
+    a side effect of the user's cancellation and must be published as such.
+    """
+    store = PrivateJobStore(tmp_path / "jobs", engine=FakeEngine())
+    job_id = str(store.prepare_enhanced_from_text(ORIGINAL)["job_id"])
+    attempt = store._begin_enhanced_attempt(job_id)
+    store._request_enhanced_cancel(job_id)
+
+    published = store._finish_enhanced_attempt(
+        attempt, status="failed", error_code="AUDIT_CRASHED"
+    )
+
+    assert published is True
+    state = store.public_state(job_id)
+    assert state["audit_status"] == "cancelled"
+    assert state["error_code"] == "AUDIT_CANCELLED"

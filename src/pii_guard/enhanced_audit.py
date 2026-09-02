@@ -51,9 +51,16 @@ _PROMPT_INJECTION_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     ),
     re.compile(r"(?:忽略|無視|覆蓋).{0,80}(?:指令|提示|規則|系統)", re.DOTALL),
     re.compile(r"(?:回傳|輸出|回答).{0,80}(?:空陣列|沒有實體|entities)", re.DOTALL),
+    # The closing group must name an actual suppression outcome.  An earlier
+    # version accepted any of 公開/忽略/沒有/不算/視為 on its own, which rejected
+    # ordinary privacy notices such as 「本公司將個資視為機密」 or 「請填寫姓名，
+    # 本表單資料不會公開」 and made the enhanced audit unusable on most contracts.
     re.compile(
-        r"(?:接下來|請|務必|不要|只要|將|把).{0,80}(?:姓名|個資|隱私|識別)"
-        r".{0,80}(?:公開|忽略|沒有|不算|視為)",
+        r"(?:接下來|請|務必|不要|只要|將|把|所有|全部|一律).{0,60}"
+        r"(?:姓名|人名|個資|個人資料|隱私|識別|實體)"
+        r".{0,60}(?:視為公開|當成公開|當作公開|視為非|不視為|不算個資|不是個資|非個資"
+        r"|不要遮|不用遮|不需遮|不必遮|無須遮|不要標|不用標|不需標|不必標"
+        r"|不要回傳|不用回傳|回傳空|回答沒有|回答無|忽略)",
         re.DOTALL,
     ),
     re.compile(
@@ -219,11 +226,25 @@ def _validate_loopback_url(value: str) -> urllib.parse.ParseResult:
     return parsed
 
 
+_LSOF_CANDIDATES: Final[tuple[str, ...]] = ("/usr/sbin/lsof", "/usr/bin/lsof")
+
+
+def _lsof_path() -> str:
+    """Return the first fixed lsof location present; never consult PATH."""
+
+    for candidate in _LSOF_CANDIDATES:
+        if os.path.isfile(candidate):
+            return candidate
+    raise AuditError("LOCAL_MODEL_UNVERIFIED", "Could not verify the local Ollama process.")
+
+
 def _verify_local_ollama_listener(parsed: urllib.parse.ParseResult) -> None:
     if sys.platform == "win32":
         raise AuditError("LOCAL_MODEL_UNVERIFIED", "Could not verify the local Ollama process.")
     port = parsed.port or 80
-    command = ["/usr/sbin/lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpcu"]
+    # macOS installs lsof under /usr/sbin; most Linux distributions use
+    # /usr/bin.  Hard-coding only the first made every Linux audit fail closed.
+    command = [_lsof_path(), "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpcu"]
     try:
         completed = subprocess.run(
             command,

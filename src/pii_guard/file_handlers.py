@@ -478,18 +478,36 @@ def _normalised_character_indices(
     return "".join(stream_parts), indices
 
 
-def _pdf_value_matches(
-    chars: Sequence[Mapping[str, object]], value: str
-) -> list[list[Mapping[str, object]]]:
-    """Return character groups for every occurrence of a value on a page."""
+@dataclass(frozen=True)
+class _PageCharIndex:
+    """NFKC streams for one page, built once and reused for every value."""
 
-    if not value:
-        _raise_file_error("PDF_REDACTION_UNRESOLVED")
+    stream: str
+    indices: list[int]
+    compact_stream: str
+    compact_indices: list[int]
+
+
+def _index_page_chars(chars: Sequence[Mapping[str, object]]) -> _PageCharIndex:
     stream, indices = _normalised_character_indices(chars)
-    needle = unicodedata.normalize("NFKC", value)
+    # Some producers omit layout whitespace from character streams. Keep a
+    # compact form as a conservative fallback while retaining coordinates.
+    compact_stream = "".join(char for char in stream if not char.isspace())
+    compact_indices = [
+        index for char, index in zip(stream, indices, strict=False) if not char.isspace()
+    ]
+    return _PageCharIndex(stream, indices, compact_stream, compact_indices)
+
+
+def _find_char_groups(
+    chars: Sequence[Mapping[str, object]],
+    stream: str,
+    indices: Sequence[int],
+    needle: str,
+) -> list[list[Mapping[str, object]]]:
     matches: list[list[Mapping[str, object]]] = []
     cursor = 0
-    while True:
+    while needle:
         found = stream.find(needle, cursor)
         if found < 0:
             break
@@ -497,26 +515,30 @@ def _pdf_value_matches(
         selected = sorted(set(indices[found:end]))
         matches.append([chars[index] for index in selected])
         cursor = end
+    return matches
+
+
+def _pdf_value_matches(
+    chars: Sequence[Mapping[str, object]],
+    value: str,
+    page_index: _PageCharIndex | None = None,
+) -> list[list[Mapping[str, object]]]:
+    """Return character groups for every occurrence of a value on a page.
+
+    ``page_index`` lets the writer normalise each page once instead of once
+    per mapped value; with fifty pages and a few hundred entities the repeated
+    per-character normalisation alone exceeded the worker's CPU limit.
+    """
+
+    if not value:
+        _raise_file_error("PDF_REDACTION_UNRESOLVED")
+    index = page_index if page_index is not None else _index_page_chars(chars)
+    needle = unicodedata.normalize("NFKC", value)
+    matches = _find_char_groups(chars, index.stream, index.indices, needle)
     if matches:
         return matches
-
-    # Some producers omit layout whitespace from character streams. Match a
-    # compact form as a conservative fallback while retaining coordinates.
-    compact_stream = "".join(char for char in stream if not char.isspace())
-    compact_indices = [
-        index for char, index in zip(stream, indices, strict=False) if not char.isspace()
-    ]
     compact_needle = "".join(char for char in needle if not char.isspace())
-    cursor = 0
-    while compact_needle:
-        found = compact_stream.find(compact_needle, cursor)
-        if found < 0:
-            break
-        end = found + len(compact_needle)
-        selected = sorted(set(compact_indices[found:end]))
-        matches.append([chars[index] for index in selected])
-        cursor = end
-    return matches
+    return _find_char_groups(chars, index.compact_stream, index.compact_indices, compact_needle)
 
 
 def _char_box(char: Mapping[str, object]) -> tuple[float, float, float, float] | None:
@@ -639,16 +661,18 @@ def _write_pdf_bytes(data: bytes, mapping: Mapping[str, str]) -> bytes:
                         _raise_file_error("PDF_OUTPUT_INVALID")
 
                     chars = [char for char in parsed_page.chars if isinstance(char, dict)]
+                    char_index = _index_page_chars(chars)
+                    draw = ImageDraw.Draw(image)
+                    x_scale = image.width / crop_width
+                    y_scale = image.height / crop_height
+                    padding_x = max(2.0, x_scale * 1.0)
+                    padding_y = max(2.0, y_scale * 1.0)
                     for placeholder, original in mapping_items:
-                        matches = _pdf_value_matches(chars, original)
+                        matches = _pdf_value_matches(chars, original, char_index)
                         if matches:
                             found_values.add(original)
                         for match in matches:
                             for x0, top, x1, bottom in _group_boxes(match):
-                                x_scale = image.width / crop_width
-                                y_scale = image.height / crop_height
-                                padding_x = max(2.0, x_scale * 1.0)
-                                padding_y = max(2.0, y_scale * 1.0)
                                 left = max(0.0, (x0 - crop_x0) * x_scale - padding_x)
                                 upper = max(0.0, (top - crop_top) * y_scale - padding_y)
                                 right = min(
@@ -658,7 +682,6 @@ def _write_pdf_bytes(data: bytes, mapping: Mapping[str, str]) -> bytes:
                                     float(image.height),
                                     (bottom - crop_top) * y_scale + padding_y,
                                 )
-                                draw = ImageDraw.Draw(image)
                                 draw.rectangle((left, upper, right, lower), fill="white")
                                 draw.rectangle((left, upper, right, lower), outline="black")
                                 draw.text(

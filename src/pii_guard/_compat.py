@@ -207,6 +207,11 @@ $rules = @($acl.GetAccessRules(
                     return False
             if current == profile:
                 return True
+            if current.parent == current:
+                # Reached the filesystem root without meeting the profile, so
+                # the jobs root is the profile itself or sits beside it.  Stop
+                # instead of spinning on a root whose parent is itself.
+                return False
             current = current.parent
 
     def secure_private_directory(path: Path, *, created: bool) -> None:

@@ -25,6 +25,32 @@
 
 ### 修正
 
+- **本機網頁改為多執行緒伺服器。** 原本的單執行緒 `HTTPServer` 搭配 HTTP/1.1 keep-alive，
+  瀏覽器只要留一條閒置連線（預連線或載入後未關閉的 socket），其他請求就要等滿 10 秒
+  閒置逾時才被處理；實測第二個請求延遲 9.7 秒。應用層本來就有鎖保護私有狀態，改用
+  `ThreadingHTTPServer` 後併發只發生在請求解析。
+- **加強稽核的中文注入偵測誤判修正。** 原本 `請…姓名…公開`、`將…個資…視為` 這類組合就會被判定為
+  指令注入，台灣常見的個資告知條款（「本公司將個資視為機密」「請填寫姓名，本表單資料不會公開」）
+  十句有五句被拒，加強模式對多數合約直接失效。結尾詞改為必須是實際的抑制動作
+  （視為公開、不算個資、不要遮、回傳空…），既有的注入測試案例維持被拒。
+- **加強稽核在 Linux 上永遠無法驗證 Ollama。** `lsof` 路徑寫死 `/usr/sbin/lsof`（macOS），
+  多數 Linux 發行版在 `/usr/bin/lsof`，導致每次都以 `LOCAL_MODEL_UNVERIFIED` 失敗。
+  改為依序嘗試兩個固定位置，仍不查 `PATH`；`pii-safe-documents` skill 腳本同一處一併修正。
+- **快速模式人工補遮改為原子提交。** 原本三個狀態檔分開寫入，中途失敗或被殺會讓 redacted、
+  mapping 與 manifest 的雜湊彼此不一致，該工作從此載入即 `INTEGRITY_CHECK_FAILED`、無法還原。
+  現在與加強模式一樣走 READY／COMMITTED 日誌，失敗時回滾到前一個完整世代。
+- **取消加強稽核時回報的錯誤碼。** `cancel()` 停掉子程序後，監看執行緒常搶先觀察到「崩潰」並發布
+  `AUDIT_CRASHED`；狀態雖正確為 `cancelled`，錯誤碼卻誤導。待取消狀態下一律發布 `AUDIT_CANCELLED`。
+- **CLI 純文字輸出仍會轉換換行。** 上一版只修了 `write_file` 的純文字路徑，但 `anonymize`／`restore`
+  對純文字檔實際走的是 CLI 自己的寫檔函式，Windows 上 CRLF 文件依然變成 CRCRLF；`quick -o`
+  同樣。三個路徑一併停用換行轉換，讀取端也改為保留原始換行。
+- PDF 去識別化輸出對每頁、每個對照值重複做整頁字元正規化，五十頁乘數百實體會超過 worker 的
+  10 秒 CPU 上限而失敗；改為每頁只建一次索引。
+- 加強稽核子程序啟動時若 pickling 失敗（`PicklingError`／`AttributeError`），先前的例外清單漏接，
+  manifest 會卡在 `running` 且管線兩端未關閉；改為一律轉成 `AUDIT_UNAVAILABLE` 並清理。
+- Windows 私有目錄父層 ACL 檢查在走到磁碟根目錄仍未遇到使用者設定檔時會無限迴圈；補上終止條件。
+- `_read_utf8` 單次 `os.read` 遇到短讀會靜默截斷來源文字；改為讀到 EOF 或上限為止。
+
 - **Windows：`.docx`／`.xlsx`／`.pdf` 讀寫修正。** `os.open` 在 Windows 預設是文字模式，
   讀檔會在第一個 `0x1A` 截斷、寫檔會把 LF 膨脹成 CRLF，導致多格式檔案被讀成數十位元組
   而以 `FILE_MALFORMED` 失敗，二進位輸出也會損毀。讀寫兩端都改為二進位模式，並補上

@@ -668,7 +668,18 @@ def _read_utf8(path: Path, *, max_bytes: int | None = MAX_INPUT_BYTES) -> str:
         current = os.fstat(descriptor)
         if not stat.S_ISREG(current.st_mode) or current.st_ino != info.st_ino:
             raise WorkflowError("INPUT_CHANGED", "Input changed during processing.")
-        data = os.read(descriptor, (max_bytes + 1) if max_bytes is not None else 1024 * 1024)
+        # A single os.read may return fewer bytes than requested on some file
+        # systems; a short read here would silently truncate the source text.
+        limit = (max_bytes + 1) if max_bytes is not None else 1024 * 1024
+        chunks: list[bytes] = []
+        total = 0
+        while total < limit:
+            chunk = os.read(descriptor, limit - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        data = b"".join(chunks)
     finally:
         os.close(descriptor)
     if max_bytes is not None and len(data) > max_bytes:
@@ -1930,7 +1941,12 @@ class PrivateJobStore:
             ):
                 return False
             if state.manifest.get("audit_status") == "cancel_requested" and status != "interrupted":
+                # A child stopped by cancel() usually dies before it can send a
+                # result, so the monitor observes a crash or timeout and races
+                # cancel() to publish it.  The user asked for the cancellation;
+                # publish that rather than the incidental failure code.
                 status = "cancelled"
+                error_code = "AUDIT_CANCELLED"
             candidate_redacted = state.redacted
             candidate_mapping = dict(state.mapping)
             if status == "passed":
@@ -2519,25 +2535,16 @@ class PrivateJobStore:
         history_list = list(history) if isinstance(history, list) else []
         history_list.append(dict(annotation))
         manifest["manual_annotations"] = history_list
-        if previous_mode == "enhanced":
-            _write_atomic_state(
-                state.job_dir,
-                redacted=redacted,
-                mapping=mapping,
-                manifest=manifest,
-            )
-        else:
-            _write_private(state.job_dir / REDACTED_NAME, redacted, replace=True)
-            _write_private(
-                state.job_dir / PRIVATE_MAP_NAME,
-                json.dumps(mapping, ensure_ascii=False, sort_keys=True),
-                replace=True,
-            )
-            _write_private(
-                state.job_dir / MANIFEST_NAME,
-                json.dumps(manifest, ensure_ascii=False, sort_keys=True),
-                replace=True,
-            )
+        # Quick jobs used three separate replace-in-place writes here.  A
+        # process killed between them left the redacted text, mapping, and
+        # manifest digests disagreeing, so the job could never be loaded or
+        # restored again.  Every mode now goes through the journaled commit.
+        _write_atomic_state(
+            state.job_dir,
+            redacted=redacted,
+            mapping=mapping,
+            manifest=manifest,
+        )
 
     def mask_terms(self, job_id: str, terms: Iterable[str]) -> dict[str, object]:
         cleaned = self._clean_terms(terms)
