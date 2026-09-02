@@ -269,7 +269,15 @@ def _write_quick_output(text: str, output: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.parent.is_symlink():
         raise OSError("quick output parent is a symlink")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    # O_BINARY: without it the Windows CRT expands LF to CRLF underneath the
+    # text layer, so newline="" alone is not enough to keep the bytes exact.
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     descriptor = os.open(target, flags, 0o600)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:

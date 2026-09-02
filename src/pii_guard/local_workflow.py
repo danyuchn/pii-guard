@@ -104,6 +104,7 @@ SAFE_AUDIT_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "LOCAL_AUDIT_INVALID",
         "LOCAL_AUDIT_UNRESOLVED",
         "LOCAL_AUDIT_RESIDUAL",
+        "LOCAL_AUDIT_SUPPRESSED",
         "ADVERSARIAL_INPUT_REVIEW_REQUIRED",
         "LEAKAGE_CHECK_FAILED",
         "INVALID_MAPPING",
@@ -216,8 +217,40 @@ def default_jobs_root() -> Path:
     return (Path.home() / ".local/share/pii-safe-documents/jobs").resolve()
 
 
+# Windows opens os.open descriptors in text mode unless O_BINARY is set: the
+# CRT then rewrites CRLF to LF and stops at the first 0x1A.  Private state must
+# be read exactly as written.
+_PRIVATE_READ_FLAGS: Final[int] = (
+    os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+)
+# Jobs written by earlier Windows builds carry LF-to-CRLF translated text whose
+# manifest digests were computed on the untranslated string.  Only that
+# platform ever produced such files, so only it accepts the translated form.
+_LEGACY_TEXT_MODE_FALLBACK: Final[bool] = sys.platform == "win32"
+
+
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _text_matching_digest(manifest: Mapping[str, object], key: str, text: str) -> str:
+    """Return ``text`` in the form whose digest the manifest recorded.
+
+    Byte-faithful state matches directly.  A file written by a pre-byte-faithful
+    Windows build had every LF expanded to CRLF on disk while its digest was
+    taken from the in-memory text; undoing that translation is the only
+    transformation accepted, and only when the digest then matches exactly.
+    Anything else is returned unchanged so the caller's strict check fails.
+    """
+
+    expected = manifest.get(key)
+    if expected == _sha256_text(text):
+        return text
+    if _LEGACY_TEXT_MODE_FALLBACK and "\r\n" in text:
+        candidate = text.replace("\r\n", "\n")
+        if expected == _sha256_text(candidate):
+            return candidate
+    return text
 
 
 def _mapping_text(mapping: Mapping[str, str]) -> str:
@@ -485,7 +518,11 @@ def _write_private(path: Path, data: str, *, replace: bool = False) -> None:
     temporary = Path(temporary_name)
     try:
         set_descriptor_mode(descriptor, PRIVATE_MODE)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        # newline="" keeps the file byte-faithful.  mkstemp already opens the
+        # descriptor in binary mode on Windows; without this the text layer
+        # still turned every LF into CRLF and the digests only matched because
+        # the reader used to translate it back.
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
             descriptor = -1
             handle.write(data)
             handle.flush()
@@ -516,7 +553,7 @@ def _read_private_bytes(path: Path) -> bytes:
     """Read one already-validated private file without exposing its contents."""
 
     _assert_owner_mode(path, PRIVATE_MODE, directory=False)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = _PRIVATE_READ_FLAGS
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
@@ -659,7 +696,7 @@ def _read_utf8(path: Path, *, max_bytes: int | None = MAX_INPUT_BYTES) -> str:
         raise WorkflowError("INPUT_NOT_FOUND", "Input path must be a regular file.")
     if max_bytes is not None and info.st_size > max_bytes:
         raise WorkflowError("INPUT_TOO_LARGE", "Input exceeds the safety size limit.")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = _PRIVATE_READ_FLAGS
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
@@ -2246,8 +2283,10 @@ class PrivateJobStore:
         if any(not key.startswith(marker_prefix) for key in mapping):
             raise WorkflowError("INVALID_MAPPING", "Private mapping belongs to another job.")
         source = job_dir / SOURCE_NAME
-        original = _read_utf8(source)
-        redacted = _read_utf8(job_dir / REDACTED_NAME)
+        original = _text_matching_digest(raw_manifest, "original_sha256", _read_utf8(source))
+        redacted = _text_matching_digest(
+            raw_manifest, "redacted_sha256", _read_utf8(job_dir / REDACTED_NAME)
+        )
         if raw_manifest.get("original_path") != str(source):
             raise WorkflowError("INVALID_JOB", "Private job source provenance is invalid.")
         if raw_manifest.get("original_sha256") != _sha256_text(original):

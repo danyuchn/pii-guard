@@ -1080,11 +1080,59 @@ def test_cancelled_attempt_reports_cancellation_not_the_incidental_crash(tmp_pat
     attempt = store._begin_enhanced_attempt(job_id)
     store._request_enhanced_cancel(job_id)
 
-    published = store._finish_enhanced_attempt(
-        attempt, status="failed", error_code="AUDIT_CRASHED"
-    )
+    published = store._finish_enhanced_attempt(attempt, status="failed", error_code="AUDIT_CRASHED")
 
     assert published is True
     state = store.public_state(job_id)
     assert state["audit_status"] == "cancelled"
     assert state["error_code"] == "AUDIT_CANCELLED"
+
+
+def test_private_files_round_trip_crlf_and_control_bytes_exactly(tmp_path: Path) -> None:
+    """Private state must be written and read byte-for-byte on every platform.
+
+    Windows used to expand LF to CRLF on write and fold it back on read (and
+    stop at 0x1A), so the digests only matched because both translations
+    cancelled out.
+    """
+    text = "第一行\r\n第二行\n\x1a尾巴\rend"
+    target = tmp_path / "probe.private.txt"
+
+    local_workflow._write_private(target, text)
+
+    assert target.read_bytes() == text.encode("utf-8")
+    assert local_workflow._read_utf8(target) == text
+    assert local_workflow._read_private_bytes(target) == text.encode("utf-8")
+
+
+def test_legacy_windows_text_mode_jobs_still_load_and_migrate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Jobs written by a pre-byte-faithful Windows build keep working there.
+
+    Their source and redacted files carry LF expanded to CRLF while the
+    manifest digests were taken from the untranslated text.  Only Windows
+    accepts that form, and only when the digest then matches exactly.
+    """
+    store = PrivateJobStore(tmp_path / "jobs", engine=FakeEngine())
+    job_id = str(store.create_quick_from_text("聯絡人王小明\n第二行\n第三行\n")["job_id"])
+    expected = store.public_state(job_id)
+    job_dir = tmp_path / "jobs" / job_id
+    for name in (SOURCE_NAME, REDACTED_NAME):
+        path = job_dir / name
+        path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+
+    monkeypatch.setattr(local_workflow, "_LEGACY_TEXT_MODE_FALLBACK", False)
+    with pytest.raises(WorkflowError, match="ORIGINAL_CHANGED"):
+        store.public_state(job_id)
+
+    monkeypatch.setattr(local_workflow, "_LEGACY_TEXT_MODE_FALLBACK", True)
+    assert store.public_state(job_id) == expected
+
+    # A later commit rewrites the redacted text byte-faithfully while the
+    # untouched source stays in the legacy form; both must keep loading.
+    masked = store.mask_terms(job_id, ["第二行"])
+    assert masked["terms_masked"] == 1
+    assert b"\r\n" not in (job_dir / REDACTED_NAME).read_bytes()
+    assert b"\r\n" in (job_dir / SOURCE_NAME).read_bytes()
+    assert store.restore_to_private(job_id)["roundtrip_equal"] is True
