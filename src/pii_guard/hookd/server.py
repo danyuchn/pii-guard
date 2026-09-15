@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Final
 
-from pii_guard.hookd import hooks
+from pii_guard.hookd import hooks, policy
 from pii_guard.hookd.core import MAX_TEXT_BYTES, SessionStore, validate_session_id
 from pii_guard.local_workflow import WorkflowError
 
@@ -53,11 +53,18 @@ class HookdApplication:
         engine_name: str,
         *,
         engine_fallback: bool = False,
+        policy_config: policy.PolicyConfig | None = None,
+        seed_terms: tuple[tuple[str, str], ...] = (),
     ) -> None:
         self._store = store
         self._engine_name = engine_name
         self._engine_fallback = engine_fallback
-        self._context = hooks.HookContext(names_covered=engine_name == "full")
+        self._policy = policy_config or policy.PolicyConfig()
+        self._context = hooks.HookContext(
+            names_covered=engine_name == "full",
+            policy=self._policy,
+            seed_terms=seed_terms,
+        )
         self._lock = threading.Lock()
 
     @property
@@ -70,6 +77,7 @@ class HookdApplication:
             "engine": self._engine_name,
             "engine_fallback": self._engine_fallback,
             "names_covered": self._context.names_covered,
+            "policy": self._policy.describe(),
             "sessions": len(self._store.summary()),
             "version": SERVICE_VERSION,
         }

@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Protocol
@@ -286,6 +286,53 @@ class SessionRedactor:
                 "mapping": dict(self.mapping),
                 "updated_at": time.time(),
             }
+
+    def placeholders(self) -> tuple[str, ...]:
+        """Every marker this session has issued."""
+
+        with self._lock:
+            return tuple(self.mapping)
+
+    def seed(self, terms: Iterable[tuple[str, str]]) -> int:
+        """Pre-load known values so the sweep masks them from the first read.
+
+        Detection is context sensitive and misses nicknames and unusual
+        spellings entirely.  A project can name those up front.
+        """
+
+        added = 0
+        with self._lock:
+            for entity_type, value in terms:
+                if not value or value in self.reverse:
+                    continue
+                self._allocate_locked(entity_type or "PERSON", value)
+                added += 1
+        return added
+
+    def detect(self, text: str) -> dict[str, int]:
+        """Report what PII is in *text* without learning anything from it.
+
+        Used for the prompt the user is about to send: the session must not
+        gain placeholders from text that is going to be refused anyway.
+        """
+
+        if not text:
+            return {}
+        probe = SessionRedactor(
+            session_id=self.session_id,
+            engine=self.engine,
+            mapping=dict(self.mapping),
+            reverse=dict(self.reverse),
+            counters=dict(self.counters),
+        )
+        before = probe._counts_for(text)
+        after = probe.redact(text).counts
+        found = {}
+        for entity_type, count in after.items():
+            delta = count - before.get(entity_type, 0)
+            if delta > 0:
+                found[entity_type] = delta
+        return found
 
     def placeholder_count(self) -> int:
         with self._lock:

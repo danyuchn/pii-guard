@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Final, cast
 
 from pii_guard.hookd import install as installer
+from pii_guard.hookd import policy
 from pii_guard.hookd.core import SessionStore, create_engine_with_fallback
 from pii_guard.hookd.server import HookdApplication, HookdServerConfig, create_server
 from pii_guard.hookd.state import HookdConfig, clear_state, read_state, write_state
@@ -83,12 +84,20 @@ def _serve_foreground(
     port: int,
     session_ttl_days: float,
 ) -> int:
+    policy_config = _load_policy()
+    seed_terms = policy.load_seed_terms(policy_config.seed_terms_files)
     engine, loaded_engine, fallback = create_engine_with_fallback(engine_name)
     store = SessionStore(config, engine)
     # Old mappings are the only thing that can undo a placeholder, so they are
     # swept before the service starts answering.
     expired = store.sweep_expired(session_ttl_days)
-    app = HookdApplication(store, loaded_engine, engine_fallback=fallback)
+    app = HookdApplication(
+        store,
+        loaded_engine,
+        engine_fallback=fallback,
+        policy_config=policy_config,
+        seed_terms=seed_terms,
+    )
     server, token, bound_port = create_server(app, HookdServerConfig(port=port))
     write_state(
         config,
@@ -112,10 +121,11 @@ def _serve_foreground(
         signal.signal(received, _stop)
 
     names = "names covered" if loaded_engine == "full" else "names NOT covered"
+    seeds = f", {len(seed_terms)} seed term(s)" if seed_terms else ""
     swept = f", swept {expired} expired session(s)" if expired else ""
     print(
         f"pii-guard hookd listening on 127.0.0.1:{bound_port} "
-        f"(engine: {loaded_engine}, {names}{swept})"
+        f"(engine: {loaded_engine}, {names}{seeds}{swept})"
     )
     sys.stdout.flush()
     try:
@@ -262,6 +272,19 @@ def cmd_purge(args: argparse.Namespace, config: HookdConfig) -> int:
     # Files belonging to sessions the running service never loaded stay behind.
     _purge_offline(config, None if args.all else args.session_id)
     return 0
+
+
+def _load_policy() -> policy.PolicyConfig:
+    """Read the policy the installer wrote, if there is one."""
+
+    path = installer.hookd_config_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return policy.PolicyConfig()
+    if not isinstance(payload, dict):
+        return policy.PolicyConfig()
+    return policy.PolicyConfig.from_mapping(payload.get("policy"))
 
 
 def _start_now(config: HookdConfig, repo: Path, engine: str) -> None:

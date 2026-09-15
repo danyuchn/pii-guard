@@ -7,19 +7,23 @@ client should print, or an empty object when there is nothing to change.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Final
 
+from pii_guard.hookd import policy
 from pii_guard.hookd.core import SessionRedactor, SessionStore
 
 POST_TOOL_USE: Final[str] = "PostToolUse"
 PRE_TOOL_USE: Final[str] = "PreToolUse"
 MESSAGE_DISPLAY: Final[str] = "MessageDisplay"
 SESSION_START: Final[str] = "SessionStart"
+USER_PROMPT_SUBMIT: Final[str] = "UserPromptSubmit"
 
 SUPPORTED_EVENTS: Final[frozenset[str]] = frozenset(
-    {POST_TOOL_USE, PRE_TOOL_USE, MESSAGE_DISPLAY, SESSION_START}
+    {POST_TOOL_USE, PRE_TOOL_USE, MESSAGE_DISPLAY, SESSION_START, USER_PROMPT_SUBMIT}
 )
 
 # Read results carry the file text under "file"; image reads use a different
@@ -33,6 +37,8 @@ class HookContext:
     """What the handlers need to know about the running service."""
 
     names_covered: bool = False
+    policy: policy.PolicyConfig = field(default_factory=policy.PolicyConfig)
+    seed_terms: tuple[tuple[str, str], ...] = ()
 
 
 NAMES_COVERED_MESSAGE: Final[str] = "pii-guard: on (full engine, names covered)"
@@ -61,6 +67,14 @@ SESSION_START_CONTEXT: Final[str] = (
 
 def _hook_output(event_name: str, **fields: object) -> dict[str, object]:
     return {"hookSpecificOutput": {"hookEventName": event_name, **fields}}
+
+
+def _deny(reason: str) -> dict[str, object]:
+    return _hook_output(
+        PRE_TOOL_USE,
+        permissionDecision="deny",
+        permissionDecisionReason=reason,
+    )
 
 
 def _redact(redactor: SessionRedactor, text: str) -> tuple[str, bool]:
@@ -127,7 +141,9 @@ def _handle_read(redactor: SessionRedactor, response: Mapping[str, Any]) -> dict
 
 
 def _handle_bash_output(
-    redactor: SessionRedactor, response: Mapping[str, Any]
+    redactor: SessionRedactor,
+    response: Mapping[str, Any],
+    context: HookContext,
 ) -> dict[str, object]:
     updated = dict(response)
     changed = False
@@ -136,6 +152,21 @@ def _handle_bash_output(
         if isinstance(value, str):
             updated[key], field_changed = _redact(redactor, value)
             changed = changed or field_changed
+
+    # Content the guard cannot read is content it cannot de-identify, so an
+    # encoded blob is withheld whole rather than passed through unexamined.
+    if context.policy.output_gate and any(
+        isinstance(updated.get(key), str) and policy.looks_encoded(str(updated[key]))
+        for key in ("stdout", "stderr")
+    ):
+        withheld = dict(response)
+        withheld["stdout"] = policy.OUTPUT_WITHHELD
+        withheld["stderr"] = ""
+        return _hook_output(
+            POST_TOOL_USE,
+            updatedToolOutput=withheld,
+            additionalContext=policy.OUTPUT_WITHHELD_CONTEXT,
+        )
     if not changed:
         return {}
     return _hook_output(POST_TOOL_USE, updatedToolOutput=updated)
@@ -146,7 +177,6 @@ def handle_post_tool_use(
 ) -> dict[str, object]:
     """De-identify what a tool result would otherwise put into the context."""
 
-    del context
     tool_name = payload.get("tool_name")
     response = payload.get("tool_response")
     if not isinstance(tool_name, str) or not isinstance(response, Mapping):
@@ -155,7 +185,7 @@ def handle_post_tool_use(
     if tool_name == "Read":
         reply = _handle_read(redactor, response)
     elif tool_name == "Bash":
-        reply = _handle_bash_output(redactor, response)
+        reply = _handle_bash_output(redactor, response, context)
     else:
         updated, changed = _redact_string_leaves(redactor, dict(response))
         reply = _hook_output(POST_TOOL_USE, updatedToolOutput=updated) if changed else {}
@@ -207,12 +237,24 @@ def handle_pre_tool_use(
 ) -> dict[str, object]:
     """Put real values back before Claude writes them to disk or to a shell."""
 
-    del context
     tool_name = payload.get("tool_name")
     tool_input = payload.get("tool_input")
     if not isinstance(tool_name, str) or not isinstance(tool_input, Mapping):
         return {}
+
+    egress = policy.egress_tool_decision(tool_name, tool_input, context.policy)
+    if egress is not None:
+        return _deny(egress)
+
     redactor = store.get(str(payload.get("session_id", "")))
+    if tool_name == "Bash":
+        command = tool_input.get("command")
+        if isinstance(command, str):
+            refusal = policy.bash_command_decision(
+                command, redactor.placeholders(), context.policy
+            )
+            if refusal is not None:
+                return _deny(refusal)
     updated, changed = _restore_tool_input(redactor, tool_name, tool_input)
     if not changed:
         return {}
@@ -236,16 +278,81 @@ def handle_message_display(
     return _hook_output(MESSAGE_DISPLAY, displayContent=restored)
 
 
+# An @ reference pulls a file straight into the prompt with no tool call, so
+# no hook ever sees it.  The only defence is to refuse the prompt.
+_AT_REFERENCE_PATTERN: Final[re.Pattern[str]] = re.compile(r"@([^\s]+)")
+_TRAILING_PUNCTUATION: Final[str] = ".,;:!?)]}'\"，。、！？）】」"
+
+
+def _referenced_file(reference: str, cwd: str) -> Path | None:
+    """Resolve an @ reference to an existing file, or ``None``."""
+
+    cleaned = reference.rstrip(_TRAILING_PUNCTUATION)
+    if not cleaned:
+        return None
+    candidate = Path(cleaned).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(cwd or ".") / candidate
+    try:
+        # Directories are fine: Claude Code lists them, it does not inline them.
+        return candidate if candidate.is_file() else None
+    except OSError:
+        return None
+
+
+def _block(reason: str) -> dict[str, object]:
+    return {"decision": "block", "reason": reason}
+
+
+def handle_user_prompt_submit(
+    store: SessionStore, payload: Mapping[str, Any], context: HookContext
+) -> dict[str, object]:
+    """Refuse a prompt that would carry real data past every other hook."""
+
+    del context
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return {}
+    cwd = str(payload.get("cwd", ""))
+
+    for reference in _AT_REFERENCE_PATTERN.findall(prompt):
+        path = _referenced_file(reference, cwd)
+        if path is not None:
+            return _block(
+                "pii-guard: @file references bypass the guard. "
+                f"Ask me to Read the file instead: {path}"
+            )
+
+    redactor = store.get(str(payload.get("session_id", "")))
+    found = redactor.detect(prompt)
+    if not found:
+        return {}
+    # Report what kind of data and how much, never the data itself.
+    summary = ", ".join(f"{count} {name}" for name, count in sorted(found.items()))
+    return _block(
+        f"pii-guard: this prompt contains personal data ({summary}). "
+        "Put it in a file and ask me to read that file, so it can be "
+        "de-identified before it reaches the model."
+    )
+
+
 def handle_session_start(
     store: SessionStore, payload: Mapping[str, Any], context: HookContext
 ) -> dict[str, object]:
     """Tell the model that placeholders are expected and must be preserved."""
 
-    del store, payload
+    seeded = 0
+    if context.seed_terms:
+        redactor = store.get(str(payload.get("session_id", "")))
+        seeded = redactor.seed(context.seed_terms)
+        if seeded:
+            store.save(redactor)
     extra = "" if context.names_covered else NAMES_UNCOVERED_CONTEXT
+    # The count is safe to show; the terms themselves never leave the service.
+    seeds = f", {seeded} seed terms loaded" if seeded else ""
     return {
         "systemMessage": (
-            NAMES_COVERED_MESSAGE if context.names_covered else NAMES_UNCOVERED_MESSAGE
+            (NAMES_COVERED_MESSAGE if context.names_covered else NAMES_UNCOVERED_MESSAGE) + seeds
         ),
         "hookSpecificOutput": {
             "hookEventName": SESSION_START,
@@ -256,6 +363,7 @@ def handle_session_start(
 
 _HANDLERS: Final[dict[str, Any]] = {
     POST_TOOL_USE: handle_post_tool_use,
+    USER_PROMPT_SUBMIT: handle_user_prompt_submit,
     PRE_TOOL_USE: handle_pre_tool_use,
     MESSAGE_DISPLAY: handle_message_display,
     SESSION_START: handle_session_start,
