@@ -147,6 +147,8 @@ ollama pull ornith-1.5:9b
 
 想把保護擴到「Claude Code 每一次工具讀取」而不只是單份文件，跑 `uv run pii-guard-hookd install` 裝上常駐服務 hookd 與其 classic hooks，說明見 [`examples/claude-code-hookd/`](examples/claude-code-hookd/)。
 
+同一個服務另有一個 Claude Mods 前端，用 `uv run pii-guard-hookd install --mod` 安裝。規則與涵蓋範圍一樣，但它的攔截點跑在 Edit 自己比對 `old_string` 之前，所以帶佔位符的 Edit 不會再失敗；prompt 也從「整則擋掉」改成「改寫」。說明見 [`examples/claude-code-mod/`](examples/claude-code-mod/)。
+
 ### 三個步驟
 
 ```bash

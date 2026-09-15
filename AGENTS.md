@@ -49,8 +49,8 @@ uv run mypy src/
 uv run ruff check src/
 
 # 常駐 hook 去識別化服務（install 會併好 settings 並自動啟動）
-uv run pii-guard-hookd install [--engine full|regex] [--scope user|project] [--no-launchd] [--harden]
-uv run pii-guard-hookd doctor | uninstall
+uv run pii-guard-hookd install [--engine full|regex] [--scope user|project] [--no-launchd] [--harden] [--mod]
+uv run pii-guard-hookd doctor [--harden] [--mod] | uninstall
 uv run pii-guard-hookd serve [--engine full|regex] [--foreground] [--session-ttl-days N]
 uv run pii-guard-hookd status | stop | purge [session_id|--all]
 ```
@@ -80,6 +80,7 @@ uv run pii-guard-hookd status | stop | purge [session_id|--all]
 - **Phase 5** ✅：`pii-safe-documents` skill（顯式觸發、可逆、主 agent 隔離）。早期的 PreToolUse hook 已退役，見 `examples/claude-code-hook/`。
 - **Phase 6** ✅ 2026-03-31：多格式檔案支援（xlsx/docx/pdf）CLI + MCP，file_handlers 模組，MIT LICENSE
 - **Phase 7** 已完成：`src/pii_guard/hookd/` 常駐 loopback 服務＋classic hooks，工具輸出進模型前遮蔽、寫回時還原，連不到服務就擋住（設計與涵蓋範圍見 `examples/claude-code-hookd/README.md`）
+- **Phase 8** 已完成：`examples/claude-code-mod/` Claude Mods 前端（function hooks）。同一個服務、同一套規則，但 `tool.call` 跑在 Edit 驗證之前，補掉 classic hooks 的 Edit 缺口；prompt 由「整則擋掉」改成「改寫」。安裝用 `install --mod`，只有 MessageDisplay 仍是 classic hook（function hook API 沒有對應事件）。設計、限制與事前驗證見 `examples/claude-code-mod/README.md`
 
 ### Recall Benchmark（2026-03-31 真實文件測試）
 - 格式化 PII（身分證/手機/Email/市話/車牌/生日/銀行帳號）：~95%
