@@ -18,6 +18,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Final, cast
 
 from pii_guard.hookd import install as installer
@@ -263,10 +264,25 @@ def cmd_purge(args: argparse.Namespace, config: HookdConfig) -> int:
     return 0
 
 
+def _start_now(config: HookdConfig, repo: Path, engine: str) -> None:
+    """Leave the service running, so install never ends on a dead guard."""
+
+    if installer.service_health(config) is not None:
+        print("Service: already running.")
+        return
+    if not installer.start_service_detached(repo, engine):
+        print("Service: could not be started; it will start at the next session.")
+        return
+    wait = " (the full engine loads a model, so this can take a while)" if engine == "full" else ""
+    print(f"Starting the service{wait}...")
+    if installer.wait_for_health(config) is None:
+        print("Service: still loading; it will be ready shortly.")
+
+
 def _report(results: list[installer.CheckResult]) -> int:
     for result in results:
         print(result.render())
-    failed = [result for result in results if not result.ok]
+    failed = [result for result in results if not result.ok and not result.warn]
     if failed:
         print(f"\n{len(failed)} check(s) failed.")
         return 1
@@ -276,6 +292,9 @@ def _report(results: list[installer.CheckResult]) -> int:
 
 def cmd_install(args: argparse.Namespace, config: HookdConfig) -> int:
     config_dir = installer.claude_config_dir()
+    # Create the private directories before anything writes into them, so they
+    # are owner-only from the first moment rather than tightened later.
+    config.ensure_home()
     settings_file = installer.settings_path(config_dir, args.scope)
     # Parse before touching anything: a settings file we cannot read must be
     # left exactly as it is rather than replaced with our block alone.
@@ -299,8 +318,8 @@ def cmd_install(args: argparse.Namespace, config: HookdConfig) -> int:
     if args.no_launchd or sys.platform != "darwin":
         reason = "skipped" if args.no_launchd else "not macOS"
         print(f"Auto-start agent: {reason}; the hook client starts the service on demand.")
+        _start_now(config, repo, args.engine)
     else:
-        config.ensure_home()
         plist = installer.launch_agent_path()
         installer.write_launch_agent(plist, installer.serve_command(repo, args.engine), config.home)
         loaded, detail = installer.load_launch_agent(plist)
@@ -308,6 +327,8 @@ def cmd_install(args: argparse.Namespace, config: HookdConfig) -> int:
         if loaded:
             print("Waiting for the service to answer...")
             installer.wait_for_health(config)
+        else:
+            _start_now(config, repo, args.engine)
 
     print()
     return _report(installer.doctor(config, config_dir, installer_config, args.scope))

@@ -34,8 +34,12 @@ def env(tmp_path, monkeypatch) -> dict[str, Path]:
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
     monkeypatch.setenv("PII_GUARD_HOOKD_HOME", str(hookd_home))
     monkeypatch.setenv("PII_GUARD_HOOKD_CONFIG", str(installer_config))
-    # Never touch real launchd.
+    # Never touch real launchd, and never spawn a real service: these tests
+    # are about the installer, and a real engine load would take a minute.
     monkeypatch.setattr(installer, "run_launchctl", lambda arguments: (0, "fake"))
+    monkeypatch.setattr(installer, "start_service_detached", lambda repo, engine: False)
+    monkeypatch.setattr(installer, "wait_for_health", lambda config, timeout=90.0: None)
+    monkeypatch.setattr(installer, "service_health", lambda config, timeout=5.0: None)
     return {
         "config_dir": config_dir,
         "hookd_home": hookd_home,
@@ -53,7 +57,7 @@ def _settings(path: Path) -> dict:
 
 
 def test_install_into_a_fresh_config(env, capsys) -> None:
-    assert _install() == 1  # doctor fails: no service is running
+    assert _install() == 0
 
     settings = _settings(env["settings"])
     assert sorted(settings["hooks"]) == [
@@ -183,18 +187,16 @@ def test_doctor_reports_each_missing_piece(env, capsys) -> None:
     assert "[FAIL] service" in output
 
 
-def test_doctor_passes_everything_but_the_service_after_install(env, capsys) -> None:
+def test_doctor_passes_after_install(env, capsys) -> None:
     _install()
     capsys.readouterr()
 
-    assert main(["doctor"]) == 1
+    assert main(["doctor"]) == 0
 
     output = capsys.readouterr().out
     assert "[OK  ] hook client" in output
     assert "[OK  ] hooks in settings" in output
     assert "[OK  ] installer config" in output
-    # The service is genuinely not running in this test.
-    assert "[FAIL] service" in output
 
 
 def test_doctor_reports_a_running_service_and_its_engine(env, capsys, monkeypatch) -> None:
@@ -295,3 +297,100 @@ def test_session_store_permissions_are_checked(env, monkeypatch, capsys) -> None
 
     assert "[FAIL] session store" in capsys.readouterr().out
     config.sessions_dir.chmod(0o700)
+
+
+def test_install_creates_owner_only_directories_from_the_start(env, tmp_path) -> None:
+    """The enclosing directory must not be world-readable even for a moment."""
+
+    nested = tmp_path / "share" / "pii-guard" / "hookd"
+    HookdConfig(home=nested).ensure_home()
+
+    assert stat.S_IMODE(nested.stat().st_mode) == 0o700
+    assert stat.S_IMODE(nested.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE((nested / "sessions").stat().st_mode) == 0o700
+
+
+def test_ensure_home_leaves_pre_existing_directories_alone(tmp_path) -> None:
+    shared = tmp_path / "share"
+    shared.mkdir(mode=0o755)
+
+    HookdConfig(home=shared / "pii-guard" / "hookd").ensure_home()
+
+    # A directory that was already there is not ours to tighten.
+    assert stat.S_IMODE(shared.stat().st_mode) == 0o755
+    assert stat.S_IMODE((shared / "pii-guard").stat().st_mode) == 0o700
+
+
+def test_install_leaves_the_hookd_home_owner_only(env) -> None:
+    _install()
+
+    home = env["hookd_home"]
+    assert stat.S_IMODE(home.stat().st_mode) == 0o700
+    assert stat.S_IMODE((home / "sessions").stat().st_mode) == 0o700
+
+
+def test_install_starts_the_service_without_launchd(env, monkeypatch, capsys) -> None:
+    started: list[list[str]] = []
+
+    def fake_start(repo, engine):
+        started.append(installer.detached_serve_command(repo, engine))
+        return True
+
+    monkeypatch.setattr(installer, "start_service_detached", fake_start)
+    monkeypatch.setattr(
+        installer,
+        "wait_for_health",
+        lambda config, timeout=90.0: {"sessions": 0, "names_covered": True},
+    )
+    monkeypatch.setattr(
+        installer,
+        "service_health",
+        lambda config, timeout=5.0: (
+            {"sessions": 0, "names_covered": True, "engine_fallback": False} if started else None
+        ),
+    )
+
+    assert main(["install", "--no-launchd"]) == 0
+
+    assert len(started) == 1
+    # The detached command must not carry launchd's foreground flag.
+    assert "--foreground" not in started[0]
+    assert "Starting the service" in capsys.readouterr().out
+
+
+def test_install_does_not_restart_a_running_service(env, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        installer,
+        "service_health",
+        lambda config, timeout=5.0: {
+            "sessions": 1,
+            "names_covered": True,
+            "engine_fallback": False,
+        },
+    )
+    monkeypatch.setattr(
+        installer,
+        "start_service_detached",
+        lambda repo, engine: pytest.fail("should not spawn a second service"),
+    )
+
+    assert main(["install", "--no-launchd"]) == 0
+    assert "already running" in capsys.readouterr().out
+
+
+def test_doctor_warns_rather_than_fails_when_the_service_is_idle(env, capsys) -> None:
+    _install()
+    capsys.readouterr()
+
+    # The installer config exists, so something will start it at the next
+    # session; that is a warning, not a broken installation.
+    assert main(["doctor"]) == 0
+
+    output = capsys.readouterr().out
+    assert "[WARN] service: not running (starts on demand at next session)" in output
+    assert "Everything checks out" in output
+
+
+def test_doctor_still_fails_when_nothing_would_start_the_service(env, capsys) -> None:
+    assert main(["doctor"]) == 1
+    assert "[FAIL] service: not reachable" in capsys.readouterr().out

@@ -62,10 +62,23 @@ class HookdConfig:
         return self.home / SESSIONS_DIR_NAME
 
     def ensure_home(self) -> None:
-        """Create the owner-only home and sessions directories."""
+        """Create the owner-only home and sessions directories.
 
-        self.home.mkdir(parents=True, exist_ok=True, mode=JOB_MODE)
-        self.sessions_dir.mkdir(parents=True, exist_ok=True, mode=JOB_MODE)
+        Every directory this creates is owner-only from the moment it exists.
+        ``mkdir(parents=True)`` would give the intermediate directories the
+        default permissions instead, leaving the enclosing directory
+        world-readable, so the missing ancestors are created one at a time.
+        Directories that already existed are left exactly as they are.
+        """
+
+        for path in (self.home, self.sessions_dir):
+            missing = [
+                ancestor
+                for ancestor in (path, *path.parents)
+                if not ancestor.exists()
+            ]
+            for ancestor in reversed(missing):
+                ancestor.mkdir(mode=JOB_MODE)
         # mkdir honours the mode only when it actually creates the directory,
         # so an inherited-permission directory from an older run is tightened.
         self.home.chmod(JOB_MODE)

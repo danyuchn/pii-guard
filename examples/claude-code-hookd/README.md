@@ -62,13 +62,15 @@ Claude 呼叫 Read/Bash/Grep
 
 ### 服務怎麼被啟動
 
-三條路，優先序由上而下：
+四條路，優先序由上而下：
 
-1. **LaunchAgent**（macOS，`install` 預設）：登入時自動起，掛掉會被 `KeepAlive` 拉回來。
-2. **隨用隨啟**：`SessionStart` 時 hook client 發現服務沒起來，就照
+1. **`install` 當下**：裝完如果服務沒在跑，`install` 會直接把它啟動並等到它回應，
+   所以安裝結束時服務就是活的（`--no-launchd` 與非 macOS 也一樣）。
+2. **LaunchAgent**（macOS，`install` 預設）：登入時自動起，掛掉會被 `KeepAlive` 拉回來。
+3. **隨用隨啟**：`SessionStart` 時 hook client 發現服務沒起來，就照
    `~/.config/pii-guard/hookd.json` 裡的 `serve_command` 把它拉起來，等它回應再放行。
    **只有 `SessionStart` 會這樣做**——其他事件必須即時回應，不能卡著等模型載入。
-3. **手動** `serve`。
+4. **手動** `serve`。
 
 第一次跑 `--engine full` 而模型還沒下載完時，等待會逾時（預設 20 秒，
 可用 `PII_GUARD_HOOKD_START_TIMEOUT` 調整）。那個 session 會拿到離線警告，
@@ -84,8 +86,16 @@ Claude 呼叫 Read/Bash/Grep
 | `~/.claude/hooks/pii-guard/pii_guard_hook_client.py` | hook client 本體 |
 | `~/Library/LaunchAgents/com.pii-guard.hookd.plist` | macOS 自動啟動 |
 
-環境變數 `PII_GUARD_HOOKD_HOME`、`PII_GUARD_HOOKD_CONFIG`、`CLAUDE_CONFIG_DIR`
-可以換掉前三類位置。
+環境變數：
+
+| 變數 | 作用 |
+|------|------|
+| `PII_GUARD_HOOKD_HOME` | 換掉 state 與對照表的位置 |
+| `PII_GUARD_HOOKD_CONFIG` | 換掉 `hookd.json` 的位置 |
+| `CLAUDE_CONFIG_DIR` | 換掉 Claude Code 設定目錄（`install` 據此決定裝哪裡） |
+| `PII_GUARD_HOOKD_START_TIMEOUT` | `SessionStart` 等待服務啟動的秒數，預設 20 |
+
+這些目錄一建立就是 `0700`，對照表與 state 檔是 `0600`。
 
 對照表預設保存 14 天，服務啟動時掃掉過期的（`serve --session-ttl-days`，`0` 關閉）。
 
@@ -126,7 +136,10 @@ Claude 呼叫 Read/Bash/Grep
 | `Grep` 的葉節點遮蔽 | **未實測**（該 session 的環境停用了 `Grep`） |
 | `install` 併設定、`doctor` 全綠、隨用隨啟真的把服務拉起來 | 通過（2026-09-15，tmp 設定目錄） |
 | macOS LaunchAgent 真的被 launchctl 載入 | **未實測**（測試一律 mock 掉 launchctl） |
-| `--engine full` 實際載入 CKIP | **未實測** |
+| `--engine full` 實際載入 CKIP，`SessionStart` 自動拉起（冷 28 秒／熱 5 秒） | 通過（2026-09-15，隔離 e2e） |
+| 中文人名被遮成 `<PERSON_1>`，磁碟與畫面是真名 | 通過（2026-09-15，隔離 e2e） |
+| 服務停掉時工具事件維持 fail-closed 且**不會**自行啟動服務 | 通過（2026-09-15，隔離 e2e） |
+| `/clear` 之後服務被重新拉起 | 通過（2026-09-15，隔離 e2e） |
 
 ## 限制：`Edit` 的 `old_string` 不會被還原
 

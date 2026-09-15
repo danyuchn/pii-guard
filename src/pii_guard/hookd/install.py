@@ -44,14 +44,24 @@ POLL_SECONDS: Final[float] = 0.4
 
 @dataclass(frozen=True)
 class CheckResult:
-    """One line of the doctor report."""
+    """One line of the doctor report.
+
+    A warning is not a failure: it reports something the user should know
+    without making the whole report, and the exit code, say the install is
+    broken.
+    """
 
     name: str
     ok: bool
     detail: str
+    warn: bool = False
 
     def render(self) -> str:
-        return f"[{'OK  ' if self.ok else 'FAIL'}] {self.name}: {self.detail}"
+        if self.warn:
+            label = "WARN"
+        else:
+            label = "OK  " if self.ok else "FAIL"
+        return f"[{label}] {self.name}: {self.detail}"
 
 
 def claude_config_dir(env: dict[str, str] | None = None) -> Path:
@@ -273,6 +283,28 @@ def install_client(config_dir: Path) -> Path:
     return target
 
 
+def detached_serve_command(repo: Path, engine: str) -> list[str]:
+    """The serve command without the flag that keeps it in the foreground."""
+
+    return [part for part in serve_command(repo, engine) if part != "--foreground"]
+
+
+def start_service_detached(repo: Path, engine: str) -> bool:
+    """Spawn the service so it outlives this process."""
+
+    try:
+        subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+            detached_serve_command(repo, engine),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def launch_agent_path() -> Path:
     return Path("~/Library/LaunchAgents").expanduser() / f"{LAUNCH_LABEL}.plist"
 
@@ -428,7 +460,16 @@ def doctor(
         )
 
     health = service_health(config)
-    if health is None:
+    if health is None and installer_config.is_file():
+        results.append(
+            CheckResult(
+                "service",
+                True,
+                "not running (starts on demand at next session)",
+                warn=True,
+            )
+        )
+    elif health is None:
         results.append(CheckResult("service", False, "not reachable on 127.0.0.1"))
     else:
         sessions = health.get("sessions", 0)

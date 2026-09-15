@@ -87,6 +87,25 @@ def _connection() -> tuple[int, str]:
         raise RuntimeError("no hookd state") from error
 
 
+def _make_private_dir(path: str) -> None:
+    """Create a directory chain that is owner-only from the first moment.
+
+    os.makedirs applies its mode to the last directory only, which would leave
+    the enclosing one world-readable.
+    """
+
+    missing = []
+    current = path
+    while current and not os.path.isdir(current):
+        missing.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    for directory in reversed(missing):
+        os.mkdir(directory, 0o700)
+
+
 def _start_service() -> bool:
     """Start the service on demand and wait for it to answer.
 
@@ -110,7 +129,7 @@ def _start_service() -> bool:
 
     lock_path = os.path.join(_home(), "starting.lock")
     try:
-        os.makedirs(_home(), mode=0o700, exist_ok=True)
+        _make_private_dir(_home())
         # O_EXCL makes this the one process that gets to spawn the service.
         lock = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
