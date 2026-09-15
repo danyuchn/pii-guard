@@ -1,0 +1,4 @@
+{
+  "description": "The pii-guard front end as a Mod: tool inputs restored and refused on the way down, tool results de-identified on the way up, typed prompts redacted and @ references turned into guarded reads, and a compaction swept of values the session already knows.",
+  "modules": ["./register.ts"]
+}
