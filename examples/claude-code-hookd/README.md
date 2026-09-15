@@ -7,6 +7,23 @@
 這版用新的 hook 能力逐一補掉：**失敗時擋住而不是放行**、**引擎常駐所以跑得動 NER**、
 **對照表留在服務裡所以可逆**、**涵蓋 Read／Bash／Grep 而不只是 Read**。
 
+## 快速開始
+
+```bash
+# 1. 取得這個 repo 並裝好依賴（只做一次）
+git clone https://github.com/danyuchn/pii-guard && cd pii-guard && uv sync
+
+# 2. 一行安裝：複製 hook client、併進 settings.json、寫設定、註冊開機自動啟動
+uv run pii-guard-hookd install
+
+# 3. 打開 Claude Code。沒了。
+```
+
+`install` 最後會自動跑一次 `doctor` 並逐項印出結果，所以你不必猜自己有沒有被保護。
+之後任何時候都可以再跑 `uv run pii-guard-hookd doctor` 確認。
+
+要移除：`uv run pii-guard-hookd uninstall`（只拿掉自己裝的東西，備份與對照表留著）。
+
 ## 流程
 
 ```
@@ -27,44 +44,71 @@ Claude 呼叫 Read/Bash/Grep
 對照表以 `session_id` 為索引。subagent 的工具呼叫帶的是同一個 `session_id`
 （多一個 `agent_id`），所以 subagent 與主 agent 共用同一組佔位符。
 
-## 安裝
-
-```bash
-# 1. 安裝 hook client 並印出要合併的設定（這支腳本不會自己改你的 settings.json）
-bash examples/claude-code-hookd/install.sh
-
-# 2. 把印出來的 hooks 區塊自己併進 ~/.claude/settings.json 或專案 .claude/settings.json
-
-# 3. 啟動常駐服務
-uv run pii-guard-hookd serve
-```
-
-指令：
+## 指令
 
 | 指令 | 作用 |
 |------|------|
-| `uv run pii-guard-hookd serve` | 背景啟動（regex 引擎） |
-| `uv run pii-guard-hookd serve --engine full` | 啟動並載入 CKIP BERT（抓得到中文人名） |
-| `uv run pii-guard-hookd serve --foreground` | 不背景化，留在終端機 |
-| `uv run pii-guard-hookd status` | 看有沒有在跑、port、已載入的 session 數 |
-| `uv run pii-guard-hookd stop` | 停止並清掉狀態檔 |
-| `uv run pii-guard-hookd purge <session_id>` | 忘掉某個 session 的對照表 |
-| `uv run pii-guard-hookd purge --all` | 忘掉全部 |
+| `install` | 裝 hook client、併設定、寫設定檔、註冊自動啟動，最後跑 doctor |
+| `install --engine regex` | 同上，但只用 regex 引擎（快，但抓不到人名） |
+| `install --scope project` | 併進當前目錄的 `.claude/settings.json` 而不是使用者層 |
+| `install --no-launchd` | 不註冊 LaunchAgent，改由 hook client 隨用隨啟 |
+| `uninstall` | 反向移除（備份、設定檔與對照表留著） |
+| `doctor` | 逐項檢查並回報；任何一項 FAIL 就 exit 1 |
+| `serve` | 手動啟動（背景）；`--foreground` 留在終端機 |
+| `status` / `stop` | 看狀態／停止 |
+| `purge <session_id>` / `purge --all` | 忘掉對照表 |
 
-服務把 port 與 bearer token 寫在 `~/.local/share/pii-guard/hookd/` 底下的
-`state.json` 與 `state.env`（兩個都是 0600），hook client 靠這兩個檔找到服務。
-用 `PII_GUARD_HOOKD_HOME` 可以換位置。
+全部都以 `uv run pii-guard-hookd <指令>` 執行。
+
+### 服務怎麼被啟動
+
+三條路，優先序由上而下：
+
+1. **LaunchAgent**（macOS，`install` 預設）：登入時自動起，掛掉會被 `KeepAlive` 拉回來。
+2. **隨用隨啟**：`SessionStart` 時 hook client 發現服務沒起來，就照
+   `~/.config/pii-guard/hookd.json` 裡的 `serve_command` 把它拉起來，等它回應再放行。
+   **只有 `SessionStart` 會這樣做**——其他事件必須即時回應，不能卡著等模型載入。
+3. **手動** `serve`。
+
+第一次跑 `--engine full` 而模型還沒下載完時，等待會逾時（預設 20 秒，
+可用 `PII_GUARD_HOOKD_START_TIMEOUT` 調整）。那個 session 會拿到離線警告，
+但服務會繼續在背景載入，下一個 session 就正常了。
+
+### 檔案位置
+
+| 檔案 | 用途 |
+|------|------|
+| `~/.local/share/pii-guard/hookd/state.json`、`state.env`（0600） | port 與 bearer token，hook client 靠它找到服務 |
+| `~/.local/share/pii-guard/hookd/sessions/*.json`（0600） | 每個 session 的對照表 |
+| `~/.config/pii-guard/hookd.json`（0600） | repo 路徑、引擎、`serve_command` |
+| `~/.claude/hooks/pii-guard/pii_guard_hook_client.py` | hook client 本體 |
+| `~/Library/LaunchAgents/com.pii-guard.hookd.plist` | macOS 自動啟動 |
+
+環境變數 `PII_GUARD_HOOKD_HOME`、`PII_GUARD_HOOKD_CONFIG`、`CLAUDE_CONFIG_DIR`
+可以換掉前三類位置。
+
+對照表預設保存 14 天，服務啟動時掃掉過期的（`serve --session-ttl-days`，`0` 關閉）。
 
 ## 引擎選擇
 
 | 引擎 | 啟動 | 抓得到 | 抓不到 |
 |------|------|--------|--------|
-| `regex`（預設） | 不到一秒 | 身分證、居留證、手機、市話、統編、Email、信用卡、車牌、生日、銀行帳號 | **人名、組織名、地名** |
-| `full` | 數秒（載入 CKIP BERT，約 500MB） | 上列全部 ＋ 中文人名／組織／地名 | 暱稱、非典型英文名 |
+| `full`（**預設**） | 數秒（載入 CKIP BERT，約 500MB） | 下列全部 ＋ 中文人名／組織／地名 | 暱稱、非典型英文名 |
+| `regex` | 不到一秒 | 身分證、居留證、手機、市話、統編、Email、信用卡、車牌、生日、銀行帳號 | **人名、組織名、地名** |
 
 **這是整份文件最重要的一段**：regex 引擎擋得住身分證字號，擋不住「王小明」。
-文件裡真正敏感的常常是人名，所以要靠這套防線就用 `--engine full`。
-實測 recall 見專案根目錄 README 的 benchmark 段。
+文件裡真正敏感的常常是人名，所以預設是 `full`。實測 recall 見專案根目錄 README
+的 benchmark 段。
+
+`full` 載入失敗時（模型沒下載、import 出錯），服務**不會整個不動**，而是退回
+`regex` 並大聲說出來：stderr 印一行、`/v1/health` 的 `engine_fallback` 為真、
+`doctor` report 該項 FAIL、SessionStart 的 systemMessage 變成
+`pii-guard: on (regex only, names NOT covered)`。
+
+換句話說，狀態列那一行就是你有沒有被完整保護的答案：
+
+- `pii-guard: on (full engine, names covered)` — 完整保護
+- `pii-guard: on (regex only, names NOT covered)` — 人名沒擋
 
 ## 已驗證（2026-09-15，Claude Code 2.1.272）
 
@@ -80,6 +124,9 @@ uv run pii-guard-hookd serve
 | 服務停掉時 `Read` 回擋住的樣板、`Write` 被 deny | 通過 |
 | `Edit` 的 `old_string` 帶佔位符 | **失敗**，見下節 |
 | `Grep` 的葉節點遮蔽 | **未實測**（該 session 的環境停用了 `Grep`） |
+| `install` 併設定、`doctor` 全綠、隨用隨啟真的把服務拉起來 | 通過（2026-09-15，tmp 設定目錄） |
+| macOS LaunchAgent 真的被 launchctl 載入 | **未實測**（測試一律 mock 掉 launchctl） |
+| `--engine full` 實際載入 CKIP | **未實測** |
 
 ## 限制：`Edit` 的 `old_string` 不會被還原
 
@@ -126,7 +173,8 @@ hook client 連不到服務、逾時、收到非 2xx、或收到看不懂的回�
 - **你自己打進去的字**（UserPromptSubmit）。你貼進對話框的個資不經過這條路。
 - **Compaction 摘要**。壓縮時模型看的是已經在 context 裡的內容，那些已經是佔位符，
   但摘要本身不再經過 hook。
-- **MCP server 的輸出**，除非你自己把工具名加進 PostToolUse 的 matcher。
+- ~~**MCP server 的輸出**~~。預設 matcher 已含 `mcp__.*`，所以 MCP 工具輸出**有**
+  走葉節點遮蔽。但這條同樣未在真實 MCP 工具上實測。
 - **會記錄原始工具輸出的 telemetry**。hook 換掉的是模型看到的東西，不是磁碟上的紀錄。
 - **transcript 存的是佔位符**。這對安全是好事（真值沒有落進 transcript），但代價是
   `--resume` 回來看到的是佔位符，要等 `MessageDisplay` 還原後才看得到真值。
@@ -164,5 +212,5 @@ hook client 連不到服務、逾時、收到非 2xx、或收到看不懂的回�
 - `pii_guard_hook_client.py` — hook 本體。只用標準函式庫，不 import 這個專案，
   不跑 uv。刻意寫得短而好讀，因為這是你要親自審的那一支。
 - `settings.json` — hooks 區塊範本，路徑處寫 `__HOOKD_CLIENT__` 佔位。
-- `install.sh` — 複製 client 到 `~/.claude/hooks/pii-guard/` 並印出填好路徑的設定。
-  **它不會自己改你的 settings.json**，要你自己看過再併。
+  只在你想完全手動設定時才需要；`install` 會自己產生正確的內容。
+- `install.sh` — 舊的半手動安裝腳本，`uv run pii-guard-hookd install` 取代了它。

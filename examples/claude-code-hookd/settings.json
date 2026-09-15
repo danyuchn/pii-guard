@@ -14,7 +14,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Read|Bash|Grep",
+        "matcher": "Read|Bash|Grep|mcp__.*",
         "hooks": [
           {
             "type": "command",

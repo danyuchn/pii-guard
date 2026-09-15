@@ -48,8 +48,10 @@ uv run mypy src/
 # Lint
 uv run ruff check src/
 
-# 常駐 hook 去識別化服務
-uv run pii-guard-hookd serve [--engine regex|full] [--foreground]
+# 常駐 hook 去識別化服務（install 會併好 settings 並自動啟動）
+uv run pii-guard-hookd install [--engine full|regex] [--scope user|project] [--no-launchd]
+uv run pii-guard-hookd doctor | uninstall
+uv run pii-guard-hookd serve [--engine full|regex] [--foreground] [--session-ttl-days N]
 uv run pii-guard-hookd status | stop | purge [session_id|--all]
 ```
 
