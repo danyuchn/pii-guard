@@ -11,6 +11,7 @@ import json
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -30,15 +31,24 @@ CLIENT = (
 SPANS = {"王小明": "PERSON", "0912345678": "TW_MOBILE"}
 
 
-def run_client(event: str, payload: dict[str, object], home: Path) -> dict[str, object]:
+def run_client(
+    event: str,
+    payload: dict[str, object],
+    home: Path,
+    *arguments: str,
+    config: Path | None = None,
+) -> dict[str, object]:
     """Run the hook client exactly as Claude Code would."""
 
+    environment = {"PII_GUARD_HOOKD_HOME": str(home), "PATH": "/usr/bin:/bin"}
+    if config is not None:
+        environment["PII_GUARD_HOOKD_CONFIG"] = str(config)
     completed = subprocess.run(
-        [sys.executable, str(CLIENT), event],
+        [sys.executable, str(CLIENT), event, *arguments],
         input=json.dumps(payload),
         capture_output=True,
         text=True,
-        env={"PII_GUARD_HOOKD_HOME": str(home), "PATH": "/usr/bin:/bin"},
+        env=environment,
         timeout=60,
         check=False,
     )
@@ -415,3 +425,76 @@ def test_online_prompt_submit_passes_a_clean_prompt(online_home: Path) -> None:
     )
 
     assert reply == {}
+
+
+# --- SessionStart --start-only, the Mod's one classic hook -------------------
+#
+# The Mod handles SessionStart itself but cannot spawn a service that outlives
+# the session, so this entry survives a --mod install purely to start it.
+
+
+def _start_only_config(tmp_path: Path, marker: Path) -> Path:
+    """An installer config whose serve command only touches a marker file."""
+
+    config = tmp_path / "hookd.json"
+    config.write_text(
+        json.dumps(
+            {
+                "serve_command": [
+                    sys.executable,
+                    "-c",
+                    f"open({str(marker)!r}, 'w').write('started')",
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config
+
+
+def test_start_only_says_nothing_and_starts_the_service(tmp_path, offline_home) -> None:
+    marker = tmp_path / "started.txt"
+    config = _start_only_config(tmp_path, marker)
+
+    reply = run_client("SessionStart", {}, offline_home, "--start-only", config=config)
+
+    assert reply == {}
+    deadline = time.time() + 10
+    while time.time() < deadline and not marker.exists():
+        time.sleep(0.1)
+    assert marker.exists(), "the start-only hook did not run the serve command"
+
+
+def test_start_only_still_says_nothing_when_the_start_fails(tmp_path, offline_home) -> None:
+    """A guard that cannot start is not a reason to disturb the session here.
+
+    The Mod fails closed on the very next event, which is where the user is
+    told; printing anything at this hook would only duplicate that.
+    """
+
+    config = tmp_path / "hookd.json"
+    config.write_text(json.dumps({"serve_command": "not-a-list"}), encoding="utf-8")
+
+    reply = run_client("SessionStart", {}, offline_home, "--start-only", config=config)
+
+    assert reply == {}
+
+
+def test_start_only_without_any_config_says_nothing(offline_home) -> None:
+    assert run_client("SessionStart", {}, offline_home, "--start-only") == {}
+
+
+def test_start_only_does_not_greet_when_the_service_is_up(online_home: Path) -> None:
+    """The Mod sends its own briefing, so this hook must stay silent."""
+
+    reply = run_client("SessionStart", {}, online_home, "--start-only")
+
+    assert reply == {}
+
+
+def test_plain_session_start_still_greets(online_home: Path) -> None:
+    """Without the flag the classic behaviour is unchanged."""
+
+    reply = run_client("SessionStart", {}, online_home)
+
+    assert "systemMessage" in reply

@@ -1,0 +1,8 @@
+{
+  "name": "pii-guard",
+  "version": "0.1.0",
+  "description": "De-identifies personal data before it reaches the model and restores it on the way back out, by asking the resident pii-guard hookd service on loopback. Tool results are redacted, writes and shell commands are restored, a prompt's @ references become guarded reads, and the commands that would carry content off the machine are refused.",
+  "author": {
+    "name": "pii-guard-tw"
+  }
+}

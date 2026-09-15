@@ -310,6 +310,19 @@ class SessionRedactor:
                 added += 1
         return added
 
+    def sweep_known(self, text: str) -> str:
+        """Mask every value this session already knows, running no detection.
+
+        For text the session has already seen once, such as a transcript being
+        compacted: the values are known, so masking them is a string replace
+        and costs no model time.
+        """
+
+        if not text:
+            return text
+        with self._lock:
+            return self._sweep_known_values_locked(text)
+
     def detect(self, text: str) -> dict[str, int]:
         """Report what PII is in *text* without learning anything from it.
 

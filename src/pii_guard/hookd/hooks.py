@@ -22,8 +22,37 @@ MESSAGE_DISPLAY: Final[str] = "MessageDisplay"
 SESSION_START: Final[str] = "SessionStart"
 USER_PROMPT_SUBMIT: Final[str] = "UserPromptSubmit"
 
+# The Mod front end's events.  They carry the same decisions as the classic
+# ones above, in the shapes a hooks module can hand to ``next``: a tool call
+# going down, a tool result coming up, a prompt, and a compaction.
+TOOL_CALL: Final[str] = "ToolCall"
+TOOL_RESULT: Final[str] = "ToolResult"
+PROMPT_SUBMIT: Final[str] = "PromptSubmit"
+COMPACT: Final[str] = "Compact"
+
 SUPPORTED_EVENTS: Final[frozenset[str]] = frozenset(
-    {POST_TOOL_USE, PRE_TOOL_USE, MESSAGE_DISPLAY, SESSION_START, USER_PROMPT_SUBMIT}
+    {
+        POST_TOOL_USE,
+        PRE_TOOL_USE,
+        MESSAGE_DISPLAY,
+        SESSION_START,
+        USER_PROMPT_SUBMIT,
+        TOOL_CALL,
+        TOOL_RESULT,
+        PROMPT_SUBMIT,
+        COMPACT,
+    }
+)
+
+# Keys the engine owns on a tool call.  A rewrite of any is refused, so they
+# are stripped from anything this service hands back as a replacement input.
+RESERVED_TOOL_KEYS: Final[frozenset[str]] = frozenset(
+    {"tool", "tool_use_id", "agentId", "consent"}
+)
+# Keys inside a transcript message that identify it to the engine.  Sweeping
+# them would break the handle that makes a kept message the engine's own.
+RESERVED_MESSAGE_KEYS: Final[frozenset[str]] = frozenset(
+    {"handle", "id", "uuid", "type", "role", "name", "tool_use_id", "toolUseId"}
 )
 
 # Read results carry the file text under "file"; image reads use a different
@@ -121,30 +150,36 @@ def _redact_string_leaves(
     return value, False
 
 
-def _handle_read(redactor: SessionRedactor, response: Mapping[str, Any]) -> dict[str, object]:
+def _redacted_read(
+    redactor: SessionRedactor, response: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """The Read result with the file text de-identified, or ``None``."""
+
     if response.get("type") != _READ_TEXT_TYPE:
-        return {}
+        return None
     file_block = response.get("file")
     if not isinstance(file_block, Mapping):
-        return {}
+        return None
     content = file_block.get("content")
     if not isinstance(content, str):
-        return {}
+        return None
     redacted, changed = _redact(redactor, content)
     if not changed:
-        return {}
+        return None
     updated_file = dict(file_block)
     updated_file["content"] = redacted
     updated = dict(response)
     updated["file"] = updated_file
-    return _hook_output(POST_TOOL_USE, updatedToolOutput=updated)
+    return updated
 
 
-def _handle_bash_output(
+def _redacted_bash(
     redactor: SessionRedactor,
     response: Mapping[str, Any],
     context: HookContext,
-) -> dict[str, object]:
+) -> tuple[dict[str, Any] | None, str | None]:
+    """The Bash result de-identified, and the note the model should read."""
+
     updated = dict(response)
     changed = False
     for key in ("stdout", "stderr"):
@@ -162,14 +197,24 @@ def _handle_bash_output(
         withheld = dict(response)
         withheld["stdout"] = policy.OUTPUT_WITHHELD
         withheld["stderr"] = ""
-        return _hook_output(
-            POST_TOOL_USE,
-            updatedToolOutput=withheld,
-            additionalContext=policy.OUTPUT_WITHHELD_CONTEXT,
-        )
-    if not changed:
-        return {}
-    return _hook_output(POST_TOOL_USE, updatedToolOutput=updated)
+        return withheld, policy.OUTPUT_WITHHELD_CONTEXT
+    return (updated if changed else None), None
+
+
+def _redacted_result(
+    redactor: SessionRedactor,
+    tool_name: str,
+    response: Mapping[str, Any],
+    context: HookContext,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """De-identify one tool result, whichever front end asked."""
+
+    if tool_name == "Read":
+        return _redacted_read(redactor, response), None
+    if tool_name == "Bash":
+        return _redacted_bash(redactor, response, context)
+    updated, changed = _redact_string_leaves(redactor, dict(response))
+    return (updated if changed else None), None
 
 
 def handle_post_tool_use(
@@ -182,15 +227,14 @@ def handle_post_tool_use(
     if not isinstance(tool_name, str) or not isinstance(response, Mapping):
         return {}
     redactor = store.get(str(payload.get("session_id", "")))
-    if tool_name == "Read":
-        reply = _handle_read(redactor, response)
-    elif tool_name == "Bash":
-        reply = _handle_bash_output(redactor, response, context)
-    else:
-        updated, changed = _redact_string_leaves(redactor, dict(response))
-        reply = _hook_output(POST_TOOL_USE, updatedToolOutput=updated) if changed else {}
-    if reply:
-        store.save(redactor)
+    updated, note = _redacted_result(redactor, tool_name, response, context)
+    if updated is None:
+        return {}
+    fields: dict[str, object] = {"updatedToolOutput": updated}
+    if note is not None:
+        fields["additionalContext"] = note
+    reply = _hook_output(POST_TOOL_USE, **fields)
+    store.save(redactor)
     return reply
 
 
@@ -361,8 +405,186 @@ def handle_session_start(
     }
 
 
+def handle_tool_call(
+    store: SessionStore, payload: Mapping[str, Any], context: HookContext
+) -> dict[str, object]:
+    """Decide one tool call on its way down, for the Mod front end.
+
+    Answers ``{"deny": reason}`` to refuse, ``{"input": ...}`` to hand back a
+    rewritten input, or ``{}`` to let the call through untouched.
+    """
+
+    tool_name = payload.get("tool")
+    tool_input = payload.get("input")
+    if not isinstance(tool_name, str) or not isinstance(tool_input, Mapping):
+        return {}
+
+    egress = policy.egress_tool_decision(tool_name, tool_input, context.policy)
+    if egress is not None:
+        return {"deny": egress}
+
+    redactor = store.get(str(payload.get("session_id", "")))
+    if tool_name == "Bash":
+        command = tool_input.get("command")
+        if isinstance(command, str):
+            refusal = policy.bash_command_decision(
+                command, redactor.placeholders(), context.policy
+            )
+            if refusal is not None:
+                return {"deny": refusal}
+    updated, changed = _restore_tool_input(redactor, tool_name, tool_input)
+    if not changed:
+        return {}
+    # The engine owns these keys and refuses a rewrite of any of them, so they
+    # never travel back as part of a replacement input.
+    for key in RESERVED_TOOL_KEYS:
+        updated.pop(key, None)
+    return {"input": updated}
+
+
+def handle_tool_result(
+    store: SessionStore, payload: Mapping[str, Any], context: HookContext
+) -> dict[str, object]:
+    """De-identify one tool result on its way up, for the Mod front end."""
+
+    tool_name = payload.get("tool")
+    response = payload.get("result")
+    if not isinstance(tool_name, str) or not isinstance(response, Mapping):
+        return {}
+    redactor = store.get(str(payload.get("session_id", "")))
+    updated, note = _redacted_result(redactor, tool_name, response, context)
+    if updated is None:
+        return {}
+    store.save(redactor)
+    reply: dict[str, object] = {"result": updated}
+    if note is not None:
+        reply["context"] = [note]
+    return reply
+
+
+# A resolved @ reference becomes a sentinel while the prompt is redacted, so
+# the path it turns into is never itself mistaken for personal data.
+_REFERENCE_SENTINEL: Final[str] = "[[pii-guard-ref-{index}]]"
+READ_INSTEAD: Final[str] = "please Read the file {path}"
+
+
+def _rewrite_at_references(prompt: str, cwd: str) -> tuple[str, list[str]]:
+    """Turn every @ reference to a real file into a request to Read it.
+
+    An @ reference inlines the file with no tool call, so nothing downstream
+    can de-identify it.  Asking for a Read instead puts the same file through
+    the guarded path.
+    """
+
+    paths: list[str] = []
+
+    def replace(match: re.Match[str]) -> str:
+        path = _referenced_file(match.group(1), cwd)
+        if path is None:
+            return match.group(0)
+        sentinel = _REFERENCE_SENTINEL.format(index=len(paths))
+        paths.append(str(path))
+        return sentinel
+
+    return _AT_REFERENCE_PATTERN.sub(replace, prompt), paths
+
+
+def _restore_references(text: str, paths: list[str]) -> str:
+    for index, path in enumerate(paths):
+        text = text.replace(
+            _REFERENCE_SENTINEL.format(index=index), READ_INSTEAD.format(path=path)
+        )
+    return text
+
+
+def handle_prompt_submit(
+    store: SessionStore, payload: Mapping[str, Any], context: HookContext
+) -> dict[str, object]:
+    """De-identify a typed prompt, for the Mod front end.
+
+    Unlike the classic hook, which can only refuse, this rewrites: @ references
+    become a request to Read the file, and personal data the user typed becomes
+    placeholders that restore on the way back out.  The mapping is persisted,
+    so a value typed here is known for the rest of the session.
+    """
+
+    del context
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return {}
+    cwd = str(payload.get("cwd", ""))
+
+    staged, paths = _rewrite_at_references(prompt, cwd)
+    redactor = store.get(str(payload.get("session_id", "")))
+    result = redactor.redact(staged)
+    text = _restore_references(result.text, paths)
+    if text == prompt:
+        return {}
+    if result.text != staged:
+        store.save(redactor)
+    return {
+        "text": text,
+        "counts": result.counts,
+        "references": len(paths),
+    }
+
+
+def _sweep_leaves(redactor: SessionRedactor, value: Any, depth: int = 0) -> tuple[Any, bool]:
+    """Mask known values in a structure, leaving the engine's own keys alone."""
+
+    if depth > _MAX_DEPTH:
+        return value, False
+    if isinstance(value, str):
+        swept = redactor.sweep_known(value)
+        return swept, swept != value
+    if isinstance(value, Mapping):
+        output: dict[str, Any] = {}
+        changed = False
+        for key, item in value.items():
+            if key in RESERVED_MESSAGE_KEYS:
+                output[key] = item
+                continue
+            output[key], item_changed = _sweep_leaves(redactor, item, depth + 1)
+            changed = changed or item_changed
+        return output, changed
+    if isinstance(value, list):
+        items: list[Any] = []
+        changed = False
+        for item in value:
+            swept, item_changed = _sweep_leaves(redactor, item, depth + 1)
+            items.append(swept)
+            changed = changed or item_changed
+        return items, changed
+    return value, False
+
+
+def handle_compact(
+    store: SessionStore, payload: Mapping[str, Any], context: HookContext
+) -> dict[str, object]:
+    """Mask known values in a transcript about to be compacted.
+
+    Only values the session already knows are masked.  Running detection over a
+    whole transcript would cost real time on every compaction, and anything
+    worth finding was already found when it first came through a tool.
+    """
+
+    del context
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return {}
+    redactor = store.get(str(payload.get("session_id", "")))
+    swept, changed = _sweep_leaves(redactor, messages)
+    if not changed:
+        return {}
+    return {"messages": swept}
+
+
 _HANDLERS: Final[dict[str, Any]] = {
     POST_TOOL_USE: handle_post_tool_use,
+    TOOL_CALL: handle_tool_call,
+    TOOL_RESULT: handle_tool_result,
+    PROMPT_SUBMIT: handle_prompt_submit,
+    COMPACT: handle_compact,
     USER_PROMPT_SUBMIT: handle_user_prompt_submit,
     PRE_TOOL_USE: handle_pre_tool_use,
     MESSAGE_DISPLAY: handle_message_display,

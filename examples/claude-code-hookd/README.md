@@ -170,6 +170,10 @@ Claude 呼叫 Read/Bash/Grep
 重寫整個檔案（`content` 會被還原），或用 `Bash` 指令改。
 **絕對不要為了讓 `Edit` 對得上而去猜佔位符背後的真值。**
 
+這條限制是 classic hooks 才有的。同一個服務的 Claude Mods 前端
+（[`examples/claude-code-mod/`](../claude-code-mod/)，`install --mod`）攔截點跑在
+Edit 比對 `old_string` 之前，帶佔位符的 `Edit` 在那邊會正常成功。
+
 ## 失敗時的行為：一律擋住（fail closed）
 
 hook client 連不到服務、逾時、收到非 2xx、或收到看不懂的回覆時，**不會放行原始內容**：

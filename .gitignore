@@ -73,3 +73,7 @@ logs/
 
 # python 3.13 migration backups
 *.bak-py311
+
+# The Mod's TypeScript declarations are generated per Claude Code build.
+# Regenerate with: CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude -p "/plugin-types"
+examples/claude-code-mod/types/
