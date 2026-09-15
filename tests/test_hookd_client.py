@@ -37,10 +37,12 @@ def run_client(
     home: Path,
     *arguments: str,
     config: Path | None = None,
+    env: dict[str, str] | None = None,
 ) -> dict[str, object]:
     """Run the hook client exactly as Claude Code would."""
 
-    environment = {"PII_GUARD_HOOKD_HOME": str(home), "PATH": "/usr/bin:/bin"}
+    environment = dict(env) if env is not None else {"PII_GUARD_HOOKD_HOME": str(home)}
+    environment["PATH"] = "/usr/bin:/bin"
     if config is not None:
         environment["PII_GUARD_HOOKD_CONFIG"] = str(config)
     completed = subprocess.run(
@@ -498,3 +500,47 @@ def test_plain_session_start_still_greets(online_home: Path) -> None:
     reply = run_client("SessionStart", {}, online_home)
 
     assert "systemMessage" in reply
+
+
+# --- Finding the service under `claude plugin eval` --------------------------
+#
+# An eval run gets a throwaway home directory and inherits only EVAL_ prefixed
+# variables from the surrounding shell, so the usual path finds nothing.
+
+
+def test_the_eval_variable_locates_the_service(online_home: Path) -> None:
+    reply = run_client(
+        "PostToolUse",
+        READ_PAYLOAD,
+        online_home,
+        env={"EVAL_PII_GUARD_HOOKD_HOME": str(online_home)},
+    )
+
+    content = reply["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"]
+    assert "0912345678" not in content
+    assert "<TW_MOBILE_1>" in content
+
+
+def test_the_ordinary_variable_still_wins(online_home: Path, tmp_path: Path) -> None:
+    """A real installation must not be overridden by a stray EVAL_ variable."""
+
+    reply = run_client(
+        "PostToolUse",
+        READ_PAYLOAD,
+        online_home,
+        env={
+            "PII_GUARD_HOOKD_HOME": str(online_home),
+            "EVAL_PII_GUARD_HOOKD_HOME": str(tmp_path / "nowhere"),
+        },
+    )
+
+    content = reply["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"]
+    assert "<TW_MOBILE_1>" in content
+
+
+def test_without_either_variable_it_still_fails_closed(tmp_path: Path) -> None:
+    reply = run_client("PostToolUse", READ_PAYLOAD, tmp_path, env={"HOME": str(tmp_path)})
+
+    content = reply["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"]
+    assert "0912345678" not in content
+    assert "withheld" in content
