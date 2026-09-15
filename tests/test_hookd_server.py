@@ -961,3 +961,47 @@ def test_compact_leaves_an_unknown_value_alone(service: RunningService) -> None:
 
 def test_compact_without_messages_is_a_no_op(service: RunningService) -> None:
     assert service.hook("Compact", {"session_id": "s1", "messages": []}) == {}
+
+
+def test_tool_result_redacts_a_write_result(service: RunningService) -> None:
+    """A Write result echoes back what was written, after restoration.
+
+    The guard restores placeholders on the way down, so the tool's own result
+    carries the real values straight back to the model unless it is redacted
+    too. The Mod front end sends Write, Edit and MultiEdit results here for
+    exactly this reason.
+    """
+
+    _learn_placeholder(service)
+
+    reply = service.hook(
+        "ToolResult",
+        {
+            "session_id": "s1",
+            "tool": "Write",
+            "result": {"filePath": "/tmp/summary.txt", "content": "0912345678"},
+        },
+    )
+
+    assert reply["result"]["content"] == "<TW_MOBILE_1>"
+    assert reply["result"]["filePath"] == "/tmp/summary.txt"
+
+
+def test_tool_result_redacts_an_edit_result(service: RunningService) -> None:
+    _learn_placeholder(service)
+
+    reply = service.hook(
+        "ToolResult",
+        {
+            "session_id": "s1",
+            "tool": "Edit",
+            "result": {
+                "filePath": "/tmp/x.txt",
+                "oldString": "call 0912345678",
+                "newString": "call 0912345678 twice",
+            },
+        },
+    )
+
+    assert reply["result"]["oldString"] == "call <TW_MOBILE_1>"
+    assert reply["result"]["newString"] == "call <TW_MOBILE_1> twice"
