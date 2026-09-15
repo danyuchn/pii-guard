@@ -211,3 +211,83 @@ def test_regex_engine_masks_taiwan_identifiers(config: HookdConfig) -> None:
     assert "A123456789" not in result.text
     assert "0912345678" not in result.text
     assert redactor.restore(result.text).text == "身分證 A123456789，手機 0912345678。"
+
+
+def test_full_engine_failure_falls_back_to_regex(monkeypatch, capsys) -> None:
+    """A missing model must degrade to regex, never to no guard at all."""
+
+    import pii_guard.hookd.core as core
+
+    real = core.create_engine
+
+    def fake(name: str):
+        if name == "full":
+            raise RuntimeError("model not downloaded")
+        return real(name)
+
+    monkeypatch.setattr(core, "create_engine", fake)
+
+    engine, loaded, fallback = core.create_engine_with_fallback("full")
+
+    assert loaded == "regex"
+    assert fallback is True
+    assert engine is not None
+    assert "NOT covered" in capsys.readouterr().err
+
+
+def test_regex_engine_failure_is_not_swallowed(monkeypatch) -> None:
+    import pii_guard.hookd.core as core
+
+    monkeypatch.setattr(
+        core, "create_engine", lambda name: (_ for _ in ()).throw(RuntimeError("broken"))
+    )
+
+    with pytest.raises(RuntimeError):
+        core.create_engine_with_fallback("regex")
+
+
+def test_successful_load_reports_no_fallback() -> None:
+    from pii_guard.hookd.core import create_engine_with_fallback
+
+    engine, loaded, fallback = create_engine_with_fallback("regex")
+
+    assert (loaded, fallback) == ("regex", False)
+    assert engine is not None
+
+
+def test_sweep_removes_only_expired_sessions(config: HookdConfig) -> None:
+    import os
+    import time
+
+    store = SessionStore(config, FakeEngine({"王小明": "PERSON"}))
+    for name in ("old-session", "fresh-session"):
+        redactor = store.get(name)
+        redactor.redact("王小明")
+        store.save(redactor)
+    stale = config.sessions_dir / "old-session.json"
+    long_ago = time.time() - 30 * 86400
+    os.utime(stale, (long_ago, long_ago))
+
+    removed = store.sweep_expired(14)
+
+    assert removed == 1
+    assert not stale.exists()
+    assert (config.sessions_dir / "fresh-session.json").exists()
+    # The swept session must also be dropped from the in-memory cache.
+    assert store.get("old-session").mapping == {}
+
+
+def test_sweep_is_disabled_by_a_zero_ttl(config: HookdConfig) -> None:
+    import os
+    import time
+
+    store = SessionStore(config, FakeEngine({"王小明": "PERSON"}))
+    redactor = store.get("old-session")
+    redactor.redact("王小明")
+    store.save(redactor)
+    stale = config.sessions_dir / "old-session.json"
+    long_ago = time.time() - 365 * 86400
+    os.utime(stale, (long_ago, long_ago))
+
+    assert store.sweep_expired(0) == 0
+    assert stale.exists()

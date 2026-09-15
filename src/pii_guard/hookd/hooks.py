@@ -8,6 +8,7 @@ client should print, or an empty object when there is nothing to change.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Final
 
 from pii_guard.hookd.core import SessionRedactor, SessionStore
@@ -26,6 +27,21 @@ SUPPORTED_EVENTS: Final[frozenset[str]] = frozenset(
 _READ_TEXT_TYPE: Final[str] = "text"
 # Recursion guard for the Grep fallback, which walks an unspecified structure.
 _MAX_DEPTH: Final[int] = 12
+
+@dataclass(frozen=True)
+class HookContext:
+    """What the handlers need to know about the running service."""
+
+    names_covered: bool = False
+
+
+NAMES_COVERED_MESSAGE: Final[str] = "pii-guard: on (full engine, names covered)"
+NAMES_UNCOVERED_MESSAGE: Final[str] = "pii-guard: on (regex only, names NOT covered)"
+NAMES_UNCOVERED_CONTEXT: Final[str] = (
+    " The regex engine is loaded, so personal NAMES and organization names are "
+    "NOT detected and may still reach you in full. Treat any name you see as "
+    "real personal data."
+)
 
 SESSION_START_CONTEXT: Final[str] = (
     "pii-guard hookd is running. Tool results you receive are de-identified: "
@@ -125,9 +141,12 @@ def _handle_bash_output(
     return _hook_output(POST_TOOL_USE, updatedToolOutput=updated)
 
 
-def handle_post_tool_use(store: SessionStore, payload: Mapping[str, Any]) -> dict[str, object]:
+def handle_post_tool_use(
+    store: SessionStore, payload: Mapping[str, Any], context: HookContext
+) -> dict[str, object]:
     """De-identify what a tool result would otherwise put into the context."""
 
+    del context
     tool_name = payload.get("tool_name")
     response = payload.get("tool_response")
     if not isinstance(tool_name, str) or not isinstance(response, Mapping):
@@ -183,9 +202,12 @@ def _restore_tool_input(
     return updated, changed
 
 
-def handle_pre_tool_use(store: SessionStore, payload: Mapping[str, Any]) -> dict[str, object]:
+def handle_pre_tool_use(
+    store: SessionStore, payload: Mapping[str, Any], context: HookContext
+) -> dict[str, object]:
     """Put real values back before Claude writes them to disk or to a shell."""
 
+    del context
     tool_name = payload.get("tool_name")
     tool_input = payload.get("tool_input")
     if not isinstance(tool_name, str) or not isinstance(tool_input, Mapping):
@@ -198,9 +220,12 @@ def handle_pre_tool_use(store: SessionStore, payload: Mapping[str, Any]) -> dict
     return _hook_output(PRE_TOOL_USE, updatedInput=updated)
 
 
-def handle_message_display(store: SessionStore, payload: Mapping[str, Any]) -> dict[str, object]:
+def handle_message_display(
+    store: SessionStore, payload: Mapping[str, Any], context: HookContext
+) -> dict[str, object]:
     """Show the user real values while the model keeps seeing placeholders."""
 
+    del context
     delta = payload.get("delta")
     if not isinstance(delta, str) or not delta:
         return {}
@@ -211,15 +236,20 @@ def handle_message_display(store: SessionStore, payload: Mapping[str, Any]) -> d
     return _hook_output(MESSAGE_DISPLAY, displayContent=restored)
 
 
-def handle_session_start(store: SessionStore, payload: Mapping[str, Any]) -> dict[str, object]:
+def handle_session_start(
+    store: SessionStore, payload: Mapping[str, Any], context: HookContext
+) -> dict[str, object]:
     """Tell the model that placeholders are expected and must be preserved."""
 
     del store, payload
+    extra = "" if context.names_covered else NAMES_UNCOVERED_CONTEXT
     return {
-        "systemMessage": "pii-guard hookd is protecting this session.",
+        "systemMessage": (
+            NAMES_COVERED_MESSAGE if context.names_covered else NAMES_UNCOVERED_MESSAGE
+        ),
         "hookSpecificOutput": {
             "hookEventName": SESSION_START,
-            "additionalContext": SESSION_START_CONTEXT,
+            "additionalContext": SESSION_START_CONTEXT + extra,
         },
     }
 
@@ -233,11 +263,14 @@ _HANDLERS: Final[dict[str, Any]] = {
 
 
 def dispatch(
-    store: SessionStore, event_name: str, payload: Mapping[str, Any]
+    store: SessionStore,
+    event_name: str,
+    payload: Mapping[str, Any],
+    context: HookContext | None = None,
 ) -> dict[str, object]:
     """Route one hook event to its handler; unknown events do nothing."""
 
     handler = _HANDLERS.get(event_name)
     if handler is None:
         return {}
-    return handler(store, payload)
+    return handler(store, payload, context or HookContext())

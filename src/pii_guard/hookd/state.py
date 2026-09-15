@@ -82,6 +82,7 @@ def write_state(
     pid: int,
     engine: str,
     started_at: float,
+    engine_fallback: bool = False,
 ) -> None:
     """Write both state files atomically with mode 0600."""
 
@@ -96,6 +97,7 @@ def write_state(
         "token": token,
         "pid": pid,
         "engine": engine,
+        "engine_fallback": engine_fallback,
         "started_at": started_at,
     }
     _write_private(

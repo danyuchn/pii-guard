@@ -20,7 +20,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Final, cast
 
-from pii_guard.hookd.core import SessionStore, create_engine
+from pii_guard.hookd.core import SessionStore, create_engine_with_fallback
 from pii_guard.hookd.server import HookdApplication, HookdServerConfig, create_server
 from pii_guard.hookd.state import HookdConfig, clear_state, read_state, write_state
 from pii_guard.local_workflow import WorkflowError
@@ -28,6 +28,7 @@ from pii_guard.local_workflow import WorkflowError
 START_TIMEOUT_SECONDS: Final[float] = 180.0
 STOP_TIMEOUT_SECONDS: Final[float] = 15.0
 POLL_SECONDS: Final[float] = 0.2
+DEFAULT_SESSION_TTL_DAYS: Final[float] = 14.0
 
 
 def _request(
@@ -74,18 +75,27 @@ def _live_state(config: HookdConfig) -> dict[str, Any] | None:
     return state
 
 
-def _serve_foreground(config: HookdConfig, engine_name: str, port: int) -> int:
-    engine = create_engine(engine_name)
+def _serve_foreground(
+    config: HookdConfig,
+    engine_name: str,
+    port: int,
+    session_ttl_days: float,
+) -> int:
+    engine, loaded_engine, fallback = create_engine_with_fallback(engine_name)
     store = SessionStore(config, engine)
-    app = HookdApplication(store, engine_name)
+    # Old mappings are the only thing that can undo a placeholder, so they are
+    # swept before the service starts answering.
+    expired = store.sweep_expired(session_ttl_days)
+    app = HookdApplication(store, loaded_engine, engine_fallback=fallback)
     server, token, bound_port = create_server(app, HookdServerConfig(port=port))
     write_state(
         config,
         port=bound_port,
         token=token,
         pid=os.getpid(),
-        engine=engine_name,
+        engine=loaded_engine,
         started_at=time.time(),
+        engine_fallback=fallback,
     )
     stopping = threading.Event()
 
@@ -99,7 +109,12 @@ def _serve_foreground(config: HookdConfig, engine_name: str, port: int) -> int:
     for received in (signal.SIGTERM, signal.SIGINT):
         signal.signal(received, _stop)
 
-    print(f"pii-guard hookd listening on 127.0.0.1:{bound_port} (engine: {engine_name})")
+    names = "names covered" if loaded_engine == "full" else "names NOT covered"
+    swept = f", swept {expired} expired session(s)" if expired else ""
+    print(
+        f"pii-guard hookd listening on 127.0.0.1:{bound_port} "
+        f"(engine: {loaded_engine}, {names}{swept})"
+    )
     sys.stdout.flush()
     try:
         server.serve_forever()
@@ -109,7 +124,12 @@ def _serve_foreground(config: HookdConfig, engine_name: str, port: int) -> int:
     return 0
 
 
-def _serve_background(config: HookdConfig, engine_name: str, port: int) -> int:
+def _serve_background(
+    config: HookdConfig,
+    engine_name: str,
+    port: int,
+    session_ttl_days: float,
+) -> int:
     command = [
         sys.executable,
         "-m",
@@ -120,6 +140,8 @@ def _serve_background(config: HookdConfig, engine_name: str, port: int) -> int:
         engine_name,
         "--port",
         str(port),
+        "--session-ttl-days",
+        str(session_ttl_days),
     ]
     with open(os.devnull, "wb") as sink:
         subprocess.Popen(  # noqa: S603 - fixed argv, no shell
@@ -151,8 +173,8 @@ def cmd_serve(args: argparse.Namespace, config: HookdConfig) -> int:
     # A stale registration from a crashed run would otherwise block startup.
     clear_state(config)
     if args.foreground:
-        return _serve_foreground(config, args.engine, args.port)
-    return _serve_background(config, args.engine, args.port)
+        return _serve_foreground(config, args.engine, args.port, args.session_ttl_days)
+    return _serve_background(config, args.engine, args.port, args.session_ttl_days)
 
 
 def cmd_status(_args: argparse.Namespace, config: HookdConfig) -> int:
@@ -248,8 +270,14 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     serve = subparsers.add_parser("serve", help="start the service")
-    serve.add_argument("--engine", choices=("regex", "full"), default="regex")
+    serve.add_argument("--engine", choices=("regex", "full"), default="full")
     serve.add_argument("--port", type=int, default=0)
+    serve.add_argument(
+        "--session-ttl-days",
+        type=float,
+        default=DEFAULT_SESSION_TTL_DAYS,
+        help="delete stored mappings older than this at start (0 disables)",
+    )
     serve.add_argument(
         "--foreground",
         action="store_true",

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import threading
 import time
 import uuid
@@ -86,6 +87,30 @@ def create_engine(name: str) -> Engine:
 
         return PiiGuardEngine()
     raise WorkflowError("INVALID_ENGINE", "The requested engine is not supported.")
+
+
+def create_engine_with_fallback(name: str) -> tuple[Engine, str, bool]:
+    """Build *name*, dropping to ``regex`` when the full engine cannot load.
+
+    Returns the engine, the name that actually loaded, and whether a fallback
+    happened.  A missing CKIP model must not leave the user with no guard at
+    all, but it does leave names uncovered, so the caller has to be able to
+    say so out loud.
+    """
+
+    try:
+        return create_engine(name), name, False
+    except WorkflowError:
+        raise
+    except Exception as error:  # noqa: BLE001 - any model loading failure
+        if name != "full":
+            raise
+        print(
+            f"pii-guard: the full engine failed to load ({type(error).__name__}); "
+            "falling back to regex. Names are NOT covered.",
+            file=sys.stderr,
+        )
+    return create_engine("regex"), "regex", True
 
 
 def validate_session_id(session_id: object) -> str:
@@ -367,6 +392,33 @@ class SessionStore:
                 entry.unlink()
             except OSError:
                 continue
+            removed += 1
+        return removed
+
+    def sweep_expired(self, max_age_days: float) -> int:
+        """Delete stored mappings older than *max_age_days*.
+
+        A mapping is the only thing that can turn a placeholder back into a
+        real value, so it should not outlive the session that needed it.
+        """
+
+        if max_age_days <= 0:
+            return 0
+        cutoff = time.time() - max_age_days * 86400
+        removed = 0
+        try:
+            entries = list(self._config.sessions_dir.glob("*.json"))
+        except OSError:
+            return 0
+        for entry in entries:
+            try:
+                if entry.stat().st_mtime >= cutoff:
+                    continue
+                entry.unlink()
+            except OSError:
+                continue
+            with self._lock:
+                self._sessions.pop(entry.stem, None)
             removed += 1
         return removed
 

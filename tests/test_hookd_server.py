@@ -93,6 +93,27 @@ def test_health_reports_the_loaded_engine(service: RunningService) -> None:
     assert status == 200
     assert body["ok"] is True
     assert body["engine"] == "regex"
+    assert body["engine_fallback"] is False
+    assert body["names_covered"] is False
+
+
+def test_health_reports_a_full_engine_as_covering_names(tmp_path) -> None:
+    config = HookdConfig(home=tmp_path / "hookd")
+    app = HookdApplication(SessionStore(config, FakeEngine({})), "full")
+
+    assert app.health()["names_covered"] is True
+    assert app.health()["engine_fallback"] is False
+
+
+def test_health_reports_a_fallback(tmp_path) -> None:
+    config = HookdConfig(home=tmp_path / "hookd")
+    app = HookdApplication(
+        SessionStore(config, FakeEngine({})), "regex", engine_fallback=True
+    )
+
+    health = app.health()
+    assert health["engine_fallback"] is True
+    assert health["names_covered"] is False
 
 
 def test_foreign_host_header_is_rejected(service: RunningService) -> None:
@@ -323,6 +344,25 @@ def test_session_start_explains_the_placeholders(service: RunningService) -> Non
 
     assert "pii-guard" in str(reply["systemMessage"])
     assert "placeholder" in str(reply["hookSpecificOutput"]["additionalContext"])
+
+
+def test_session_start_says_names_are_uncovered_on_the_regex_engine(
+    service: RunningService,
+) -> None:
+    reply = service.hook("SessionStart", {"session_id": "s1", "source": "startup"})
+
+    assert reply["systemMessage"] == "pii-guard: on (regex only, names NOT covered)"
+    assert "NOT detected" in str(reply["hookSpecificOutput"]["additionalContext"])
+
+
+def test_session_start_says_names_are_covered_on_the_full_engine(tmp_path) -> None:
+    config = HookdConfig(home=tmp_path / "hookd")
+    app = HookdApplication(SessionStore(config, FakeEngine({})), "full")
+
+    reply = app.hook("SessionStart", {"session_id": "s1"})
+
+    assert reply["systemMessage"] == "pii-guard: on (full engine, names covered)"
+    assert "NOT detected" not in str(reply["hookSpecificOutput"]["additionalContext"])
 
 
 def test_session_start_warns_about_the_edit_limitation(service: RunningService) -> None:

@@ -47,9 +47,17 @@ class HookdServerConfig:
 class HookdApplication:
     """Request-level behaviour, independent of the HTTP plumbing."""
 
-    def __init__(self, store: SessionStore, engine_name: str) -> None:
+    def __init__(
+        self,
+        store: SessionStore,
+        engine_name: str,
+        *,
+        engine_fallback: bool = False,
+    ) -> None:
         self._store = store
         self._engine_name = engine_name
+        self._engine_fallback = engine_fallback
+        self._context = hooks.HookContext(names_covered=engine_name == "full")
         self._lock = threading.Lock()
 
     @property
@@ -60,6 +68,8 @@ class HookdApplication:
         return {
             "ok": True,
             "engine": self._engine_name,
+            "engine_fallback": self._engine_fallback,
+            "names_covered": self._context.names_covered,
             "sessions": len(self._store.summary()),
             "version": SERVICE_VERSION,
         }
@@ -87,7 +97,7 @@ class HookdApplication:
             # An unmatched event is not an error: the hook should simply do
             # nothing rather than fail the tool call it is attached to.
             return {}
-        return hooks.dispatch(self._store, event_name, payload)
+        return hooks.dispatch(self._store, event_name, payload, self._context)
 
     def sessions(self) -> dict[str, object]:
         return {"sessions": self._store.summary()}
