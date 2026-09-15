@@ -325,6 +325,19 @@ def test_session_start_explains_the_placeholders(service: RunningService) -> Non
     assert "placeholder" in str(reply["hookSpecificOutput"]["additionalContext"])
 
 
+def test_session_start_warns_about_the_edit_limitation(service: RunningService) -> None:
+    """Edit matches old_string before any hook runs, so it cannot be restored."""
+
+    reply = service.hook("SessionStart", {"session_id": "s1", "source": "startup"})
+
+    context = str(reply["hookSpecificOutput"]["additionalContext"])
+    assert "Edit" in context
+    assert "String to replace not found" in context
+    # The model must be told the way out, not just the failure.
+    assert "Write" in context
+    assert "Never guess" in context
+
+
 def test_unknown_hook_event_is_a_no_op(service: RunningService) -> None:
     assert service.hook("Notification", {"session_id": "s1"}) == {}
 

@@ -32,7 +32,14 @@ SESSION_START_CONTEXT: Final[str] = (
     "personal data has been replaced with placeholders such as <PERSON_1> or "
     "<TW_ID_NUMBER_1>. Keep those placeholders exactly as they are. When you "
     "write them back to a file or a shell command they are restored to the "
-    "real values automatically, so do not try to guess what they stand for."
+    "real values automatically, so do not try to guess what they stand for. "
+    "One important exception: Edit and MultiEdit match old_string against the "
+    "real file, which still holds the real value, and that match happens "
+    "before this guard can restore anything. An Edit whose old_string "
+    "contains a placeholder therefore fails with 'String to replace not "
+    "found'. When that happens, rewrite the whole file with Write, whose "
+    "content is restored, or make the change with a Bash command. Never guess "
+    "what a placeholder stands for in order to make an Edit match."
 )
 
 
