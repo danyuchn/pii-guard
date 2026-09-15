@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: write-restore
+description: A placeholder written back to a file must land on disk as the real value.
+tags: [guard, write]
+context:
+  scaffold_script: fixture.sh

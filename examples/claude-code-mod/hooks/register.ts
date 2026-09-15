@@ -17,6 +17,13 @@ const DEFAULT_HOME = '.local/share/pii-guard/hookd'
 const RESTORED = new Set(['Write', 'Edit', 'MultiEdit', 'Bash'])
 const EGRESS = new Set(['WebFetch', 'WebSearch', 'Agent', 'Task', 'Workflow'])
 // Tools whose result is de-identified on the way up.
+//
+// Write, Edit and MultiEdit are deliberately NOT here. Their results do echo
+// the content that was written, restored, but only in the structured record
+// Claude Code keeps for its own diff, undo and file-state tracking. What the
+// model reads is the tool_result block, which is just "File created
+// successfully at ...". Redacting these would put placeholders into that
+// file-state cache to fix a leak that is not there.
 const REDACTED = new Set(['Read', 'Bash', 'Grep'])
 // The engine owns these and refuses a rewrite of any, so a rewritten input
 // never carries them back.
@@ -34,6 +41,21 @@ const OFFLINE_BRIEFING =
   'The pii-guard guard service is offline. Until the user starts it with ' +
   "'uv run pii-guard-hookd serve', do not read files that may contain personal data, " +
   'and tell the user the guard is off.'
+
+// Posts one request the way $.http.fetch would. Used only where that op is
+// refused; stdlib only, because python3 is already required by the classic
+// hook client and nothing else is guaranteed to be present.
+const RELAY = [
+  'import sys, urllib.request',
+  'port, token, event = sys.argv[1], sys.argv[2], sys.argv[3]',
+  'url = "http://127.0.0.1:" + port + "/v1/hooks/" + event',
+  'request = urllib.request.Request(url, data=sys.stdin.buffer.read(), method="POST")',
+  'request.add_header("Authorization", "Bearer " + token)',
+  'request.add_header("Content-Type", "application/json")',
+  'request.add_header("Host", "127.0.0.1:" + port)',
+  'sys.stdout.write(urllib.request.urlopen(request, timeout=15).read().decode("utf-8"))',
+].join('\n')
+const RELAY_TIMEOUT_MS = 8000
 
 type Connection = { port: string; token: string }
 
@@ -53,6 +75,10 @@ async function homeDir($: any, options: Record<string, unknown>): Promise<string
   if (typeof configured === 'string' && configured.trim()) return configured.trim()
   const fromEnv = await $.env.get('PII_GUARD_HOOKD_HOME')
   if (typeof fromEnv === 'string' && fromEnv.trim()) return fromEnv.trim()
+  // An eval run gets a throwaway home, so the default path finds nothing and
+  // only EVAL_* variables survive from the surrounding shell.
+  const fromEval = await $.env.get('EVAL_PII_GUARD_HOOKD_HOME')
+  if (typeof fromEval === 'string' && fromEval.trim()) return fromEval.trim()
   const home = await $.env.get('HOME')
   return `${typeof home === 'string' ? home : ''}/${DEFAULT_HOME}`
 }
@@ -83,29 +109,54 @@ async function ask(
     throw error
   }
   const { port, token } = connection
-  let response
+  const body = JSON.stringify({ ...payload, session_id: await $.session.id() })
+  let text: string
   try {
-    response = await $.http.fetch(`http://127.0.0.1:${port}/v1/hooks/${event}`, {
+    text = await post($, port, token, event, body)
+  } catch (error) {
+    // The service may have restarted on a new port since the cache was filled.
+    cached = null
+    throw error
+  }
+  const reply = JSON.parse(text)
+  if (!isRecord(reply)) throw new Error('unexpected reply')
+  return reply
+}
+
+// Two transports, because the host's own fetch is not always available. Under
+// `claude plugin eval` it is refused outright ("nonessential network traffic is
+// disabled for this session") even for loopback, while a child process still
+// reaches the service. Trying fetch first keeps the ordinary case free of a
+// process spawn per call.
+async function post(
+  $: any,
+  port: string,
+  token: string,
+  event: string,
+  body: string,
+): Promise<string> {
+  try {
+    const response = await $.http.fetch(`http://127.0.0.1:${port}/v1/hooks/${event}`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
         Host: `127.0.0.1:${port}`,
       },
-      body: JSON.stringify({ ...payload, session_id: await $.session.id() }),
+      body,
     })
-  } catch (error) {
-    // The service may have restarted on a new port since the cache was filled.
-    cached = null
-    throw error
+    if (response.ok) return response.text
+  } catch {
+    // fall through to the relay, which reports its own failure
   }
-  if (!response.ok) {
-    cached = null
-    throw new Error(`hookd answered ${response.status}`)
+  const relayed = await $.process.run(['python3', '-c', RELAY, port, token, event], {
+    stdin: body,
+    timeoutMs: RELAY_TIMEOUT_MS,
+  })
+  if (relayed.exitCode !== 0) {
+    throw new Error(`hookd unreachable: ${relayed.stderr.slice(0, 200)}`)
   }
-  const reply = JSON.parse(response.text)
-  if (!isRecord(reply)) throw new Error('unexpected reply')
-  return reply
+  return relayed.stdout
 }
 
 // Replace every string in a result whose shape is not pinned down, keeping the

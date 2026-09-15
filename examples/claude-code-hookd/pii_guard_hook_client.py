@@ -25,6 +25,7 @@ import urllib.request
 
 DEFAULT_HOME = "~/.local/share/pii-guard/hookd"
 HOME_ENV_VAR = "PII_GUARD_HOOKD_HOME"
+EVAL_HOME_ENV_VAR = "EVAL_PII_GUARD_HOOKD_HOME"
 DEFAULT_CONFIG_PATH = "~/.config/pii-guard/hookd.json"
 CONFIG_ENV_VAR = "PII_GUARD_HOOKD_CONFIG"
 DEFAULT_TIMEOUT = 20.0
@@ -68,7 +69,14 @@ SESSION_CONTEXT = (
 
 
 def _home() -> str:
-    return os.path.expanduser(os.environ.get(HOME_ENV_VAR, "").strip() or DEFAULT_HOME)
+    # EVAL_ prefixed variables are the only ones a `claude plugin eval` run
+    # inherits from the surrounding shell, and it gets a throwaway home.
+    configured = (
+        os.environ.get(HOME_ENV_VAR, "").strip()
+        or os.environ.get(EVAL_HOME_ENV_VAR, "").strip()
+        or DEFAULT_HOME
+    )
+    return os.path.expanduser(configured)
 
 
 def _connection() -> tuple[int, str]:

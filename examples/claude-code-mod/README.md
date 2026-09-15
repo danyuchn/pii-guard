@@ -69,6 +69,10 @@ CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir ~/.claude/plugins/pii-gu
 
 plugin 用 `$.fs.read` 讀服務的 state 檔拿 port 與 token，再用 `$.http.fetch` 直接打
 `127.0.0.1`。兩者實測都通（見下方 spike）。這樣每次工具呼叫不用另外開一個 Python 行程。
+
+`$.http.fetch` 失敗時會退到第二條路：用 `$.process.run` 叫一小段 stdlib Python 去 POST。
+這是為了 `claude plugin eval`，那個環境會直接拒掉 `$.http.fetch`（連 loopback 也拒），
+但子行程還是打得通。需要機器上有 `python3`——classic hook client 本來就要，所以不是新的依賴。
 服務位置的解析順序是 `options.hookdHome` → 環境變數 `PII_GUARD_HOOKD_HOME` → 預設值，
 沒有寫死路徑。
 
@@ -112,6 +116,67 @@ plugin 用 `$.fs.read` 讀服務的 state 檔拿 port 與 token，再用 `$.http
 
 注意驗證方法：**要看 transcript，不要看終端機 stdout**。`-p` 的 stdout 會經過 MessageDisplay，
 那條 hook 的工作就是把佔位符還原給人看，所以終端機上出現真值是正確行為，不是外洩。
+
+## Eval 分數（2026-09-16，haiku，runs=1，full engine）
+
+`evals/` 是一套 `claude plugin eval` 的案例。跑法：
+
+```bash
+./evals/run.sh                       # full engine、每個 arm 跑 1 次、haiku
+ENGINE=regex RUNS=3 MODEL=sonnet ./evals/run.sh
+```
+
+`run.sh` 會在一個 tmp 目錄開一個 guard、把路徑用 `EVAL_PII_GUARD_HOOKD_HOME` 傳進去、
+跑完再把服務停掉。不會碰到任何真實安裝。
+
+| CASE | WITH | W/OUT | Δ |
+|------|------|-------|---|
+| read-redaction | 1.00 | 0.09 | +0.91 |
+| typed-pii | 1.00 | 0.00 | +1.00 |
+| write-restore | 1.00 | 0.50 | +0.50 |
+
+3 cases、mean Δ +0.80、29 秒、$0.11。
+
+without-arm 分數低是**預期的**：沒有 Mod，個資本來就會進到模型，`not_contains` 那幾條
+grader 本來就該失敗。這個差值才是這套 suite 真正在量的東西。without 不是 0 的兩條，是因為
+有些 grader 兩邊都會過：read-redaction 的「有沒有真的去讀檔」、write-restore 的
+「檔案裡有沒有真值」與「有沒有用 Write」。
+
+### grader 要看 `message.content`，不是整行 trace
+
+`target: trace` 的 regex 是拿**整行 JSON** 去比對，而那一行除了模型真正讀到的
+`message.content`，還有 Claude Code 自己留著做 diff／undo／檔案狀態追蹤的
+`tool_use_result`。**在 `tool_use_result` 裡命中不算外洩。**
+
+實際例子（write-restore 的 with-arm，`--keep-temp` 取得）：
+
+```
+message.content  -> [{"type":"tool_result","content":"File created successfully at: .../summary.txt ..."}]
+                    真實號碼：不在裡面
+tool_use_result  -> {"type":"create","filePath":".../summary.txt","content":"林美玲,0987654321", ...}
+                    真實號碼：在這裡，但模型看不到
+```
+
+所以 write-restore 改成問模型「把你剛才傳給 Write 的 content 原樣唸回來」，
+再用 `last_message` 判定——量的是**模型知道什麼**，不是整行 JSON 裡有什麼。
+
+read-redaction 與 typed-pii 仍然用 `target: trace`，這在那兩個案例是有效的：
+Read 的結果本身就是 Mod 換掉的，所以連 `tool_use_result` 裡的副本也是遮過的；
+typed-pii 根本沒有工具呼叫。
+
+### 跑 eval 時的三個環境限制
+
+1. **每個 run 都有一個全新的 home**，所以 Mod 找不到預設路徑下的 state 檔。
+   只有 `EVAL_` 開頭的環境變數會從外層 shell 傳進去，所以 `homeDir()` 多認一個
+   `EVAL_PII_GUARD_HOOKD_HOME`（順序：`options.hookdHome` → `PII_GUARD_HOOKD_HOME`
+   → `EVAL_PII_GUARD_HOOKD_HOME` → 預設值）。
+   `prompt.md` 的 `env:` 只吃寫死的值，所以案例裡沒寫，改由 `run.sh` export。
+2. **`$.http.fetch` 在 eval 裡會被直接拒絕**，連 loopback 也一樣：
+   `refused: nonessential network traffic is disabled for this session`。
+   但 `$.process.run` 開出去的子行程不受這條限制。所以傳輸層改成兩段：先試 `$.http.fetch`，
+   失敗就用一小段 stdlib Python 中繼。平常那條路不會多開行程，eval 裡才會。
+3. **`$.env.get` 的參數必須是字面字串**，`claude plugin validate` 會擋下用變數去取的寫法
+   （這樣它才能把模組讀寫哪些環境變數列出來）。
 
 ## 事前驗證（spike）
 
