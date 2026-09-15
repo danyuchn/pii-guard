@@ -1,0 +1,50 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"__HOOKD_CLIENT__\" SessionStart",
+            "statusMessage": "Checking pii-guard..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read|Bash|Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"__HOOKD_CLIENT__\" PostToolUse",
+            "statusMessage": "De-identifying tool output..."
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"__HOOKD_CLIENT__\" PreToolUse",
+            "statusMessage": "Restoring real values..."
+          }
+        ]
+      }
+    ],
+    "MessageDisplay": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"__HOOKD_CLIENT__\" MessageDisplay"
+          }
+        ]
+      }
+    ]
+  }
+}
