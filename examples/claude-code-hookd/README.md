@@ -19,6 +19,7 @@ Claude 呼叫 Read/Bash/Grep
   模型產出含 <PERSON_1> 的內容
         │
         ├─► PreToolUse(Write/Edit/MultiEdit/Bash) ──► 還原真值 ──► 寫進磁碟
+        │      註：Edit 的 old_string 例外，見「限制」一節
         │
         └─► MessageDisplay ──► 還原真值 ──► 只顯示給你看（不回模型）
 ```
@@ -65,13 +66,42 @@ uv run pii-guard-hookd serve
 文件裡真正敏感的常常是人名，所以要靠這套防線就用 `--engine full`。
 實測 recall 見專案根目錄 README 的 benchmark 段。
 
+## 已驗證（2026-09-15，Claude Code 2.1.272）
+
+以一個 Sonnet session 實跑，判讀依據是 transcript JSONL 而不是畫面。
+
+| 情境 | 結果 |
+|------|------|
+| `Read` 之後模型只看到 `<TW_MOBILE_1>` 這類佔位符 | 通過 |
+| 同一個真值跨 `Read` 與 `Bash` 拿到同一個佔位符 | 通過 |
+| `MessageDisplay` 畫面顯示真值、transcript 仍是佔位符 | 通過 |
+| `Write` 寫進磁碟的是真值、transcript 的 tool_use 仍是佔位符 | 通過 |
+| `Bash` stdout 被遮蔽；命令列裡的佔位符執行前被還原 | 通過 |
+| 服務停掉時 `Read` 回擋住的樣板、`Write` 被 deny | 通過 |
+| `Edit` 的 `old_string` 帶佔位符 | **失敗**，見下節 |
+| `Grep` 的葉節點遮蔽 | **未實測**（該 session 的環境停用了 `Grep`） |
+
+## 限制：`Edit` 的 `old_string` 不會被還原
+
+`Edit` 與 `MultiEdit` 用 `old_string` 去比對**磁碟上的真實檔案**，而那個比對發生在
+**hook 觸發之前**。官方 hooks 文件寫得很清楚：輸入若沒通過 schema 或工具自身的驗證，
+「會在 hooks 執行前就結束，因此 PreToolUse 與 PostToolUseFailure 都不會觸發」。
+
+所以 `old_string` 裡帶佔位符的 `Edit` 會直接失敗，錯誤訊息是
+`String to replace not found`，這條路徑我們補不了。
+
+`new_string` 仍然會被還原，所以 `Edit`／`MultiEdit` 留在 matcher 裡。
+遇到這個錯誤時的正解寫在 SessionStart 送給模型的 context 裡：改用 `Write`
+重寫整個檔案（`content` 會被還原），或用 `Bash` 指令改。
+**絕對不要為了讓 `Edit` 對得上而去猜佔位符背後的真值。**
+
 ## 失敗時的行為：一律擋住（fail closed）
 
 hook client 連不到服務、逾時、收到非 2xx、或收到看不懂的回覆時，**不會放行原始內容**：
 
 - **Read**：檔案內容換成一行「hookd unreachable」說明，其餘欄位照原樣回填。
 - **Bash**：stdout／stderr 同樣換掉。
-- **Grep**：結構保留，每個字串葉節點換掉。
+- **Grep**：結構保留，每個字串葉節點換掉（**未實測**，見上面的驗證表）。
 - **Write／Edit／MultiEdit／Bash（寫入側）**：直接 `deny`，理由是佔位符還原不了。
 - **MessageDisplay**：每則訊息的第一個 delta 前面加上離線標記。
 - **SessionStart**：送出明顯的警告，並告訴模型在使用者啟動服務前不要讀敏感檔案。
@@ -79,21 +109,41 @@ hook client 連不到服務、逾時、收到非 2xx、或收到看不懂的回�
 這是刻意的取捨。`type: "http"` 的 hook 連不上時會 fail **open**，所以這裡用
 `type: "command"` 搭配一支自己會擋的 client。
 
+**服務停著的時候，每一個 `Write`／`Edit`／`MultiEdit`／`Bash` 都會被 deny，
+包含那些根本沒有佔位符的。** 這是刻意的，不是 bug：hook client 連不到服務時，
+沒有任何辦法知道某段內容裡有沒有佔位符——能判斷的那個東西正是連不上的服務。
+要恢復寫入就把服務啟動起來，或把 hooks 從 settings 拿掉。
+
 ## 涵蓋範圍：明說擋不到哪些
 
 擋得到：`Read`、`Bash`、`Grep` 的輸出，含 subagent 發出的同名工具呼叫。
 
 **擋不到**：
 
+- **prompt 裡用 `@` 引用的檔案**。官方文件說明這類檔案是直接插進 prompt 的，
+  **不經過任何工具呼叫**，所以沒有任何 hook 會觸發。這是最容易踩到的一個洞：
+  你以為 `@secrets.csv` 和 `Read secrets.csv` 一樣受保護，其實完全沒有。
 - **你自己打進去的字**（UserPromptSubmit）。你貼進對話框的個資不經過這條路。
 - **Compaction 摘要**。壓縮時模型看的是已經在 context 裡的內容，那些已經是佔位符，
   但摘要本身不再經過 hook。
 - **MCP server 的輸出**，除非你自己把工具名加進 PostToolUse 的 matcher。
 - **會記錄原始工具輸出的 telemetry**。hook 換掉的是模型看到的東西，不是磁碟上的紀錄。
-- **transcript 存的是佔位符**，所以 `--resume` 回來看到的是佔位符，不是真值。
+- **transcript 存的是佔位符**。這對安全是好事（真值沒有落進 transcript），但代價是
+  `--resume` 回來看到的是佔位符，要等 `MessageDisplay` 還原後才看得到真值。
+- **`Edit` 的 `old_string`**，原因見上面的「限制」一節。
 - **惡意情境**。這套擋的是「不小心把個資餵給模型」，不是擋一個想繞過它的人。
 
 另外，偵測本身有 recall 上限（見上表），所以**這是 best-effort，不是保證**。
+
+### `Bash` 還原是唯一擴大曝險的路徑
+
+`PreToolUse` 會把 `Bash` 指令裡的佔位符換成真值才執行，所以真值會出現在
+**process list 與 shell history** 裡。這一條是刻意保留的：不還原的話，
+對受保護檔案下 `grep`／`sed`／`awk` 全部會失效，等於逼模型改用別的方式繞開防線。
+
+如果你的威脅模型包含「同一台機器上的其他使用者看得到 process list」，
+就把 `Bash` 從 `PreToolUse` 的 matcher 拿掉，代價是模型無法用 shell 指令
+處理含佔位符的內容。
 
 ## 和 `pii-safe-documents` skill 的關係
 
