@@ -557,3 +557,127 @@ def test_reinstall_keeps_a_hand_edited_allowlist(env) -> None:
 
     kept = json.loads(config_file.read_text(encoding="utf-8"))["policy"]
     assert kept["allowed_tools"] == ["mcp__local__read"]
+
+
+# --- The Mod front end -------------------------------------------------------
+
+
+@pytest.fixture
+def mod_env(env, monkeypatch) -> dict[str, Path]:
+    """The installation environment with plugin validation stubbed out.
+
+    Running the real `claude plugin validate` would make these tests depend on
+    a Claude Code build being present, which the installer's own logic does not.
+    """
+
+    monkeypatch.setattr(installer, "validate_plugin", lambda path: (True, "Validation passed"))
+    return env
+
+
+def test_mod_install_keeps_only_the_display_hook(mod_env) -> None:
+    assert _install("--mod") == 0
+
+    settings = _settings(mod_env["settings"])
+    assert sorted(settings["hooks"]) == ["MessageDisplay"]
+
+
+def test_mod_install_puts_the_plugin_where_the_launch_line_points(mod_env) -> None:
+    _install("--mod")
+
+    plugin = installer.mod_target(mod_env["config_dir"])
+    assert (plugin / ".claude-plugin" / "plugin.json").is_file()
+    assert (plugin / "hooks" / "hooks.json").is_file()
+    assert (plugin / "hooks" / "register.ts").is_file()
+
+
+def test_mod_install_prints_the_launch_line(mod_env, capsys) -> None:
+    _install("--mod")
+
+    out = capsys.readouterr().out
+    plugin = installer.mod_target(mod_env["config_dir"])
+    assert f"CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir {plugin}" in out
+
+
+def test_mod_install_supersedes_the_classic_hooks(mod_env) -> None:
+    """A classic install followed by a mod install must not leave both running."""
+
+    _install()
+    assert sorted(_settings(mod_env["settings"])["hooks"]) != ["MessageDisplay"]
+
+    _install("--mod")
+
+    assert sorted(_settings(mod_env["settings"])["hooks"]) == ["MessageDisplay"]
+
+
+def test_mod_install_keeps_a_foreign_hook(mod_env) -> None:
+    mod_env["settings"].write_text(
+        json.dumps({"hooks": {"PreToolUse": [FOREIGN_HOOK]}}), encoding="utf-8"
+    )
+
+    _install("--mod")
+
+    settings = _settings(mod_env["settings"])
+    assert settings["hooks"]["PreToolUse"] == [FOREIGN_HOOK]
+    assert sorted(settings["hooks"]) == ["MessageDisplay", "PreToolUse"]
+
+
+def test_mod_install_can_be_hardened(mod_env) -> None:
+    assert main(["install", "--no-launchd", "--mod", "--harden"]) == 0
+
+    settings = _settings(mod_env["settings"])
+    assert settings["sandbox"] == installer.SANDBOX_BLOCK
+    assert settings["permissions"]["deny"] == ["WebFetch", "WebSearch"]
+    # The mod checks prompts itself, so no classic UserPromptSubmit entry.
+    assert sorted(settings["hooks"]) == ["MessageDisplay"]
+
+
+def test_doctor_mod_reports_a_valid_plugin(mod_env, capsys) -> None:
+    _install("--mod")
+    capsys.readouterr()
+
+    main(["doctor", "--mod"])
+
+    out = capsys.readouterr().out
+    assert "[OK  ] mod plugin" in out
+    assert "[OK  ] mod validates" in out
+    assert "[OK  ] mod launch" in out
+
+
+def test_doctor_mod_fails_when_the_plugin_does_not_validate(env, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(installer, "validate_plugin", lambda path: (True, "ok"))
+    _install("--mod")
+    monkeypatch.setattr(installer, "validate_plugin", lambda path: (False, "Validation failed"))
+    capsys.readouterr()
+
+    assert main(["doctor", "--mod"]) == 1
+
+    assert "[FAIL] mod validates: Validation failed" in capsys.readouterr().out
+
+
+def test_doctor_mod_fails_without_the_plugin(env, capsys) -> None:
+    _install()
+    capsys.readouterr()
+
+    assert main(["doctor", "--mod"]) == 1
+
+    assert "[FAIL] mod plugin" in capsys.readouterr().out
+
+
+def test_uninstall_removes_the_mod_plugin(mod_env) -> None:
+    _install("--mod")
+    plugin = installer.mod_target(mod_env["config_dir"])
+    assert plugin.exists()
+
+    assert main(["uninstall"]) == 0
+
+    assert not plugin.exists()
+    assert not plugin.is_symlink()
+
+
+def test_mod_install_is_idempotent(mod_env) -> None:
+    _install("--mod")
+    _install("--mod")
+
+    settings = _settings(mod_env["settings"])
+    assert sorted(settings["hooks"]) == ["MessageDisplay"]
+    assert len(settings["hooks"]["MessageDisplay"]) == 1

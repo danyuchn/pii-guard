@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -326,10 +327,23 @@ def cmd_install(args: argparse.Namespace, config: HookdConfig) -> int:
     client = installer.install_client(config_dir)
     print(f"Installed hook client: {client}")
 
+    plugin: Path | None = None
+    if args.mod:
+        plugin = installer.install_mod(config_dir)
+        print(f"Installed mod plugin: {plugin}")
+
     backup = installer.backup_settings(settings_file)
     if backup is not None:
         print(f"Backed up settings: {backup}")
-    merged = installer.merge_hooks(settings, installer.hooks_block(client, hardened=args.harden))
+    if args.mod:
+        # The Mod supersedes every classic hook but MessageDisplay, so the
+        # others are cleared rather than left to run a second time.
+        settings, superseded = installer.remove_hooks(settings)
+        if superseded:
+            print(f"Removed {superseded} classic hook entr(ies) the mod supersedes")
+    merged = installer.merge_hooks(
+        settings, installer.hooks_block(client, hardened=args.harden, mod=args.mod)
+    )
     if args.harden:
         merged, warnings = installer.harden_settings(merged)
         for warning in warnings:
@@ -366,9 +380,19 @@ def cmd_install(args: argparse.Namespace, config: HookdConfig) -> int:
             _start_now(config, repo, args.engine)
 
     print()
+    if plugin is not None:
+        print("Start Claude Code with the mod loaded:")
+        print(f"  {installer.launch_line(plugin)}")
+        print("The mod only loads with that flag; without it the guard is off.")
+        print()
     return _report(
         installer.doctor(
-            config, config_dir, installer_config, args.scope, hardened=args.harden
+            config,
+            config_dir,
+            installer_config,
+            args.scope,
+            hardened=args.harden,
+            mod=args.mod,
         )
     )
 
@@ -403,6 +427,14 @@ def cmd_uninstall(args: argparse.Namespace, config: HookdConfig) -> int:
     client = installer.client_target(config_dir)
     client.unlink(missing_ok=True)
     print(f"Removed hook client: {client}")
+
+    plugin = installer.mod_target(config_dir)
+    if plugin.is_symlink() or plugin.is_file():
+        plugin.unlink()
+        print(f"Removed mod plugin: {plugin}")
+    elif plugin.is_dir():
+        shutil.rmtree(plugin)
+        print(f"Removed mod plugin: {plugin}")
     print("Left in place: settings backups, the installer config and stored mappings.")
     print("Run 'pii-guard-hookd purge --all' to forget stored mappings.")
     del config
@@ -428,6 +460,7 @@ def cmd_doctor(args: argparse.Namespace, config: HookdConfig) -> int:
             installer.hookd_config_path(),
             args.scope,
             hardened=args.harden,
+            mod=args.mod,
         )
     )
 
@@ -459,6 +492,11 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--scope", choices=("user", "project"), default="user")
     setup.add_argument("--no-launchd", action="store_true", help="do not register auto-start")
     setup.add_argument(
+        "--mod",
+        action="store_true",
+        help="install the Claude Mods front end instead of the classic hooks",
+    )
+    setup.add_argument(
         "--harden",
         action="store_true",
         help="also sandbox the session, deny egress tools and check prompts",
@@ -470,6 +508,7 @@ def build_parser() -> argparse.ArgumentParser:
     check = subparsers.add_parser("doctor", help="check every part of the installation")
     check.add_argument("--scope", choices=("user", "project"), default="user")
     check.add_argument("--harden", action="store_true", help="also check the hardened settings")
+    check.add_argument("--mod", action="store_true", help="also check the mod front end")
 
     subparsers.add_parser("status", help="report whether the service is running")
     subparsers.add_parser("stop", help="stop the running service")

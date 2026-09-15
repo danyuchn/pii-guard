@@ -50,6 +50,12 @@ SANDBOX_BLOCK: Final[dict[str, Any]] = {
     "network": {"allowedDomains": []},
 }
 SEED_TERMS_RELATIVE: Final[str] = ".pii-guard/terms.txt"
+# The Mod front end: a plugin directory whose hooks module replaces every
+# classic hook except MessageDisplay, which has no function-hook equivalent
+# because display-only restore does not exist in that API.
+MOD_DIRECTORY: Final[str] = "claude-code-mod"
+MOD_NAME: Final[str] = "pii-guard"
+FUNCTION_HOOKS_ENV_VAR: Final[str] = "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS"
 SESSION_START_MATCHER: Final[str] = "startup|resume|clear"
 HEALTH_TIMEOUT_SECONDS: Final[float] = 90.0
 POLL_SECONDS: Final[float] = 0.4
@@ -115,6 +121,65 @@ def client_target(config_dir: Path) -> Path:
     return config_dir / "hooks" / HOOK_MARKER / CLIENT_NAME
 
 
+def mod_source() -> Path:
+    """Locate the Mod plugin directory shipped with this checkout."""
+
+    path = repo_root() / "examples" / MOD_DIRECTORY
+    if not (path / ".claude-plugin" / "plugin.json").is_file():
+        raise WorkflowError("MOD_NOT_FOUND", "The Mod plugin directory is missing.")
+    return path
+
+
+def mod_target(config_dir: Path) -> Path:
+    return config_dir / "plugins" / MOD_NAME
+
+
+def install_mod(config_dir: Path) -> Path:
+    """Point a stable path at the Mod, so the launch line never moves.
+
+    A symlink keeps the plugin current when the checkout is updated; where one
+    cannot be made the directory is copied instead.
+    """
+
+    target = mod_target(config_dir)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=JOB_MODE)
+    source = mod_source()
+    if target.is_symlink() or target.is_file():
+        target.unlink()
+    elif target.is_dir():
+        shutil.rmtree(target)
+    try:
+        target.symlink_to(source, target_is_directory=True)
+    except OSError:
+        shutil.copytree(source, target)
+    return target
+
+
+def launch_line(plugin_dir: Path) -> str:
+    """The exact command that starts Claude Code with the Mod loaded."""
+
+    return f"{FUNCTION_HOOKS_ENV_VAR}=1 claude --plugin-dir {plugin_dir}"
+
+
+def validate_plugin(plugin_dir: Path) -> tuple[bool, str]:
+    """Ask Claude Code whether the plugin loads. Tests monkeypatch this."""
+
+    try:
+        completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            ["claude", "plugin", "validate", str(plugin_dir)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+            env={**os.environ, FUNCTION_HOOKS_ENV_VAR: "1"},
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, str(error)
+    output = (completed.stdout or completed.stderr).strip().splitlines()
+    detail = output[-1].strip() if output else "no output"
+    return completed.returncode == 0, detail
+
+
 def settings_path(config_dir: Path, scope: str) -> Path:
     if scope == "user":
         return config_dir / "settings.json"
@@ -140,9 +205,14 @@ def serve_command(repo: Path, engine: str) -> list[str]:
 
 
 def hooks_block(
-    client_path: Path, *, hardened: bool = False
+    client_path: Path, *, hardened: bool = False, mod: bool = False
 ) -> dict[str, list[dict[str, Any]]]:
-    """Build the hooks this installer owns, all tagged with the marker."""
+    """Build the hooks this installer owns, all tagged with the marker.
+
+    With the Mod loaded only MessageDisplay is left here: the Mod's hooks
+    module supersedes the others, and running both would redact twice and
+    print the session banner twice.
+    """
 
     def entry(event: str, message: str, matcher: str | None = None) -> dict[str, Any]:
         block: dict[str, Any] = {
@@ -157,6 +227,9 @@ def hooks_block(
         if matcher is not None:
             block["matcher"] = matcher
         return block
+
+    if mod:
+        return {"MessageDisplay": [entry("MessageDisplay", "pii-guard: restoring display")]}
 
     block: dict[str, list[dict[str, Any]]] = {
         "SessionStart": [
@@ -504,6 +577,7 @@ def doctor(
     *,
     check_launchd: bool | None = None,
     hardened: bool = False,
+    mod: bool = False,
 ) -> list[CheckResult]:
     """Check every moving part and report one line each."""
 
@@ -532,7 +606,7 @@ def doctor(
             for event, entries in (raw_hooks or {}).items()
             if isinstance(entries, list) and any(_is_ours(item) for item in entries)
         )
-        expected = sorted(hooks_block(client, hardened=hardened))
+        expected = sorted(hooks_block(client, hardened=hardened, mod=mod))
         if events == expected:
             detail = f"{settings_file} ({len(events)})"
             results.append(CheckResult("hooks in settings", True, detail))
@@ -546,6 +620,9 @@ def doctor(
         results.append(CheckResult("installer config", True, str(installer_config)))
     else:
         results.append(CheckResult("installer config", False, f"missing at {installer_config}"))
+
+    if mod:
+        results.extend(_mod_checks(config_dir))
 
     if hardened:
         results.extend(_hardening_checks(settings))
@@ -606,6 +683,21 @@ def doctor(
     else:
         results.append(CheckResult("session store", False, f"{sessions_dir} is not mode 0700"))
 
+    return results
+
+
+def _mod_checks(config_dir: Path) -> list[CheckResult]:
+    """Report that the plugin is in place and that Claude Code accepts it."""
+
+    results: list[CheckResult] = []
+    plugin = mod_target(config_dir)
+    if not (plugin / ".claude-plugin" / "plugin.json").is_file():
+        results.append(CheckResult("mod plugin", False, f"missing at {plugin}"))
+        return results
+    results.append(CheckResult("mod plugin", True, str(plugin)))
+    ok, detail = validate_plugin(plugin)
+    results.append(CheckResult("mod validates", ok, detail))
+    results.append(CheckResult("mod launch", True, launch_line(plugin)))
     return results
 
 
