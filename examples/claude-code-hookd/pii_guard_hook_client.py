@@ -17,14 +17,25 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
 DEFAULT_HOME = "~/.local/share/pii-guard/hookd"
 HOME_ENV_VAR = "PII_GUARD_HOOKD_HOME"
+DEFAULT_CONFIG_PATH = "~/.config/pii-guard/hookd.json"
+CONFIG_ENV_VAR = "PII_GUARD_HOOKD_CONFIG"
 DEFAULT_TIMEOUT = 20.0
 DISPLAY_TIMEOUT = 5.0
+# How long SessionStart waits for a service it just started.  A first run
+# that still has to download a model can exceed this; the session then gets
+# the offline warning while the service keeps loading for the next one.
+try:
+    START_TIMEOUT = float(os.environ.get("PII_GUARD_HOOKD_START_TIMEOUT", "") or 20.0)
+except ValueError:
+    START_TIMEOUT = 20.0
 
 OFFLINE = (
     "[pii-guard] hookd unreachable; {what} withheld. "
@@ -74,6 +85,70 @@ def _connection() -> tuple[int, str]:
         return int(state["port"]), str(state["token"])
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise RuntimeError("no hookd state") from error
+
+
+def _start_service() -> bool:
+    """Start the service on demand and wait for it to answer.
+
+    Only SessionStart does this. Every other event stays fail-closed and fast,
+    because a tool call must not block for the seconds a model load can take.
+    """
+
+    config_path = os.path.expanduser(
+        os.environ.get(CONFIG_ENV_VAR, "").strip() or DEFAULT_CONFIG_PATH
+    )
+    try:
+        with open(config_path, encoding="utf-8") as handle:
+            command = json.load(handle)["serve_command"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
+        return False
+    # The stored command runs in the foreground for launchd; dropping that flag
+    # makes it detach on its own.
+    command = [part for part in command if part != "--foreground"]
+
+    lock_path = os.path.join(_home(), "starting.lock")
+    try:
+        os.makedirs(_home(), mode=0o700, exist_ok=True)
+        # O_EXCL makes this the one process that gets to spawn the service.
+        lock = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        if time.time() - os.path.getmtime(lock_path) < START_TIMEOUT:
+            return _wait_for_service()
+        os.unlink(lock_path)
+        return _start_service()
+    except OSError:
+        return False
+    try:
+        os.close(lock)
+        subprocess.Popen(  # noqa: S603 - argv from an owner-only config file
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except (OSError, ValueError):
+        return False
+    finally:
+        try:
+            os.unlink(lock_path)
+        except OSError:
+            pass
+    return _wait_for_service()
+
+
+def _wait_for_service() -> bool:
+    deadline = time.time() + START_TIMEOUT
+    while time.time() < deadline:
+        try:
+            _ask_service("Ping", {}, 2.0)
+        except Exception:  # noqa: BLE001 - any failure means not ready yet
+            time.sleep(0.4)
+            continue
+        return True
+    return False
 
 
 def _ask_service(event: str, payload: dict, timeout: float) -> dict:
@@ -198,7 +273,17 @@ def main(argv: list[str]) -> int:
     try:
         reply = _ask_service(event, payload, timeout)
     except (OSError, ValueError, RuntimeError, urllib.error.URLError):
-        reply = fail_closed(event, payload)
+        # A session opening with no service running is the normal case, not an
+        # error: start it now so the user never has to.  Other events must stay
+        # fast, so they fail closed instead of waiting for a model to load.
+        reply = None
+        if event == "SessionStart" and _start_service():
+            try:
+                reply = _ask_service(event, payload, timeout)
+            except (OSError, ValueError, RuntimeError, urllib.error.URLError):
+                reply = None
+        if reply is None:
+            reply = fail_closed(event, payload)
     json.dump(reply, sys.stdout, ensure_ascii=False)
     sys.stdout.write("\n")
     return 0

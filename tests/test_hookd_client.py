@@ -241,3 +241,158 @@ def test_a_subagent_shares_the_parent_session_mapping(online_home: Path) -> None
 
     updated = reply["hookSpecificOutput"]["updatedToolOutput"]
     assert updated["file"]["content"] == "聯絡人 <PERSON_1> <TW_MOBILE_1>"
+
+
+FAKE_SERVE = """
+import json, os, stat, sys
+argv_log, home, port, token = sys.argv[1:5]
+with open(argv_log, "w") as handle:
+    json.dump(sys.argv, handle)
+os.makedirs(home, mode=0o700, exist_ok=True)
+state = os.path.join(home, "state.json")
+with open(state, "w") as handle:
+    json.dump({"version": 1, "port": int(port), "token": token, "pid": os.getpid(),
+               "engine": "regex", "started_at": 0.0}, handle)
+os.chmod(state, 0o600)
+env = os.path.join(home, "state.env")
+with open(env, "w") as handle:
+    handle.write("PII_HOOKD_PORT=%s\\nPII_HOOKD_TOKEN=%s\\n" % (port, token))
+os.chmod(env, 0o600)
+"""
+
+
+@pytest.fixture
+def lazy_start(tmp_path) -> Iterator[dict[str, Path]]:
+    """A server that is running but not yet advertised in the state file.
+
+    The fake serve command publishes the state file, which is exactly what the
+    client is waiting for, without needing a real engine load.
+    """
+
+    config = HookdConfig(home=tmp_path / "hookd")
+    store = SessionStore(config, FakeEngine(dict(SPANS)))
+    server, token, port = create_server(
+        HookdApplication(store, "regex"), HookdServerConfig(port=0)
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    argv_log = tmp_path / "argv.json"
+    installer_config = tmp_path / "hookd-config.json"
+    installer_config.write_text(
+        json.dumps(
+            {
+                "repo": str(tmp_path),
+                "engine": "regex",
+                "serve_command": [
+                    sys.executable,
+                    "-c",
+                    FAKE_SERVE,
+                    str(argv_log),
+                    str(config.home),
+                    str(port),
+                    token,
+                    "--foreground",
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    try:
+        yield {"home": config.home, "config": installer_config, "argv_log": argv_log}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def run_with_config(
+    event: str,
+    payload: dict[str, object],
+    home: Path,
+    config: Path,
+    start_timeout: str = "20",
+) -> dict[str, object]:
+    completed = subprocess.run(
+        [sys.executable, str(CLIENT), event],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env={
+            "PII_GUARD_HOOKD_HOME": str(home),
+            "PII_GUARD_HOOKD_CONFIG": str(config),
+            "PII_GUARD_HOOKD_START_TIMEOUT": start_timeout,
+            "PATH": "/usr/bin:/bin",
+        },
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+
+def test_session_start_starts_the_service_on_demand(lazy_start) -> None:
+    reply = run_with_config(
+        "SessionStart",
+        {"session_id": "s1", "source": "startup"},
+        lazy_start["home"],
+        lazy_start["config"],
+    )
+
+    # The offline warning would say "NOT running"; this is the live reply.
+    assert reply["systemMessage"] == "pii-guard: on (regex only, names NOT covered)"
+    assert (lazy_start["home"] / "state.env").is_file()
+
+
+def test_lazy_start_drops_the_foreground_flag(lazy_start) -> None:
+    """The stored command is launchd's; on demand it must daemonize itself."""
+
+    run_with_config(
+        "SessionStart",
+        {"session_id": "s1", "source": "startup"},
+        lazy_start["home"],
+        lazy_start["config"],
+    )
+
+    argv = json.loads(lazy_start["argv_log"].read_text(encoding="utf-8"))
+    assert "--foreground" not in argv
+
+
+def test_other_events_never_start_the_service(lazy_start) -> None:
+    reply = run_with_config(
+        "PostToolUse", READ_PAYLOAD, lazy_start["home"], lazy_start["config"]
+    )
+
+    assert "hookd unreachable" in (
+        reply["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"]
+    )
+    assert not (lazy_start["home"] / "state.env").exists()
+    assert not lazy_start["argv_log"].exists()
+
+
+def test_session_start_warns_when_there_is_no_installer_config(tmp_path: Path) -> None:
+    reply = run_with_config(
+        "SessionStart",
+        {"session_id": "s1", "source": "startup"},
+        tmp_path / "hookd",
+        tmp_path / "missing.json",
+        start_timeout="2",
+    )
+
+    assert "NOT running" in reply["systemMessage"]
+
+
+def test_session_start_warns_when_the_spawned_command_never_serves(tmp_path: Path) -> None:
+    config = tmp_path / "hookd-config.json"
+    config.write_text(
+        json.dumps({"serve_command": [sys.executable, "-c", "pass"]}), encoding="utf-8"
+    )
+
+    reply = run_with_config(
+        "SessionStart",
+        {"session_id": "s1", "source": "startup"},
+        tmp_path / "hookd",
+        config,
+        start_timeout="2",
+    )
+
+    assert "NOT running" in reply["systemMessage"]
