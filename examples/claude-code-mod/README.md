@@ -48,7 +48,7 @@ CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir ~/.claude/plugins/pii-gu
 
 | 事件 | 往下（進工具前） | 往上（回模型前） |
 |------|------------------|------------------|
-| `tool.call` | Write／Edit／MultiEdit／Bash 還原佔位符；WebFetch／WebSearch／`mcp__*`／remote agent 直接拒絕；帶佔位符又能連網的指令拒絕 | Read／Bash／Grep／`mcp__*`，以及 Write／Edit／MultiEdit 的結果去識別化 |
+| `tool.call` | Write／Edit／MultiEdit／Bash 還原佔位符；WebFetch／WebSearch／`mcp__*`／remote agent 直接拒絕；帶佔位符又能連網的指令拒絕 | Read／Bash／Grep／`mcp__*` 的結果去識別化 |
 | `prompt.submit` | `@檔案` 改寫成「請 Read 這個檔」；使用者打字打進去的個資換成佔位符 | — |
 | `session.compact` | 壓縮前後都掃一次已知值 | 同左 |
 | `session.start` | 向服務要開場說明並載入 seed terms | — |
@@ -56,11 +56,7 @@ CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir ~/.claude/plugins/pii-gu
 `prompt.submit` 這條跟 classic 前端不同：classic 只能整則 **擋掉**，Mod 是 **改寫**，
 所以正常工作不會被打斷，而且打進去的值會被記住，之後寫回檔案時會還原。
 
-## 三個實作上最容易踩的地方
-
-**寫入類工具的「結果」也要遮。** `Write`／`Edit`／`MultiEdit` 的結果會把剛剛寫進去的內容
-原樣回傳，而那時候佔位符已經被還原成真值了——不遮的話，真值就從結果繞回模型，
-等於前面白做。這條是 eval 抓出來的，不是想出來的。
+## 兩個實作上最容易踩的地方
 
 **回傳結果時不能把 `ref` 一起帶回去。** `ref` 指的是 core 用**真值**建好的訊息；
 把拿到的物件原封不動回傳，core 就會照用那份，你改過的 `result` 會被忽略。
@@ -139,11 +135,34 @@ ENGINE=regex RUNS=3 MODEL=sonnet ./evals/run.sh
 | typed-pii | 1.00 | 0.00 | +1.00 |
 | write-restore | 1.00 | 0.50 | +0.50 |
 
-3 cases、mean Δ +0.80、35 秒、$0.12。
+3 cases、mean Δ +0.80、29 秒、$0.11。
 
 without-arm 分數低是**預期的**：沒有 Mod，個資本來就會進到模型，`not_contains` 那幾條
-grader 本來就該失敗。這個差值才是這套 suite 真正在量的東西。read-redaction 的 without
-拿到 0.09 而不是 0，是因為「有沒有真的去讀檔」那條 grader 兩邊都會過。
+grader 本來就該失敗。這個差值才是這套 suite 真正在量的東西。without 不是 0 的兩條，是因為
+有些 grader 兩邊都會過：read-redaction 的「有沒有真的去讀檔」、write-restore 的
+「檔案裡有沒有真值」與「有沒有用 Write」。
+
+### grader 要看 `message.content`，不是整行 trace
+
+`target: trace` 的 regex 是拿**整行 JSON** 去比對，而那一行除了模型真正讀到的
+`message.content`，還有 Claude Code 自己留著做 diff／undo／檔案狀態追蹤的
+`tool_use_result`。**在 `tool_use_result` 裡命中不算外洩。**
+
+實際例子（write-restore 的 with-arm，`--keep-temp` 取得）：
+
+```
+message.content  -> [{"type":"tool_result","content":"File created successfully at: .../summary.txt ..."}]
+                    真實號碼：不在裡面
+tool_use_result  -> {"type":"create","filePath":".../summary.txt","content":"林美玲,0987654321", ...}
+                    真實號碼：在這裡，但模型看不到
+```
+
+所以 write-restore 改成問模型「把你剛才傳給 Write 的 content 原樣唸回來」，
+再用 `last_message` 判定——量的是**模型知道什麼**，不是整行 JSON 裡有什麼。
+
+read-redaction 與 typed-pii 仍然用 `target: trace`，這在那兩個案例是有效的：
+Read 的結果本身就是 Mod 換掉的，所以連 `tool_use_result` 裡的副本也是遮過的；
+typed-pii 根本沒有工具呼叫。
 
 ### 跑 eval 時的三個環境限制
 

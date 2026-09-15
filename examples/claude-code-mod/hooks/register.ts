@@ -16,11 +16,15 @@ const DEFAULT_HOME = '.local/share/pii-guard/hookd'
 // Tools whose input is restored, or refused, on the way down.
 const RESTORED = new Set(['Write', 'Edit', 'MultiEdit', 'Bash'])
 const EGRESS = new Set(['WebFetch', 'WebSearch', 'Agent', 'Task', 'Workflow'])
-// Tools whose result is de-identified on the way up. Write, Edit and MultiEdit
-// are here because their results echo back the content that was written, and by
-// then the guard has restored it: without this the real value returns to the
-// model in the tool result it just successfully hid from it.
-const REDACTED = new Set(['Read', 'Bash', 'Grep', 'Write', 'Edit', 'MultiEdit'])
+// Tools whose result is de-identified on the way up.
+//
+// Write, Edit and MultiEdit are deliberately NOT here. Their results do echo
+// the content that was written, restored, but only in the structured record
+// Claude Code keeps for its own diff, undo and file-state tracking. What the
+// model reads is the tool_result block, which is just "File created
+// successfully at ...". Redacting these would put placeholders into that
+// file-state cache to fix a leak that is not there.
+const REDACTED = new Set(['Read', 'Bash', 'Grep'])
 // The engine owns these and refuses a rewrite of any, so a rewritten input
 // never carries them back.
 const RESERVED = ['tool', 'tool_use_id', 'agentId', 'consent']
