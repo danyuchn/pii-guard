@@ -286,8 +286,35 @@ def fail_closed(event: str, payload: dict) -> dict:
     return {}
 
 
+START_ONLY_FLAG = "--start-only"
+
+
+def _start_only() -> int:
+    """Make sure the service is running, and say nothing at all.
+
+    The Mod front end handles SessionStart itself, but it cannot start the
+    service: a hooks module has no way to spawn one that outlives the session.
+    So a classic SessionStart entry survives a --mod install for this one job.
+    It always prints an empty object, because anything else would duplicate the
+    Mod's own briefing, and because failing to start is not a reason to disturb
+    a session that the Mod is about to fail closed anyway.
+    """
+
+    try:
+        _ask_service("Ping", {}, 2.0)
+    except (OSError, ValueError, RuntimeError, urllib.error.URLError):
+        try:
+            _start_service()
+        except Exception:  # noqa: BLE001 - starting is best effort, never fatal
+            pass
+    sys.stdout.write("{}\n")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     event = argv[1] if len(argv) > 1 else ""
+    if event == "SessionStart" and START_ONLY_FLAG in argv[2:]:
+        return _start_only()
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except ValueError:

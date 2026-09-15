@@ -56,6 +56,8 @@ SEED_TERMS_RELATIVE: Final[str] = ".pii-guard/terms.txt"
 MOD_DIRECTORY: Final[str] = "claude-code-mod"
 MOD_NAME: Final[str] = "pii-guard"
 FUNCTION_HOOKS_ENV_VAR: Final[str] = "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS"
+# Tells the hook client to start the service and print nothing else.
+START_ONLY_FLAG: Final[str] = "--start-only"
 SESSION_START_MATCHER: Final[str] = "startup|resume|clear"
 HEALTH_TIMEOUT_SECONDS: Final[float] = 90.0
 POLL_SECONDS: Final[float] = 0.4
@@ -209,17 +211,27 @@ def hooks_block(
 ) -> dict[str, list[dict[str, Any]]]:
     """Build the hooks this installer owns, all tagged with the marker.
 
-    With the Mod loaded only MessageDisplay is left here: the Mod's hooks
-    module supersedes the others, and running both would redact twice and
-    print the session banner twice.
+    With the Mod loaded the hooks module supersedes almost all of these, and
+    running both would redact twice and greet twice.  Two entries survive.
+    MessageDisplay, because showing the user real values while the model keeps
+    placeholders has no equivalent in the function-hook API.  And a SessionStart
+    that only starts the service: a hooks module cannot spawn one that outlives
+    the session, so without this entry nothing brings the guard back after a
+    stop, and every later session is dead until the user runs serve by hand.
     """
 
-    def entry(event: str, message: str, matcher: str | None = None) -> dict[str, Any]:
+    def entry(
+        event: str,
+        message: str,
+        matcher: str | None = None,
+        arguments: str = "",
+    ) -> dict[str, Any]:
+        command = f'python3 "{client_path}" {event}'
         block: dict[str, Any] = {
             "hooks": [
                 {
                     "type": "command",
-                    "command": f'python3 "{client_path}" {event}',
+                    "command": f"{command} {arguments}".rstrip(),
                     "statusMessage": message,
                 }
             ]
@@ -229,7 +241,17 @@ def hooks_block(
         return block
 
     if mod:
-        return {"MessageDisplay": [entry("MessageDisplay", "pii-guard: restoring display")]}
+        return {
+            "SessionStart": [
+                entry(
+                    "SessionStart",
+                    "pii-guard: starting guard",
+                    SESSION_START_MATCHER,
+                    START_ONLY_FLAG,
+                )
+            ],
+            "MessageDisplay": [entry("MessageDisplay", "pii-guard: restoring display")],
+        }
 
     block: dict[str, list[dict[str, Any]]] = {
         "SessionStart": [
@@ -622,7 +644,7 @@ def doctor(
         results.append(CheckResult("installer config", False, f"missing at {installer_config}"))
 
     if mod:
-        results.extend(_mod_checks(config_dir))
+        results.extend(_mod_checks(config_dir, settings))
 
     if hardened:
         results.extend(_hardening_checks(settings))
@@ -635,7 +657,7 @@ def doctor(
         results.append(
             CheckResult("launchd agent", loaded, LAUNCH_LABEL if loaded else "not loaded")
         )
-    elif check_launchd:
+    elif check_launchd and not mod:
         results.append(
             CheckResult("auto-start", True, "on demand from the hook client (no launchd agent)")
         )
@@ -686,7 +708,22 @@ def doctor(
     return results
 
 
-def _mod_checks(config_dir: Path) -> list[CheckResult]:
+def has_start_only_hook(settings: Mapping[str, Any]) -> bool:
+    """Is the classic SessionStart entry that starts the service present?"""
+
+    entries = (settings.get("hooks") or {}).get("SessionStart")
+    if not isinstance(entries, list):
+        return False
+    for entry in entries:
+        if not _is_ours(entry):
+            continue
+        for hook in entry.get("hooks", []) or []:
+            if isinstance(hook, dict) and START_ONLY_FLAG in str(hook.get("command", "")):
+                return True
+    return False
+
+
+def _mod_checks(config_dir: Path, settings: Mapping[str, Any]) -> list[CheckResult]:
     """Report that the plugin is in place and that Claude Code accepts it."""
 
     results: list[CheckResult] = []
@@ -698,6 +735,18 @@ def _mod_checks(config_dir: Path) -> list[CheckResult]:
     ok, detail = validate_plugin(plugin)
     results.append(CheckResult("mod validates", ok, detail))
     results.append(CheckResult("mod launch", True, launch_line(plugin)))
+    if has_start_only_hook(settings):
+        results.append(
+            CheckResult("auto-start", True, "on demand (classic SessionStart)")
+        )
+    else:
+        results.append(
+            CheckResult(
+                "auto-start",
+                False,
+                "no classic SessionStart entry, so a stopped service never comes back",
+            )
+        )
     return results
 
 

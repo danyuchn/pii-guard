@@ -574,11 +574,11 @@ def mod_env(env, monkeypatch) -> dict[str, Path]:
     return env
 
 
-def test_mod_install_keeps_only_the_display_hook(mod_env) -> None:
+def test_mod_install_keeps_the_display_and_start_only_hooks(mod_env) -> None:
     assert _install("--mod") == 0
 
     settings = _settings(mod_env["settings"])
-    assert sorted(settings["hooks"]) == ["MessageDisplay"]
+    assert sorted(settings["hooks"]) == ["MessageDisplay", "SessionStart"]
 
 
 def test_mod_install_puts_the_plugin_where_the_launch_line_points(mod_env) -> None:
@@ -602,11 +602,14 @@ def test_mod_install_supersedes_the_classic_hooks(mod_env) -> None:
     """A classic install followed by a mod install must not leave both running."""
 
     _install()
-    assert sorted(_settings(mod_env["settings"])["hooks"]) != ["MessageDisplay"]
+    assert "PostToolUse" in _settings(mod_env["settings"])["hooks"]
 
     _install("--mod")
 
-    assert sorted(_settings(mod_env["settings"])["hooks"]) == ["MessageDisplay"]
+    settings = _settings(mod_env["settings"])
+    assert sorted(settings["hooks"]) == ["MessageDisplay", "SessionStart"]
+    assert "PostToolUse" not in settings["hooks"]
+    assert "PreToolUse" not in settings["hooks"]
 
 
 def test_mod_install_keeps_a_foreign_hook(mod_env) -> None:
@@ -618,7 +621,7 @@ def test_mod_install_keeps_a_foreign_hook(mod_env) -> None:
 
     settings = _settings(mod_env["settings"])
     assert settings["hooks"]["PreToolUse"] == [FOREIGN_HOOK]
-    assert sorted(settings["hooks"]) == ["MessageDisplay", "PreToolUse"]
+    assert sorted(settings["hooks"]) == ["MessageDisplay", "PreToolUse", "SessionStart"]
 
 
 def test_mod_install_can_be_hardened(mod_env) -> None:
@@ -628,7 +631,7 @@ def test_mod_install_can_be_hardened(mod_env) -> None:
     assert settings["sandbox"] == installer.SANDBOX_BLOCK
     assert settings["permissions"]["deny"] == ["WebFetch", "WebSearch"]
     # The mod checks prompts itself, so no classic UserPromptSubmit entry.
-    assert sorted(settings["hooks"]) == ["MessageDisplay"]
+    assert sorted(settings["hooks"]) == ["MessageDisplay", "SessionStart"]
 
 
 def test_doctor_mod_reports_a_valid_plugin(mod_env, capsys) -> None:
@@ -679,5 +682,61 @@ def test_mod_install_is_idempotent(mod_env) -> None:
     _install("--mod")
 
     settings = _settings(mod_env["settings"])
-    assert sorted(settings["hooks"]) == ["MessageDisplay"]
+    assert sorted(settings["hooks"]) == ["MessageDisplay", "SessionStart"]
     assert len(settings["hooks"]["MessageDisplay"]) == 1
+    assert len(settings["hooks"]["SessionStart"]) == 1
+
+
+def test_mod_install_writes_the_start_only_session_hook(mod_env) -> None:
+    """Without this the guard never comes back after a stop."""
+
+    _install("--mod")
+
+    settings = _settings(mod_env["settings"])
+    command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+    assert command.endswith("SessionStart --start-only")
+    assert str(installer.client_target(mod_env["config_dir"])) in command
+    assert settings["hooks"]["SessionStart"][0]["matcher"] == installer.SESSION_START_MATCHER
+
+
+def test_classic_install_session_hook_is_not_start_only(env) -> None:
+    """The classic front end still needs the greeting and the seed loading."""
+
+    _install()
+
+    settings = _settings(env["settings"])
+    command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+    assert command.endswith("SessionStart")
+    assert not installer.has_start_only_hook(settings)
+
+
+def test_doctor_mod_reports_the_on_demand_start(mod_env, capsys) -> None:
+    _install("--mod")
+    capsys.readouterr()
+
+    main(["doctor", "--mod"])
+
+    out = capsys.readouterr().out
+    assert "[OK  ] auto-start: on demand (classic SessionStart)" in out
+    # The launchd branch must not add a second auto-start line.
+    assert out.count("auto-start") == 1
+
+
+def test_doctor_mod_fails_without_the_start_only_hook(mod_env, capsys) -> None:
+    _install("--mod")
+    settings = _settings(mod_env["settings"])
+    del settings["hooks"]["SessionStart"]
+    mod_env["settings"].write_text(json.dumps(settings), encoding="utf-8")
+    capsys.readouterr()
+
+    assert main(["doctor", "--mod"]) == 1
+
+    assert "[FAIL] auto-start" in capsys.readouterr().out
+
+
+def test_uninstall_removes_the_start_only_hook(mod_env) -> None:
+    _install("--mod")
+
+    assert main(["uninstall"]) == 0
+
+    assert _settings(mod_env["settings"]).get("hooks") is None
