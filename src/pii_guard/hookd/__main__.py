@@ -18,7 +18,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from pii_guard.hookd.core import SessionStore, create_engine
 from pii_guard.hookd.server import HookdApplication, HookdServerConfig, create_server
@@ -181,7 +181,8 @@ def cmd_stop(_args: argparse.Namespace, config: HookdConfig) -> int:
         clear_state(config)
         print("pii-guard hookd is not running.")
         return 0
-    pid = int(state["pid"])
+    # _pid_alive above already established that this is a positive int.
+    pid = cast(int, state["pid"])
     try:
         os.kill(pid, signal.SIGTERM)
     except OSError as error:
