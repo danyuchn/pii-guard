@@ -145,6 +145,8 @@ ollama pull ornith-1.5:9b
 
 用連結而非複製，是因為 skill 需要找到它所屬的 repo 才能呼叫 pii-guard 本體。只能複製的環境改設 `PII_GUARD_HOME` 指向 clone 出來的路徑。
 
+想把保護擴到「Claude Code 每一次工具讀取」而不只是單份文件，見常駐服務 hookd 與其 classic hooks：[`examples/claude-code-hookd/`](examples/claude-code-hookd/)。
+
 ### 三個步驟
 
 ```bash
