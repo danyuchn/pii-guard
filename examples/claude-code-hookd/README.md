@@ -19,6 +19,9 @@ uv run pii-guard-hookd install
 # 3. 打開 Claude Code。沒了。
 ```
 
+處理真正敏感的專案時改用 `uv run pii-guard-hookd install --harden`，
+它會多堵住幾條「拿到佔位符之後還能把內容送出去」的路，代價見下面的加固模式一節。
+
 `install` 最後會自動跑一次 `doctor` 並逐項印出結果，所以你不必猜自己有沒有被保護。
 之後任何時候都可以再跑 `uv run pii-guard-hookd doctor` 確認。
 
@@ -52,6 +55,8 @@ Claude 呼叫 Read/Bash/Grep
 | `install --engine regex` | 同上，但只用 regex 引擎（快，但抓不到人名） |
 | `install --scope project` | 併進當前目錄的 `.claude/settings.json` 而不是使用者層 |
 | `install --no-launchd` | 不註冊 LaunchAgent，改由 hook client 隨用隨啟 |
+| `install --harden` | 同上加出口封鎖、sandbox、prompt 檢查（見加固模式一節） |
+| `doctor --harden` | 連加固設定一起檢查 |
 | `uninstall` | 反向移除（備份、設定檔與對照表留著） |
 | `doctor` | 逐項檢查並回報；任何一項 FAIL 就 exit 1 |
 | `serve` | 手動啟動（背景）；`--foreground` 留在終端機 |
@@ -140,6 +145,11 @@ Claude 呼叫 Read/Bash/Grep
 | 中文人名被遮成 `<PERSON_1>`，磁碟與畫面是真名 | 通過（2026-09-15，隔離 e2e） |
 | 服務停掉時工具事件維持 fail-closed 且**不會**自行啟動服務 | 通過（2026-09-15，隔離 e2e） |
 | `/clear` 之後服務被重新拉起 | 通過（2026-09-15，隔離 e2e） |
+| `--harden` 併設定（保留既有 deny）、`doctor --harden` 全綠 | 通過（2026-09-15，tmp 設定目錄） |
+| 帶佔位符的 `curl` 被 deny、`grep` 照常還原執行 | 通過（2026-09-15，真實 client） |
+| 種子詞 `龍哥` 在 regex 引擎下仍被遮成 `<PERSON_1>` | 通過（2026-09-15，真實 client） |
+| 含手機號碼的 prompt 被擋且理由只講類型與數量 | 通過（2026-09-15，真實 client） |
+| sandbox 真的擋住連線（由 Claude Code 執行，非本專案） | **未實測** |
 
 ## 限制：`Edit` 的 `old_string` 不會被還原
 
@@ -181,13 +191,14 @@ hook client 連不到服務、逾時、收到非 2xx、或收到看不懂的回�
 **擋不到**：
 
 - **prompt 裡用 `@` 引用的檔案**。官方文件說明這類檔案是直接插進 prompt 的，
-  **不經過任何工具呼叫**，所以沒有任何 hook 會觸發。這是最容易踩到的一個洞：
-  你以為 `@secrets.csv` 和 `Read secrets.csv` 一樣受保護，其實完全沒有。
-- **你自己打進去的字**（UserPromptSubmit）。你貼進對話框的個資不經過這條路。
+  **不經過任何工具呼叫**，所以沒有任何 hook 會觸發。你以為 `@secrets.csv` 和
+  `Read secrets.csv` 一樣受保護，其實完全沒有。
+  **`--harden` 會直接擋掉這種 prompt** 並要你改口說「讀這個檔」。
+- **你自己打進去的字**。預設模式不看 prompt；`--harden` 會檢查並擋下含個資的 prompt。
 - **Compaction 摘要**。壓縮時模型看的是已經在 context 裡的內容，那些已經是佔位符，
   但摘要本身不再經過 hook。
-- ~~**MCP server 的輸出**~~。預設 matcher 已含 `mcp__.*`，所以 MCP 工具輸出**有**
-  走葉節點遮蔽。但這條同樣未在真實 MCP 工具上實測。
+- **MCP server 的輸出**：預設 matcher 已含 `mcp__.*`，所以輸出**有**走葉節點遮蔽
+  （未在真實 MCP 工具上實測）。`--harden` 更進一步，直接 deny 所有 `mcp__*` 呼叫。
 - **會記錄原始工具輸出的 telemetry**。hook 換掉的是模型看到的東西，不是磁碟上的紀錄。
 - **transcript 存的是佔位符**。這對安全是好事（真值沒有落進 transcript），但代價是
   `--resume` 回來看到的是佔位符，要等 `MessageDisplay` 還原後才看得到真值。
@@ -205,6 +216,80 @@ hook client 連不到服務、逾時、收到非 2xx、或收到看不懂的回�
 如果你的威脅模型包含「同一台機器上的其他使用者看得到 process list」，
 就把 `Bash` 從 `PreToolUse` 的 matcher 拿掉，代價是模型無法用 shell 指令
 處理含佔位符的內容。
+
+## 加固模式 `install --harden`
+
+預設安裝擋的是「不小心把個資餵給模型」。`--harden` 再往前一步，堵住幾條
+**已經拿到佔位符之後還能把內容送出去**的路。
+
+```bash
+uv run pii-guard-hookd install --harden
+uv run pii-guard-hookd doctor --harden
+```
+
+### 每條規則擋什麼，以及代價
+
+| 規則 | 擋什麼 | 誤擋的代價 |
+|------|--------|------------|
+| **網路命令不還原** | 帶佔位符的 `curl`／`wget`／`nc`／`ssh`／`scp`／`rsync`／含 URL 的指令，以及 `python -c` 之類含 `urllib`／`socket`／`fetch` 的一行腳本，一律 deny | 要把去識別化後的內容送出去得自己改寫。**沒帶佔位符的 `curl` 完全不受影響**——沒東西要還原就不關這層的事 |
+| **編碼器 deny** | `base64`／`base32`／`xxd`／`od`／`hexdump`／`openssl enc`、寫到 stdout 的 `tar czf -`／`gzip -c`，以及含 `b64`／`zlib`／`hexlify` 的一行腳本。**不論有沒有佔位符** | 這是最容易誤擋的一條：正當地讀一個本來就是 base64 的檔案也會被擋。改用 `cat` 看原檔，或把工具加進 `policy.encoders_extra` 的反面——目前只能改用別的指令 |
+| **輸出閘門** | 指令輸出含 64 字元以上的 base64 或 hex 連續串，或非文字字元超過三成 → 整份輸出扣住 | 讀 hash、憑證、minified bundle 的輸出會被扣住。用 `policy.output_gate: false` 關掉 |
+| **出口工具 deny** | `WebFetch`、`WebSearch`、所有 `mcp__*` | 這期間不能上網查資料。要放行特定 MCP 工具見下 |
+| **遠端 agent deny** | `isolation: "remote"` 的 Agent／Workflow | 不能用雲端 sandbox。理由是那台機器上沒有 hook，等於整個防線失效 |
+| **prompt 檢查** | `@檔案` 引用（因為它不經過工具呼叫，任何 hook 都看不到）、以及 prompt 本身含個資 | 想引用檔案要改口說「讀這個檔」。`@目錄` 不受影響 |
+| **sandbox** | `sandbox.enabled`＋`failIfUnavailable`＋空的 `network.allowedDomains` | 指令連不了外網。這條才是唯一真正兜底的 |
+
+### 放行
+
+編輯 `~/.config/pii-guard/hookd.json` 的 `policy` 區塊（重跑 `install` 不會覆蓋你手改的內容）：
+
+```json
+{
+  "policy": {
+    "allowed_tools": ["mcp__local-db__query"],
+    "output_gate": false,
+    "encoders_extra": ["mycompany-encode"],
+    "network_extra": ["mycompany-upload"],
+    "seed_terms_files": ["/path/to/.pii-guard/terms.txt"]
+  }
+}
+```
+
+放行網域改 settings 的 `sandbox.network.allowedDomains`。改完重啟服務
+（`stop` 之後下一個 session 會自己拉起來）。
+
+### 種子詞：補偵測抓不到的那一類
+
+`<專案>/.pii-guard/terms.txt` 每行一個值，可選 `TYPE<TAB>值`：
+
+```
+# 偵測抓不到的暱稱與內部代號
+龍哥
+ORG	寶島顧問
+TW_MOBILE	0912345678
+```
+
+`install` 會自動把它寫進設定。服務啟動時載入，之後這些值**在任何一次工具輸出裡
+都會被遮掉**，不需要偵測層認得它們。值本身不會出現在任何回覆裡，SessionStart
+只會說「載入 N 個種子詞」。
+
+這一條補的是 recall 的已知弱點：暱稱、非典型英文名、內部代號，NER 模型本來就抓不到。
+
+### 誠實的殘餘風險
+
+**這些規則擋的是機械式的搬運，擋不了改寫。** 模型可以把
+`<PERSON_1> 的電話是 <TW_MOBILE_1>` 用自然語言重述成別的樣子，再放進一個
+沒被擋的欄位——那不是 base64，沒有連續字元特徵，任何 regex 都看不出來。
+
+**真正兜住這一層的只有 sandbox 的網域白名單。** 規則層負責讓「不小心」和
+「順手」變得做不到，sandbox 負責讓「刻意」也出不去。只開 `--harden` 的規則
+而把 sandbox 關掉，等於只裝了前者。
+
+另外三點：
+
+- 偵測本身有 recall 上限（見上面的引擎表），遮不到的東西這些規則也保護不了。
+- 編碼器 deny 是黑名單，列舉不完。`policy.encoders_extra` 存在就是因為這點。
+- `Bash` 還原仍然會把真值放進 process list 與 shell history，見上面那一節。
 
 ## 和 `pii-safe-documents` skill 的關係
 
