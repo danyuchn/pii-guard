@@ -19,6 +19,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
@@ -37,6 +38,18 @@ DEFAULT_CLAUDE_CONFIG_DIR: Final[str] = "~/.claude"
 DEFAULT_CONFIG_PATH: Final[str] = "~/.config/pii-guard/hookd.json"
 POST_TOOL_MATCHER: Final[str] = "Read|Bash|Grep|mcp__.*"
 PRE_TOOL_MATCHER: Final[str] = "Write|Edit|MultiEdit|Bash"
+# Hardened mode also intercepts the tools that can carry content off the box.
+HARDENED_PRE_TOOL_MATCHER: Final[str] = (
+    "Write|Edit|MultiEdit|Bash|WebFetch|WebSearch|Agent|Task|Workflow|mcp__.*"
+)
+DENIED_PERMISSIONS: Final[tuple[str, ...]] = ("WebFetch", "WebSearch")
+SANDBOX_BLOCK: Final[dict[str, Any]] = {
+    "enabled": True,
+    "failIfUnavailable": True,
+    "allowUnsandboxedCommands": False,
+    "network": {"allowedDomains": []},
+}
+SEED_TERMS_RELATIVE: Final[str] = ".pii-guard/terms.txt"
 SESSION_START_MATCHER: Final[str] = "startup|resume|clear"
 HEALTH_TIMEOUT_SECONDS: Final[float] = 90.0
 POLL_SECONDS: Final[float] = 0.4
@@ -126,7 +139,9 @@ def serve_command(repo: Path, engine: str) -> list[str]:
     ]
 
 
-def hooks_block(client_path: Path) -> dict[str, list[dict[str, Any]]]:
+def hooks_block(
+    client_path: Path, *, hardened: bool = False
+) -> dict[str, list[dict[str, Any]]]:
     """Build the hooks this installer owns, all tagged with the marker."""
 
     def entry(event: str, message: str, matcher: str | None = None) -> dict[str, Any]:
@@ -143,16 +158,85 @@ def hooks_block(client_path: Path) -> dict[str, list[dict[str, Any]]]:
             block["matcher"] = matcher
         return block
 
-    return {
+    block: dict[str, list[dict[str, Any]]] = {
         "SessionStart": [
             entry("SessionStart", "pii-guard: checking guard", SESSION_START_MATCHER)
         ],
         "PostToolUse": [
             entry("PostToolUse", "pii-guard: de-identifying output", POST_TOOL_MATCHER)
         ],
-        "PreToolUse": [entry("PreToolUse", "pii-guard: restoring values", PRE_TOOL_MATCHER)],
+        "PreToolUse": [
+            entry(
+                "PreToolUse",
+                "pii-guard: restoring values",
+                HARDENED_PRE_TOOL_MATCHER if hardened else PRE_TOOL_MATCHER,
+            )
+        ],
         "MessageDisplay": [entry("MessageDisplay", "pii-guard: restoring display")],
     }
+    if hardened:
+        block["UserPromptSubmit"] = [entry("UserPromptSubmit", "pii-guard: checking prompt")]
+    return block
+
+
+def harden_settings(settings: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Add the sandbox and egress denials, never overwriting what is there.
+
+    An existing sandbox block is the user's own decision about how their
+    machine runs, so it is reported rather than replaced.
+    """
+
+    merged = dict(settings)
+    warnings: list[str] = []
+
+    if "sandbox" in merged:
+        warnings.append(
+            "A sandbox block already exists and was left alone. For full hardening it "
+            "should set enabled true, failIfUnavailable true, allowUnsandboxedCommands "
+            "false and an empty network.allowedDomains."
+        )
+    else:
+        merged["sandbox"] = json.loads(json.dumps(SANDBOX_BLOCK))
+
+    permissions = dict(merged.get("permissions") or {})
+    if not isinstance(merged.get("permissions", {}), dict):
+        warnings.append("The permissions key is not an object and was left alone.")
+        return merged, warnings
+    deny = list(permissions.get("deny") or []) if isinstance(permissions.get("deny"), list) else []
+    for tool in DENIED_PERMISSIONS:
+        if tool not in deny:
+            deny.append(tool)
+    permissions["deny"] = deny
+    merged["permissions"] = permissions
+    return merged, warnings
+
+
+def unharden_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    """Remove only the exact values this installer added."""
+
+    merged = dict(settings)
+    if merged.get("sandbox") == SANDBOX_BLOCK:
+        merged.pop("sandbox")
+    permissions = merged.get("permissions")
+    if isinstance(permissions, dict) and isinstance(permissions.get("deny"), list):
+        permissions = dict(permissions)
+        deny = [item for item in permissions["deny"] if item not in DENIED_PERMISSIONS]
+        if deny:
+            permissions["deny"] = deny
+        else:
+            permissions.pop("deny")
+        if permissions:
+            merged["permissions"] = permissions
+        else:
+            merged.pop("permissions")
+    return merged
+
+
+def default_seed_terms_files(project: Path) -> list[str]:
+    """The project's own term list, when it has one."""
+
+    candidate = project / SEED_TERMS_RELATIVE
+    return [str(candidate)] if candidate.is_file() else []
 
 
 def _is_ours(entry: object) -> bool:
@@ -261,14 +345,30 @@ def backup_settings(path: Path) -> Path | None:
     return backup
 
 
-def write_installer_config(path: Path, repo: Path, engine: str) -> None:
+def write_installer_config(
+    path: Path,
+    repo: Path,
+    engine: str,
+    *,
+    seed_terms_files: list[str] | None = None,
+    existing_policy: Mapping[str, Any] | None = None,
+) -> None:
     """Record what the hook client needs in order to start the service."""
 
     path.parent.mkdir(parents=True, exist_ok=True, mode=JOB_MODE)
+    # A re-run must not silently drop an allowlist the user added by hand.
+    policy_block: dict[str, Any] = dict(existing_policy or {})
+    policy_block.setdefault("allowed_tools", [])
+    policy_block.setdefault("encoders_extra", [])
+    policy_block.setdefault("network_extra", [])
+    policy_block.setdefault("output_gate", True)
+    if seed_terms_files or "seed_terms_files" not in policy_block:
+        policy_block["seed_terms_files"] = seed_terms_files or []
     payload = {
         "repo": str(repo),
         "engine": engine,
         "serve_command": serve_command(repo, engine),
+        "policy": policy_block,
     }
     _atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n", mode=PRIVATE_MODE)
 
@@ -403,6 +503,7 @@ def doctor(
     scope: str = "user",
     *,
     check_launchd: bool | None = None,
+    hardened: bool = False,
 ) -> list[CheckResult]:
     """Check every moving part and report one line each."""
 
@@ -431,7 +532,7 @@ def doctor(
             for event, entries in (raw_hooks or {}).items()
             if isinstance(entries, list) and any(_is_ours(item) for item in entries)
         )
-        expected = sorted(hooks_block(client))
+        expected = sorted(hooks_block(client, hardened=hardened))
         if events == expected:
             detail = f"{settings_file} ({len(events)})"
             results.append(CheckResult("hooks in settings", True, detail))
@@ -445,6 +546,9 @@ def doctor(
         results.append(CheckResult("installer config", True, str(installer_config)))
     else:
         results.append(CheckResult("installer config", False, f"missing at {installer_config}"))
+
+    if hardened:
+        results.extend(_hardening_checks(settings))
 
     # Only report on the agent when one was actually installed.  A user who
     # chose --no-launchd relies on the hook client's on-demand start instead,
@@ -474,6 +578,17 @@ def doctor(
     else:
         sessions = health.get("sessions", 0)
         results.append(CheckResult("service", True, f"healthy, {sessions} session(s)"))
+        described = health.get("policy")
+        if isinstance(described, Mapping):
+            gate = "output gate on" if described.get("output_gate") else "output gate OFF"
+            allowed = described.get("allowed_tools") or []
+            results.append(
+                CheckResult("policy", True, f"active, {gate}, {len(allowed)} allowlisted tool(s)")
+            )
+        else:
+            results.append(
+                CheckResult("policy", False, "the running service predates the policy rules")
+            )
         if health.get("engine_fallback"):
             results.append(
                 CheckResult("engine", False, "full engine failed to load; names NOT covered")
@@ -491,4 +606,32 @@ def doctor(
     else:
         results.append(CheckResult("session store", False, f"{sessions_dir} is not mode 0700"))
 
+    return results
+
+
+def _hardening_checks(settings: Mapping[str, Any]) -> list[CheckResult]:
+    """Report the settings that hardening is supposed to have put in place."""
+
+    results: list[CheckResult] = []
+    sandbox = settings.get("sandbox")
+    if not isinstance(sandbox, Mapping):
+        results.append(CheckResult("sandbox", False, "no sandbox block in settings"))
+    elif sandbox.get("enabled") and not sandbox.get("allowUnsandboxedCommands", False):
+        domains = (sandbox.get("network") or {}).get("allowedDomains")
+        detail = "enabled"
+        if isinstance(domains, list) and domains:
+            detail = f"enabled, {len(domains)} allowed domain(s)"
+        results.append(CheckResult("sandbox", True, detail))
+    else:
+        results.append(
+            CheckResult("sandbox", True, "present but permissive; review it by hand", warn=True)
+        )
+
+    permissions = settings.get("permissions")
+    deny = permissions.get("deny") if isinstance(permissions, Mapping) else None
+    missing = [tool for tool in DENIED_PERMISSIONS if tool not in (deny or [])]
+    if missing:
+        results.append(CheckResult("egress denied", False, f"missing {', '.join(missing)}"))
+    else:
+        results.append(CheckResult("egress denied", True, ", ".join(DENIED_PERMISSIONS)))
     return results

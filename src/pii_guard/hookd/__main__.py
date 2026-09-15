@@ -329,13 +329,25 @@ def cmd_install(args: argparse.Namespace, config: HookdConfig) -> int:
     backup = installer.backup_settings(settings_file)
     if backup is not None:
         print(f"Backed up settings: {backup}")
-    merged = installer.merge_hooks(settings, installer.hooks_block(client))
+    merged = installer.merge_hooks(settings, installer.hooks_block(client, hardened=args.harden))
+    if args.harden:
+        merged, warnings = installer.harden_settings(merged)
+        for warning in warnings:
+            print(f"Note: {warning}")
     installer._atomic_write(settings_file, json.dumps(merged, ensure_ascii=False, indent=2) + "\n")
     print(f"Merged hooks into: {settings_file}")
+    if args.harden:
+        print("Hardened: sandbox on, WebFetch and WebSearch denied, prompts checked.")
 
     repo = installer.repo_root()
     installer_config = installer.hookd_config_path()
-    installer.write_installer_config(installer_config, repo, args.engine)
+    installer.write_installer_config(
+        installer_config,
+        repo,
+        args.engine,
+        seed_terms_files=installer.default_seed_terms_files(Path.cwd()),
+        existing_policy=_existing_policy(installer_config),
+    )
     print(f"Wrote config: {installer_config}")
 
     if args.no_launchd or sys.platform != "darwin":
@@ -354,7 +366,11 @@ def cmd_install(args: argparse.Namespace, config: HookdConfig) -> int:
             _start_now(config, repo, args.engine)
 
     print()
-    return _report(installer.doctor(config, config_dir, installer_config, args.scope))
+    return _report(
+        installer.doctor(
+            config, config_dir, installer_config, args.scope, hardened=args.harden
+        )
+    )
 
 
 def cmd_uninstall(args: argparse.Namespace, config: HookdConfig) -> int:
@@ -374,6 +390,7 @@ def cmd_uninstall(args: argparse.Namespace, config: HookdConfig) -> int:
         print(f"{error.message} Remove the pii-guard hooks by hand.", file=sys.stderr)
         return 1
     stripped, removed = installer.remove_hooks(settings)
+    stripped = installer.unharden_settings(stripped)
     if removed:
         backup = installer.backup_settings(settings_file)
         if backup is not None:
@@ -392,6 +409,17 @@ def cmd_uninstall(args: argparse.Namespace, config: HookdConfig) -> int:
     return 0
 
 
+def _existing_policy(path: Path) -> dict[str, Any] | None:
+    """Keep an allowlist the user edited by hand across a re-install."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    policy_block = payload.get("policy") if isinstance(payload, dict) else None
+    return policy_block if isinstance(policy_block, dict) else None
+
+
 def cmd_doctor(args: argparse.Namespace, config: HookdConfig) -> int:
     return _report(
         installer.doctor(
@@ -399,6 +427,7 @@ def cmd_doctor(args: argparse.Namespace, config: HookdConfig) -> int:
             installer.claude_config_dir(),
             installer.hookd_config_path(),
             args.scope,
+            hardened=args.harden,
         )
     )
 
@@ -429,12 +458,18 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--engine", choices=("regex", "full"), default="full")
     setup.add_argument("--scope", choices=("user", "project"), default="user")
     setup.add_argument("--no-launchd", action="store_true", help="do not register auto-start")
+    setup.add_argument(
+        "--harden",
+        action="store_true",
+        help="also sandbox the session, deny egress tools and check prompts",
+    )
 
     remove = subparsers.add_parser("uninstall", help="remove the hooks and auto-start")
     remove.add_argument("--scope", choices=("user", "project"), default="user")
 
     check = subparsers.add_parser("doctor", help="check every part of the installation")
     check.add_argument("--scope", choices=("user", "project"), default="user")
+    check.add_argument("--harden", action="store_true", help="also check the hardened settings")
 
     subparsers.add_parser("status", help="report whether the service is running")
     subparsers.add_parser("stop", help="stop the running service")

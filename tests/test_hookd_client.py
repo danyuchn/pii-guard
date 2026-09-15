@@ -396,3 +396,22 @@ def test_session_start_warns_when_the_spawned_command_never_serves(tmp_path: Pat
     )
 
     assert "NOT running" in reply["systemMessage"]
+
+
+def test_offline_prompt_submit_is_blocked(offline_home: Path) -> None:
+    reply = run_client(
+        "UserPromptSubmit", {"session_id": "s1", "prompt": "hello"}, offline_home
+    )
+
+    assert reply["decision"] == "block"
+    assert "offline" in reply["reason"]
+
+
+def test_online_prompt_submit_passes_a_clean_prompt(online_home: Path) -> None:
+    reply = run_client(
+        "UserPromptSubmit",
+        {"session_id": "s1", "prompt": "請看一下測試", "cwd": "/tmp"},
+        online_home,
+    )
+
+    assert reply == {}

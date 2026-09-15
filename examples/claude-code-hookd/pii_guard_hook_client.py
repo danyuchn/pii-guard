@@ -29,6 +29,7 @@ DEFAULT_CONFIG_PATH = "~/.config/pii-guard/hookd.json"
 CONFIG_ENV_VAR = "PII_GUARD_HOOKD_CONFIG"
 DEFAULT_TIMEOUT = 20.0
 DISPLAY_TIMEOUT = 5.0
+PROMPT_TIMEOUT = 10.0
 # How long SessionStart waits for a service it just started.  A first run
 # that still has to download a model can exceed this; the session then gets
 # the offline warning while the service keeps loading for the next one.
@@ -54,6 +55,10 @@ DISPLAY_PREFIX = "[pii-guard offline: placeholders not restored] "
 SESSION_WARNING = (
     "WARNING: pii-guard hookd is NOT running. Tool results are not being "
     "de-identified and placeholders are not being restored."
+)
+PROMPT_BLOCK = (
+    "[pii-guard] offline: your prompt was not checked for personal data, so it "
+    "was blocked. Start the guard with: uv run pii-guard-hookd serve"
 )
 SESSION_CONTEXT = (
     "The pii-guard guard service is offline. Until the user starts it with "
@@ -268,6 +273,8 @@ def fail_closed(event: str, payload: dict) -> dict:
         )
     if event == "MessageDisplay":
         return _closed_message_display(payload)
+    if event == "UserPromptSubmit":
+        return {"decision": "block", "reason": PROMPT_BLOCK}
     if event == "SessionStart":
         return {
             "systemMessage": SESSION_WARNING,
@@ -288,7 +295,11 @@ def main(argv: list[str]) -> int:
     if not isinstance(payload, dict):
         payload = {}
 
-    timeout = DISPLAY_TIMEOUT if event == "MessageDisplay" else DEFAULT_TIMEOUT
+    timeout = DEFAULT_TIMEOUT
+    if event == "MessageDisplay":
+        timeout = DISPLAY_TIMEOUT
+    elif event == "UserPromptSubmit":
+        timeout = PROMPT_TIMEOUT
     try:
         reply = _ask_service(event, payload, timeout)
     except (OSError, ValueError, RuntimeError, urllib.error.URLError):
