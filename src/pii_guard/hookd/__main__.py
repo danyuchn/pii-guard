@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Final, cast
 
+from pii_guard.hookd import install as installer
 from pii_guard.hookd.core import SessionStore, create_engine_with_fallback
 from pii_guard.hookd.server import HookdApplication, HookdServerConfig, create_server
 from pii_guard.hookd.state import HookdConfig, clear_state, read_state, write_state
@@ -262,6 +263,102 @@ def cmd_purge(args: argparse.Namespace, config: HookdConfig) -> int:
     return 0
 
 
+def _report(results: list[installer.CheckResult]) -> int:
+    for result in results:
+        print(result.render())
+    failed = [result for result in results if not result.ok]
+    if failed:
+        print(f"\n{len(failed)} check(s) failed.")
+        return 1
+    print("\nEverything checks out.")
+    return 0
+
+
+def cmd_install(args: argparse.Namespace, config: HookdConfig) -> int:
+    config_dir = installer.claude_config_dir()
+    settings_file = installer.settings_path(config_dir, args.scope)
+    # Parse before touching anything: a settings file we cannot read must be
+    # left exactly as it is rather than replaced with our block alone.
+    settings = installer._load_settings(settings_file)
+
+    client = installer.install_client(config_dir)
+    print(f"Installed hook client: {client}")
+
+    backup = installer.backup_settings(settings_file)
+    if backup is not None:
+        print(f"Backed up settings: {backup}")
+    merged = installer.merge_hooks(settings, installer.hooks_block(client))
+    installer._atomic_write(settings_file, json.dumps(merged, ensure_ascii=False, indent=2) + "\n")
+    print(f"Merged hooks into: {settings_file}")
+
+    repo = installer.repo_root()
+    installer_config = installer.hookd_config_path()
+    installer.write_installer_config(installer_config, repo, args.engine)
+    print(f"Wrote config: {installer_config}")
+
+    if args.no_launchd or sys.platform != "darwin":
+        reason = "skipped" if args.no_launchd else "not macOS"
+        print(f"Auto-start agent: {reason}; the hook client starts the service on demand.")
+    else:
+        config.ensure_home()
+        plist = installer.launch_agent_path()
+        installer.write_launch_agent(plist, installer.serve_command(repo, args.engine), config.home)
+        loaded, detail = installer.load_launch_agent(plist)
+        print(f"Auto-start agent: {'loaded' if loaded else 'FAILED'} ({detail})")
+        if loaded:
+            print("Waiting for the service to answer...")
+            installer.wait_for_health(config)
+
+    print()
+    return _report(installer.doctor(config, config_dir, installer_config, args.scope))
+
+
+def cmd_uninstall(args: argparse.Namespace, config: HookdConfig) -> int:
+    config_dir = installer.claude_config_dir()
+    settings_file = installer.settings_path(config_dir, args.scope)
+
+    if sys.platform == "darwin":
+        plist = installer.launch_agent_path()
+        if plist.exists():
+            installer.unload_launch_agent(plist)
+            plist.unlink(missing_ok=True)
+            print(f"Removed auto-start agent: {plist}")
+
+    try:
+        settings = installer._load_settings(settings_file)
+    except WorkflowError as error:
+        print(f"{error.message} Remove the pii-guard hooks by hand.", file=sys.stderr)
+        return 1
+    stripped, removed = installer.remove_hooks(settings)
+    if removed:
+        backup = installer.backup_settings(settings_file)
+        if backup is not None:
+            print(f"Backed up settings: {backup}")
+        installer._atomic_write(
+            settings_file, json.dumps(stripped, ensure_ascii=False, indent=2) + "\n"
+        )
+    print(f"Removed {removed} hook entr(ies) from {settings_file}")
+
+    client = installer.client_target(config_dir)
+    client.unlink(missing_ok=True)
+    print(f"Removed hook client: {client}")
+    print("Left in place: settings backups, the installer config and stored mappings.")
+    print("Run 'pii-guard-hookd purge --all' to forget stored mappings.")
+    del config
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace, config: HookdConfig) -> int:
+    return _report(
+        installer.doctor(
+            config,
+            installer.claude_config_dir(),
+            installer.hookd_config_path(),
+            args.scope,
+        )
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pii-guard-hookd",
@@ -284,6 +381,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="stay attached instead of detaching into the background",
     )
 
+    setup = subparsers.add_parser("install", help="install the hooks and auto-start")
+    setup.add_argument("--engine", choices=("regex", "full"), default="full")
+    setup.add_argument("--scope", choices=("user", "project"), default="user")
+    setup.add_argument("--no-launchd", action="store_true", help="do not register auto-start")
+
+    remove = subparsers.add_parser("uninstall", help="remove the hooks and auto-start")
+    remove.add_argument("--scope", choices=("user", "project"), default="user")
+
+    check = subparsers.add_parser("doctor", help="check every part of the installation")
+    check.add_argument("--scope", choices=("user", "project"), default="user")
+
     subparsers.add_parser("status", help="report whether the service is running")
     subparsers.add_parser("stop", help="stop the running service")
 
@@ -300,6 +408,9 @@ def main(argv: list[str] | None = None) -> int:
     config = HookdConfig.from_env()
     commands = {
         "serve": cmd_serve,
+        "install": cmd_install,
+        "uninstall": cmd_uninstall,
+        "doctor": cmd_doctor,
         "status": cmd_status,
         "stop": cmd_stop,
         "purge": cmd_purge,
