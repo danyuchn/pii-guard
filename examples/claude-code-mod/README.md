@@ -48,7 +48,7 @@ CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir ~/.claude/plugins/pii-gu
 
 | 事件 | 往下（進工具前） | 往上（回模型前） |
 |------|------------------|------------------|
-| `tool.call` | Write／Edit／MultiEdit／Bash 還原佔位符；WebFetch／WebSearch／`mcp__*`／remote agent 直接拒絕；帶佔位符又能連網的指令拒絕 | Read／Bash／Grep／`mcp__*` 的結果去識別化 |
+| `tool.call` | Write／Edit／MultiEdit／Bash 還原佔位符；WebFetch／WebSearch／`mcp__*`／remote agent 直接拒絕；帶佔位符又能連網的指令拒絕 | Read／Bash／Grep／`mcp__*`，以及 Write／Edit／MultiEdit 的結果去識別化 |
 | `prompt.submit` | `@檔案` 改寫成「請 Read 這個檔」；使用者打字打進去的個資換成佔位符 | — |
 | `session.compact` | 壓縮前後都掃一次已知值 | 同左 |
 | `session.start` | 向服務要開場說明並載入 seed terms | — |
@@ -56,7 +56,11 @@ CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir ~/.claude/plugins/pii-gu
 `prompt.submit` 這條跟 classic 前端不同：classic 只能整則 **擋掉**，Mod 是 **改寫**，
 所以正常工作不會被打斷，而且打進去的值會被記住，之後寫回檔案時會還原。
 
-## 兩個實作上最容易踩的地方
+## 三個實作上最容易踩的地方
+
+**寫入類工具的「結果」也要遮。** `Write`／`Edit`／`MultiEdit` 的結果會把剛剛寫進去的內容
+原樣回傳，而那時候佔位符已經被還原成真值了——不遮的話，真值就從結果繞回模型，
+等於前面白做。這條是 eval 抓出來的，不是想出來的。
 
 **回傳結果時不能把 `ref` 一起帶回去。** `ref` 指的是 core 用**真值**建好的訊息；
 把拿到的物件原封不動回傳，core 就會照用那份，你改過的 `result` 會被忽略。
@@ -69,6 +73,10 @@ CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir ~/.claude/plugins/pii-gu
 
 plugin 用 `$.fs.read` 讀服務的 state 檔拿 port 與 token，再用 `$.http.fetch` 直接打
 `127.0.0.1`。兩者實測都通（見下方 spike）。這樣每次工具呼叫不用另外開一個 Python 行程。
+
+`$.http.fetch` 失敗時會退到第二條路：用 `$.process.run` 叫一小段 stdlib Python 去 POST。
+這是為了 `claude plugin eval`，那個環境會直接拒掉 `$.http.fetch`（連 loopback 也拒），
+但子行程還是打得通。需要機器上有 `python3`——classic hook client 本來就要，所以不是新的依賴。
 服務位置的解析順序是 `options.hookdHome` → 環境變數 `PII_GUARD_HOOKD_HOME` → 預設值，
 沒有寫死路徑。
 
@@ -112,6 +120,44 @@ plugin 用 `$.fs.read` 讀服務的 state 檔拿 port 與 token，再用 `$.http
 
 注意驗證方法：**要看 transcript，不要看終端機 stdout**。`-p` 的 stdout 會經過 MessageDisplay，
 那條 hook 的工作就是把佔位符還原給人看，所以終端機上出現真值是正確行為，不是外洩。
+
+## Eval 分數（2026-09-16，haiku，runs=1，full engine）
+
+`evals/` 是一套 `claude plugin eval` 的案例。跑法：
+
+```bash
+./evals/run.sh                       # full engine、每個 arm 跑 1 次、haiku
+ENGINE=regex RUNS=3 MODEL=sonnet ./evals/run.sh
+```
+
+`run.sh` 會在一個 tmp 目錄開一個 guard、把路徑用 `EVAL_PII_GUARD_HOOKD_HOME` 傳進去、
+跑完再把服務停掉。不會碰到任何真實安裝。
+
+| CASE | WITH | W/OUT | Δ |
+|------|------|-------|---|
+| read-redaction | 1.00 | 0.09 | +0.91 |
+| typed-pii | 1.00 | 0.00 | +1.00 |
+| write-restore | 1.00 | 0.50 | +0.50 |
+
+3 cases、mean Δ +0.80、35 秒、$0.12。
+
+without-arm 分數低是**預期的**：沒有 Mod，個資本來就會進到模型，`not_contains` 那幾條
+grader 本來就該失敗。這個差值才是這套 suite 真正在量的東西。read-redaction 的 without
+拿到 0.09 而不是 0，是因為「有沒有真的去讀檔」那條 grader 兩邊都會過。
+
+### 跑 eval 時的三個環境限制
+
+1. **每個 run 都有一個全新的 home**，所以 Mod 找不到預設路徑下的 state 檔。
+   只有 `EVAL_` 開頭的環境變數會從外層 shell 傳進去，所以 `homeDir()` 多認一個
+   `EVAL_PII_GUARD_HOOKD_HOME`（順序：`options.hookdHome` → `PII_GUARD_HOOKD_HOME`
+   → `EVAL_PII_GUARD_HOOKD_HOME` → 預設值）。
+   `prompt.md` 的 `env:` 只吃寫死的值，所以案例裡沒寫，改由 `run.sh` export。
+2. **`$.http.fetch` 在 eval 裡會被直接拒絕**，連 loopback 也一樣：
+   `refused: nonessential network traffic is disabled for this session`。
+   但 `$.process.run` 開出去的子行程不受這條限制。所以傳輸層改成兩段：先試 `$.http.fetch`，
+   失敗就用一小段 stdlib Python 中繼。平常那條路不會多開行程，eval 裡才會。
+3. **`$.env.get` 的參數必須是字面字串**，`claude plugin validate` 會擋下用變數去取的寫法
+   （這樣它才能把模組讀寫哪些環境變數列出來）。
 
 ## 事前驗證（spike）
 

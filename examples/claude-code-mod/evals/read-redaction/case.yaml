@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: read-redaction
+description: A file read must reach the model with every identifier replaced by a placeholder.
+tags: [guard, read]
+context:
+  scaffold_script: fixture.sh
