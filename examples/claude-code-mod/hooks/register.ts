@@ -45,19 +45,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function homeDir($: any, options: Record<string, unknown>): string {
+// Every call on `$` is a dispatch to the host, so all of them are async,
+// `$.env.get` included: reading one without awaiting yields a Promise that
+// stringifies into the path and turns every lookup into ENOENT.
+async function homeDir($: any, options: Record<string, unknown>): Promise<string> {
   const configured = options['hookdHome']
   if (typeof configured === 'string' && configured.trim()) return configured.trim()
-  const fromEnv = $.env.get('PII_GUARD_HOOKD_HOME')
+  const fromEnv = await $.env.get('PII_GUARD_HOOKD_HOME')
   if (typeof fromEnv === 'string' && fromEnv.trim()) return fromEnv.trim()
-  return `${$.env.get('HOME') ?? ''}/${DEFAULT_HOME}`
+  const home = await $.env.get('HOME')
+  return `${typeof home === 'string' ? home : ''}/${DEFAULT_HOME}`
 }
 
 // The state file is owner-only and holds the port and bearer token of the
 // running service. A stale cache is dropped by the caller on any failure.
 async function connect($: any, options: Record<string, unknown>): Promise<Connection> {
   if (cached) return cached
-  const text = await $.fs.read(`${homeDir($, options)}/state.env`)
+  const text = await $.fs.read(`${await homeDir($, options)}/state.env`)
   const port = /PII_HOOKD_PORT=(\d+)/.exec(text)?.[1]
   const token = /PII_HOOKD_TOKEN=(\S+)/.exec(text)?.[1]
   if (!port || !token) throw new Error('no hookd state')
