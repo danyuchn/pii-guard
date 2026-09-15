@@ -47,6 +47,12 @@ uv run mypy src/
 
 # Lint
 uv run ruff check src/
+
+# 常駐 hook 去識別化服務（install 會併好 settings 並自動啟動）
+uv run pii-guard-hookd install [--engine full|regex] [--scope user|project] [--no-launchd] [--harden]
+uv run pii-guard-hookd doctor | uninstall
+uv run pii-guard-hookd serve [--engine full|regex] [--foreground] [--session-ttl-days N]
+uv run pii-guard-hookd status | stop | purge [session_id|--all]
 ```
 
 ## PII Types Supported
@@ -73,6 +79,7 @@ uv run ruff check src/
 - **Phase 4** ✅ 2026-03-30：eval corpus 53 筆標註語料 + precision/recall/F1 框架，修復 5 個偵測問題。2026-08-31 實跑 `uv run pytest tests/eval/ -v -m eval -s`：Regex 49 TP / 0 FP / 0 FN（F1=100%），Full CKIP 62 TP / 1 FP / 2 FN（F1=97.6%）。同日把 loc-001 的標註由 LOCATION 更正為 TW_ADDRESS，並在類別正規化前依 raw type 排除 NER-only 類型，使結構化地址確實貢獻 Regex TP；另修正 TW_PASSWORD 關鍵字邊界，避免把 "passport" 的 "port" 誤判為密碼。
 - **Phase 5** ✅：`pii-safe-documents` skill（顯式觸發、可逆、主 agent 隔離）。早期的 PreToolUse hook 已退役，見 `examples/claude-code-hook/`。
 - **Phase 6** ✅ 2026-03-31：多格式檔案支援（xlsx/docx/pdf）CLI + MCP，file_handlers 模組，MIT LICENSE
+- **Phase 7** 已完成：`src/pii_guard/hookd/` 常駐 loopback 服務＋classic hooks，工具輸出進模型前遮蔽、寫回時還原，連不到服務就擋住（設計與涵蓋範圍見 `examples/claude-code-hookd/README.md`）
 
 ### Recall Benchmark（2026-03-31 真實文件測試）
 - 格式化 PII（身分證/手機/Email/市話/車牌/生日/銀行帳號）：~95%

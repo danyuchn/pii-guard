@@ -36,6 +36,7 @@ dev = [
 [project.scripts]
 pii-guard = "pii_guard.__main__:main"
 pii-guard-detect = "pii_guard.hook_detect:main"
+pii-guard-hookd = "pii_guard.hookd.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pii_guard"]
