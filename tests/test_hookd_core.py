@@ -291,3 +291,26 @@ def test_sweep_is_disabled_by_a_zero_ttl(config: HookdConfig) -> None:
 
     assert store.sweep_expired(0) == 0
     assert stale.exists()
+
+
+def test_detect_prefers_the_structured_type_over_the_model_label() -> None:
+    """The full engine can call a phone number PERSON; the reason must not."""
+
+    redactor = _redactor({"0955123456": "PERSON"})
+
+    assert redactor.detect("請打 0955123456 給我") == {"TW_MOBILE": 1}
+    # Detection must not teach the session anything about a refused prompt.
+    assert redactor.mapping == {}
+
+
+def test_detect_keeps_the_model_label_for_a_name() -> None:
+    redactor = _redactor({"王小明": "PERSON"})
+
+    assert redactor.detect("負責人是王小明") == {"PERSON": 1}
+
+
+def test_detect_ignores_a_placeholder_the_session_already_issued() -> None:
+    redactor = _redactor({"王小明": "PERSON"})
+    redactor.redact("王小明")
+
+    assert redactor.detect("把 <PERSON_1> 寫進檔案") == {}

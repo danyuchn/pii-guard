@@ -108,7 +108,17 @@ def test_extra_commands_come_from_the_config() -> None:
 
 def test_looks_encoded_catches_long_runs() -> None:
     assert policy.looks_encoded("payload: " + "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph" * 3)
-    assert policy.looks_encoded("hash " + "a1b2c3d4" * 9)
+    # 96 hex characters and up; a SHA-512 digest is 128.
+    assert policy.looks_encoded("digest " + "a1b2c3d4" * 16)
+
+
+def test_a_sha256_checksum_is_not_withheld() -> None:
+    """shasum prints exactly 64 hex characters, which is ordinary output."""
+
+    digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+    assert len(digest) == 64
+    assert not policy.looks_encoded(f"{digest}  customers.txt\n" * 2)
 
 
 def test_looks_encoded_leaves_ordinary_output_alone() -> None:
@@ -197,3 +207,21 @@ def test_seed_terms_are_read_with_optional_types(tmp_path) -> None:
 
 def test_missing_seed_file_is_not_an_error(tmp_path) -> None:
     assert policy.load_seed_terms([str(tmp_path / "nope.txt")]) == ()
+
+
+@pytest.mark.parametrize(
+    ("value", "entity"),
+    [
+        ("0955123456", "TW_MOBILE"),
+        ("A123456789", "TW_NATIONAL_ID"),
+        ("0212345678", "TW_LANDLINE"),
+        ("someone@example.com", "EMAIL_ADDRESS"),
+    ],
+)
+def test_structured_values_are_named_by_shape(value: str, entity: str) -> None:
+    assert policy.structured_entity_type(value) == entity
+
+
+@pytest.mark.parametrize("value", ["王小明", "寶島顧問", "", "just words"])
+def test_unstructured_values_have_no_shape(value: str) -> None:
+    assert policy.structured_entity_type(value) is None

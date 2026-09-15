@@ -149,7 +149,12 @@ Claude 呼叫 Read/Bash/Grep
 | 帶佔位符的 `curl` 被 deny、`grep` 照常還原執行 | 通過（2026-09-15，真實 client） |
 | 種子詞 `龍哥` 在 regex 引擎下仍被遮成 `<PERSON_1>` | 通過（2026-09-15，真實 client） |
 | 含手機號碼的 prompt 被擋且理由只講類型與數量 | 通過（2026-09-15，真實 client） |
-| sandbox 真的擋住連線（由 Claude Code 執行，非本專案） | **未實測** |
+| sandbox 真的擋住裸 `curl`（Seatbelt 回 sandbox_violations） | 通過（2026-09-15，加固 e2e） |
+| `cat｜base64` 與 python base64 一行腳本被編碼器規則 deny | 通過（2026-09-15，加固 e2e） |
+| 帶佔位符的 `curl` deny；`grep '<TW_MOBILE_1>'` 還原後執行 | 通過（2026-09-15，加固 e2e） |
+| `@customers.txt` 的 prompt 被擋；含手機號碼的 prompt 在進模型前被擋 | 通過（2026-09-15，加固 e2e） |
+| MCP 工具呼叫 deny 並附 allowlist 提示；`isolation: remote` 的 Agent deny | 通過（2026-09-15，加固 e2e） |
+| 種子詞 `龍哥` 在 full 引擎下被遮成 `<PERSON_1>` | 通過（2026-09-15，加固 e2e） |
 
 ## 限制：`Edit` 的 `old_string` 不會被還原
 
@@ -233,7 +238,7 @@ uv run pii-guard-hookd doctor --harden
 |------|--------|------------|
 | **網路命令不還原** | 帶佔位符的 `curl`／`wget`／`nc`／`ssh`／`scp`／`rsync`／含 URL 的指令，以及 `python -c` 之類含 `urllib`／`socket`／`fetch` 的一行腳本，一律 deny | 要把去識別化後的內容送出去得自己改寫。**沒帶佔位符的 `curl` 完全不受影響**——沒東西要還原就不關這層的事 |
 | **編碼器 deny** | `base64`／`base32`／`xxd`／`od`／`hexdump`／`openssl enc`、寫到 stdout 的 `tar czf -`／`gzip -c`，以及含 `b64`／`zlib`／`hexlify` 的一行腳本。**不論有沒有佔位符** | 這是最容易誤擋的一條：正當地讀一個本來就是 base64 的檔案也會被擋。改用 `cat` 看原檔，或把工具加進 `policy.encoders_extra` 的反面——目前只能改用別的指令 |
-| **輸出閘門** | 指令輸出含 64 字元以上的 base64 或 hex 連續串，或非文字字元超過三成 → 整份輸出扣住 | 讀 hash、憑證、minified bundle 的輸出會被扣住。用 `policy.output_gate: false` 關掉 |
+| **輸出閘門** | 指令輸出含 64 字元以上的 base64 連續串、96 字元以上的 hex 串，或非文字字元超過三成 → 整份輸出扣住 | 憑證、minified bundle 的輸出會被扣住。**SHA-256 不會**（剛好 64 個 hex 字元，已特別放行）；SHA-512 會。用 `policy.output_gate: false` 關掉 |
 | **出口工具 deny** | `WebFetch`、`WebSearch`、所有 `mcp__*` | 這期間不能上網查資料。要放行特定 MCP 工具見下 |
 | **遠端 agent deny** | `isolation: "remote"` 的 Agent／Workflow | 不能用雲端 sandbox。理由是那台機器上沒有 hook，等於整個防線失效 |
 | **prompt 檢查** | `@檔案` 引用（因為它不經過工具呼叫，任何 hook 都看不到）、以及 prompt 本身含個資 | 想引用檔案要改口說「讀這個檔」。`@目錄` 不受影響 |
@@ -284,6 +289,13 @@ TW_MOBILE	0912345678
 **真正兜住這一層的只有 sandbox 的網域白名單。** 規則層負責讓「不小心」和
 「順手」變得做不到，sandbox 負責讓「刻意」也出不去。只開 `--harden` 的規則
 而把 sandbox 關掉，等於只裝了前者。
+
+**被擋下的 prompt 仍然會寫進本機 transcript。** Claude Code 會在
+`~/.claude/projects/` 的 transcript JSONL 裡寫一行
+`type: "system", subtype: "informational"`，內容引用了被擋的原始 prompt
+（`Original prompt: ...`）。依官方說明那段文字**不會進入模型 context**，
+但它確實留在磁碟上。也就是說：擋下來防的是「模型看到」，不是「本機留存」。
+要一併處理本機留存，得自己清 transcript。
 
 另外三點：
 

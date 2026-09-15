@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Protocol
 
+from pii_guard.hookd.policy import structured_entity_type
 from pii_guard.hookd.state import HookdConfig
 from pii_guard.local_workflow import (
     PLACEHOLDER_PATTERN,
@@ -325,13 +326,16 @@ class SessionRedactor:
             reverse=dict(self.reverse),
             counters=dict(self.counters),
         )
-        before = probe._counts_for(text)
-        after = probe.redact(text).counts
-        found = {}
-        for entity_type, count in after.items():
-            delta = count - before.get(entity_type, 0)
-            if delta > 0:
-                found[entity_type] = delta
+        known = set(self.mapping)
+        probe.redact(text)
+        found: dict[str, int] = {}
+        for placeholder, value in probe.mapping.items():
+            if placeholder in known:
+                continue
+            # The engine labels by context, so a phone number sitting inside a
+            # sentence can come back as PERSON.  Report what the value is.
+            entity_type = structured_entity_type(value) or _placeholder_type(placeholder)
+            found[entity_type] = found.get(entity_type, 0) + 1
         return found
 
     def placeholder_count(self) -> int:

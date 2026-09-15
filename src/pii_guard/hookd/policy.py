@@ -70,7 +70,12 @@ OPENSSL_ENCODER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\b(?:enc|base64)\
 OPENSSL_NETWORK_PATTERN: Final[re.Pattern[str]] = re.compile(r"\bs_client\b")
 
 BASE64_RUN_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9+/=]{64,}")
-HEX_RUN_PATTERN: Final[re.Pattern[str]] = re.compile(r"[0-9a-fA-F]{64,}")
+# A SHA-256 digest is exactly 64 hex characters, so checksumming a file used to
+# have its output withheld.  SHA-512 still trips this, which is the right way
+# round: printing a hash is common, printing 96 hex characters is not.
+HEX_RUN_PATTERN: Final[re.Pattern[str]] = re.compile(r"[0-9a-fA-F]{96,}")
+_HEX_ONLY_PATTERN: Final[re.Pattern[str]] = re.compile(r"[0-9a-fA-F]+")
+HEX_EXEMPT_LENGTH: Final[int] = 96
 # Letters, CJK, digits and the punctuation ordinary output is made of.
 ORDINARY_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"[0-9A-Za-z　-〿㐀-䶿一-鿿＀-￯"
@@ -297,7 +302,14 @@ def looks_encoded(text: str) -> bool:
 
     if len(text) < MIN_GATED_LENGTH:
         return False
-    if BASE64_RUN_PATTERN.search(text) or HEX_RUN_PATTERN.search(text):
+    if HEX_RUN_PATTERN.search(text):
+        return True
+    for match in BASE64_RUN_PATTERN.finditer(text):
+        run = match.group()
+        # Hex is a subset of the base64 alphabet, so a checksum would trip this
+        # rule too.  Runs that are pure hex are left to the longer hex limit.
+        if len(run) < HEX_EXEMPT_LENGTH and _HEX_ONLY_PATTERN.fullmatch(run):
+            continue
         return True
     dense = "".join(text.split())
     if len(dense) < MIN_GATED_LENGTH:
@@ -370,3 +382,42 @@ def load_seed_terms(paths: Iterable[str]) -> tuple[tuple[str, str], ...]:
             seen.add(value)
             terms.append((entity_type, value))
     return tuple(terms)
+
+
+_STRUCTURED_PATTERNS: list[tuple[str, re.Pattern[str]]] = []
+
+
+def _structured_patterns() -> list[tuple[str, re.Pattern[str]]]:
+    """Compile the Taiwan recognizers' patterns once, for relabelling only."""
+
+    if _STRUCTURED_PATTERNS:
+        return _STRUCTURED_PATTERNS
+    try:
+        from pii_guard.recognizers.tw_recognizers import get_all_tw_recognizers
+
+        for recognizer in get_all_tw_recognizers():
+            entity = (recognizer.supported_entities or [""])[0]
+            for pattern in getattr(recognizer, "patterns", []):
+                try:
+                    _STRUCTURED_PATTERNS.append((entity, re.compile(pattern.regex)))
+                except re.error:
+                    continue
+    except Exception:  # noqa: BLE001 - relabelling is cosmetic, never fatal
+        return []
+    return _STRUCTURED_PATTERNS
+
+
+def structured_entity_type(value: str) -> str | None:
+    """Name what *value* is by shape, ignoring the context it was found in.
+
+    The full engine can label a phone number PERSON when a name recogniser
+    overlaps it, which makes a refusal reason say the wrong thing.  A value
+    that is exactly a known structured identifier is reported as one.
+    """
+
+    if not value:
+        return None
+    for entity, pattern in _structured_patterns():
+        if pattern.fullmatch(value):
+            return entity
+    return None
