@@ -53,6 +53,11 @@ uv run pii-guard-hookd install [--engine full|regex] [--scope user|project] [--n
 uv run pii-guard-hookd doctor [--harden] [--mod] | uninstall
 uv run pii-guard-hookd serve [--engine full|regex] [--foreground] [--session-ttl-days N]
 uv run pii-guard-hookd status | stop | purge [session_id|--all]
+
+# 參考名單：把客戶名單（xlsx/csv）的欄位對應存成描述檔，值留在原檔
+uv run pii-guard-hookd terms inspect <表格> [--sheet 名稱] [--json]
+uv run pii-guard-hookd terms import <表格> [--map 姓名=PERSON,金額=SKIP] [--yes] [--materialize]
+uv run pii-guard-hookd terms status | remove <表格>|--all | ui
 ```
 
 ## PII Types Supported
@@ -80,6 +85,7 @@ uv run pii-guard-hookd status | stop | purge [session_id|--all]
 - **Phase 5** ✅：`pii-safe-documents` skill（顯式觸發、可逆、主 agent 隔離）。早期的 PreToolUse hook 已退役，見 `examples/claude-code-hook/`。
 - **Phase 6** ✅ 2026-03-31：多格式檔案支援（xlsx/docx/pdf）CLI + MCP，file_handlers 模組，MIT LICENSE
 - **Phase 7** 已完成：`src/pii_guard/hookd/` 常駐 loopback 服務＋classic hooks，工具輸出進模型前遮蔽、寫回時還原，連不到服務就擋住（設計與涵蓋範圍見 `examples/claude-code-hookd/README.md`）
+- **Phase 9** 已完成：參考名單（reference list seeding）。`src/pii_guard/reference.py` 把客戶名單（xlsx／csv）的「欄位 → 類型」對應存成 `<專案>/.pii-guard/sources.json`（**只存描述，不存值**），服務依來源檔 mtime 重讀，`POST /v1/reload` 免重啟。編號類欄位會推出格式 regex 動態註冊成 `PatternRecognizer`，名單外的新編號也抓得到。三個入口共用同一份設定：`pii-guard-hookd terms`、Claude Code 的 `/pii-terms`、本機網頁的「名單」分頁；匯入時會自動把專案登記進 installer config 的 `policy.reference_sources`，服務每次 reload 重讀該清單，所以「先裝 hook、後匯名單」不需重啟。Excel 存成數字而掉了開頭 0 的手機／市話／統編會依欄位類型補回。值不進 stdout／log／hook 回覆／HTTP JSON，例外只有網頁每欄 3 筆預覽與 `--materialize` 寫出的 `terms.txt`。
 - **Phase 8** 已完成：`examples/claude-code-mod/` Claude Mods 前端（function hooks）。同一個服務、同一套規則，但 `tool.call` 跑在 Edit 驗證之前，補掉 classic hooks 的 Edit 缺口；prompt 由「整則擋掉」改成「改寫」。安裝用 `install --mod`，只有 MessageDisplay 仍是 classic hook（function hook API 沒有對應事件）。設計、限制與事前驗證見 `examples/claude-code-mod/README.md`
 
 ### Recall Benchmark（2026-03-31 真實文件測試）

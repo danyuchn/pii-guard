@@ -28,6 +28,24 @@ from pii_guard.hookd.core import SessionStore, create_engine_with_fallback
 from pii_guard.hookd.server import HookdApplication, HookdServerConfig, create_server
 from pii_guard.hookd.state import HookdConfig, clear_state, read_state, write_state
 from pii_guard.local_workflow import WorkflowError
+from pii_guard.reference import (
+    COLUMN_TYPES,
+    ReferenceCache,
+    ReferenceSource,
+    TableReport,
+    inspect_table,
+    load_reference_terms,
+    load_sources,
+    materialize,
+    normalize_type,
+    register_project,
+    registered_source_files,
+    sources_path,
+    terms_path,
+    type_label,
+    unregister_project,
+    write_sources,
+)
 
 START_TIMEOUT_SECONDS: Final[float] = 180.0
 STOP_TIMEOUT_SECONDS: Final[float] = 15.0
@@ -87,6 +105,9 @@ def _serve_foreground(
 ) -> int:
     policy_config = _load_policy()
     seed_terms = policy.load_seed_terms(policy_config.seed_terms_files)
+    # A callable, not the list read at startup: a project imported later must
+    # become visible on the next /v1/reload without restarting the service.
+    reference = ReferenceCache(registered_source_files)
     engine, loaded_engine, fallback = create_engine_with_fallback(engine_name)
     store = SessionStore(config, engine)
     # Old mappings are the only thing that can undo a placeholder, so they are
@@ -98,6 +119,7 @@ def _serve_foreground(
         engine_fallback=fallback,
         policy_config=policy_config,
         seed_terms=seed_terms,
+        reference=reference,
     )
     server, token, bound_port = create_server(app, HookdServerConfig(port=port))
     write_state(
@@ -122,7 +144,9 @@ def _serve_foreground(
         signal.signal(received, _stop)
 
     names = "names covered" if loaded_engine == "full" else "names NOT covered"
-    seeds = f", {len(seed_terms)} seed term(s)" if seed_terms else ""
+    reference_terms = len(reference.load().terms)
+    seeded_total = len(seed_terms) + reference_terms
+    seeds = f", {seeded_total} seed term(s)" if seeded_total else ""
     swept = f", swept {expired} expired session(s)" if expired else ""
     print(
         f"pii-guard hookd listening on 127.0.0.1:{bound_port} "
@@ -360,6 +384,7 @@ def cmd_install(args: argparse.Namespace, config: HookdConfig) -> int:
         repo,
         args.engine,
         seed_terms_files=installer.default_seed_terms_files(Path.cwd()),
+        reference_sources=installer.default_reference_sources(Path.cwd()),
         existing_policy=_existing_policy(installer_config),
     )
     print(f"Wrote config: {installer_config}")
@@ -465,6 +490,291 @@ def cmd_doctor(args: argparse.Namespace, config: HookdConfig) -> int:
     )
 
 
+# ---------------------------------------------------------------------------
+# Reference lists
+# ---------------------------------------------------------------------------
+
+# Every one of these prints column names, types and counts.  None of them ever
+# prints a value out of the table, because this output lands in a terminal, a
+# scrollback buffer and often a transcript.
+TERMS_HEADER: Final[str] = "欄位 | 猜到的類型 | 筆數 | 風險筆數 | 形狀"
+
+
+def _project_path(args: argparse.Namespace) -> Path:
+    return Path(getattr(args, "project", None) or Path.cwd()).expanduser()
+
+
+def _print_type_menu() -> list[str]:
+    """Show the type table once and return the numbered order used by it."""
+
+    order = list(COLUMN_TYPES)
+    print("可選的類型：")
+    for number, entity_type in enumerate(order, start=1):
+        print(f"  {number:>2}. {type_label(entity_type)}（{entity_type}）")
+    return order
+
+
+def _render_report(report: TableReport) -> None:
+    print(f"檔案：{report.path}")
+    if report.sheet:
+        print(f"工作表：{report.sheet}（可用：{', '.join(report.sheets)}）")
+    print(f"資料列數：{report.rows}")
+    print()
+    print(TERMS_HEADER)
+    for column in report.columns:
+        shape = column.shape or "－"
+        print(
+            f"{column.name} | {type_label(column.guessed_type)}"
+            f"（{column.guessed_type}） | {column.non_empty} | {column.risky} | {shape}"
+        )
+
+
+def cmd_terms_inspect(args: argparse.Namespace, _config: HookdConfig) -> int:
+    report = inspect_table(args.file, sheet=args.sheet)
+    if args.json:
+        # Deliberately without samples: this output is meant to be safe to hand
+        # to a model or paste anywhere.
+        print(json.dumps(report.describe(), ensure_ascii=False, indent=2))
+        return 0
+    _render_report(report)
+    return 0
+
+
+def _parse_map(values: list[str] | None) -> dict[str, str]:
+    """Read ``--map 姓名=PERSON,電話=TW_MOBILE`` into a column mapping."""
+
+    mapping: dict[str, str] = {}
+    for raw in values or []:
+        for item in raw.split(","):
+            entry = item.strip()
+            if not entry:
+                continue
+            name, separator, entity_type = entry.partition("=")
+            if not separator or not name.strip():
+                raise WorkflowError("INVALID_MAP", "Use --map 欄位=類型 pairs.")
+            mapping[name.strip()] = normalize_type(entity_type)
+    return mapping
+
+
+def _ask_columns(report: TableReport) -> dict[str, str]:
+    """Walk the columns with the user, one confirmation each."""
+
+    order = _print_type_menu()
+    print()
+    chosen: dict[str, str] = {}
+    for column in report.columns:
+        label = type_label(column.guessed_type)
+        risky = f"，其中 {column.risky} 筆太短會略過" if column.risky else ""
+        prompt = (
+            f"「{column.name}」看起來是{label}（{column.non_empty} 筆{risky}）。"
+            "Enter 接受／輸入編號改／s 不要遮：> "
+        )
+        while True:
+            try:
+                answer = input(prompt).strip()
+            except EOFError:
+                answer = ""
+            if not answer:
+                chosen[column.name] = column.guessed_type
+                break
+            if answer.lower() == "s":
+                chosen[column.name] = "SKIP"
+                break
+            if answer.isdigit() and 1 <= int(answer) <= len(order):
+                chosen[column.name] = order[int(answer) - 1]
+                break
+            print("請按 Enter、輸入清單裡的編號，或輸入 s。")
+    return chosen
+
+
+def _shape_patterns(report: TableReport, columns: dict[str, str]) -> list[tuple[str, str]]:
+    """Shape rules worth registering, which is the types nothing else covers.
+
+    A phone number or a national id already has a recognizer, so inferring a
+    second pattern for it would only add work.  An order number does not.
+    """
+
+    patterns: list[tuple[str, str]] = []
+    for column in report.columns:
+        entity_type = columns.get(column.name, "SKIP")
+        if entity_type not in {"ORDER_ID", "CUSTOM"} or not column.shape:
+            continue
+        patterns.append((entity_type, column.shape))
+    return patterns
+
+
+def _reload_service(config: HookdConfig) -> dict[str, Any] | None:
+    """Ask a running service to re-read the lists; ``None`` when it is down."""
+
+    state = _live_state(config)
+    if state is None:
+        return None
+    try:
+        return _request(state, "POST", "/v1/reload", {}, timeout=60.0)
+    except (OSError, ValueError):
+        return None
+
+
+def _merge_source(
+    existing: list[ReferenceSource], source: ReferenceSource
+) -> list[ReferenceSource]:
+    kept = [
+        item
+        for item in existing
+        if not (item.path == source.path and item.sheet == source.sheet)
+    ]
+    kept.append(source)
+    return kept
+
+
+def cmd_terms_import(args: argparse.Namespace, config: HookdConfig) -> int:
+    report = inspect_table(args.file, sheet=args.sheet)
+    explicit = _parse_map(args.map)
+    if explicit:
+        columns = {
+            column.name: explicit.get(column.name, "SKIP") for column in report.columns
+        }
+        unknown = sorted(set(explicit) - {column.name for column in report.columns})
+        if unknown:
+            print(f"注意：這幾欄不在檔案裡，已忽略：{', '.join(unknown)}")
+    elif args.yes:
+        columns = {column.name: column.guessed_type for column in report.columns}
+    else:
+        columns = _ask_columns(report)
+
+    source = ReferenceSource(
+        path=report.path,
+        sheet=report.sheet,
+        columns={name: entity for name, entity in columns.items() if entity != "SKIP"},
+        patterns=tuple(_shape_patterns(report, columns)),
+    )
+    project = _project_path(args)
+    stored = _merge_source(load_sources(project), source)
+    target = write_sources(project, stored)
+    print(f"已存下名單設定：{target}")
+    if register_project(project):
+        print("已把這個專案登記給保護服務。")
+
+    loaded = load_reference_terms(stored)
+    if args.materialize:
+        written = materialize(stored, terms_path(project))
+        print(f"已寫出詞表（含真實值，僅本機可讀）：{terms_path(project)}，{written} 筆")
+
+    if not loaded.counts:
+        print("這次沒有任何欄位會被遮蔽。")
+    else:
+        print("將自動遮蔽：")
+        for entity_type, count in sorted(loaded.counts.items()):
+            print(f"  {type_label(entity_type)} {count} 筆")
+    if loaded.risky_skipped:
+        print(f"略過 {loaded.risky_skipped} 筆過短的值（太容易誤遮）。")
+    for name, regex in loaded.patterns:
+        print(f"固定格式：{type_label(name)} {regex}，名單外的新值也會一起遮。")
+    if loaded.truncated:
+        print("注意：已達詞數上限，後面的值沒有載入。")
+
+    reloaded = _reload_service(config)
+    if reloaded is None:
+        print("保護服務目前沒在跑；下次開 Claude Code 時會自動載入這份名單。")
+        return 0
+    loaded_count = int(reloaded.get("terms", 0) or 0)
+    if loaded_count:
+        print(f"保護服務已重新載入，共 {loaded_count} 筆。")
+        return 0
+    # Reporting a reload that loaded nothing as a success is how someone ends
+    # up believing they are protected when they are not.
+    print(
+        "注意：保護服務載入了 0 筆。請跑 'pii-guard-hookd terms status' 查原因，"
+        "常見的是欄位全設成「不要遮」，或名單檔已經被移走。",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def cmd_terms_status(args: argparse.Namespace, config: HookdConfig) -> int:
+    project = _project_path(args)
+    sources = load_sources(project)
+    print(f"名單設定：{sources_path(project)}")
+    if not sources:
+        print("尚未匯入任何名單。")
+        return 0
+    for source in sources:
+        path = Path(source.path).expanduser()
+        if path.is_file():
+            stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime))
+            freshness = f"最後修改 {stamp}"
+        else:
+            freshness = "檔案不存在"
+        sheet = f"（工作表 {source.sheet}）" if source.sheet else ""
+        print(f"- {source.path}{sheet}：{len(source.columns)} 欄，{freshness}")
+    loaded = load_reference_terms(sources)
+    for entity_type, count in sorted(loaded.counts.items()):
+        print(f"  {type_label(entity_type)} {count} 筆")
+    if loaded.missing:
+        print(f"  讀不到的來源：{len(loaded.missing)} 個")
+    state = _live_state(config)
+    if state is None:
+        print("保護服務：沒在跑（下次開 Claude Code 會自動載入）")
+        return 0
+    try:
+        health = _request(state, "GET", "/v1/health", timeout=5.0)
+    except (OSError, ValueError):
+        print("保護服務：有回應但拿不到狀態")
+        return 0
+    running = health.get("reference")
+    count = running.get("terms", 0) if isinstance(running, dict) else 0
+    print(f"保護服務：執行中，已載入 {count} 筆")
+    return 0
+
+
+def cmd_terms_remove(args: argparse.Namespace, config: HookdConfig) -> int:
+    project = _project_path(args)
+    if not args.all and not args.file:
+        print("給一個檔案路徑，或用 --all。", file=sys.stderr)
+        return 1
+    sources = load_sources(project)
+    if args.all:
+        remaining: list[ReferenceSource] = []
+    else:
+        wanted = str(Path(args.file).expanduser())
+        remaining = [source for source in sources if source.path != wanted]
+        if len(remaining) == len(sources):
+            print("這個檔案不在名單設定裡。")
+            return 1
+    write_sources(project, remaining)
+    print(f"已移除 {len(sources) - len(remaining)} 個來源。")
+    if not remaining and unregister_project(project):
+        print("已把這個專案從保護服務的名單裡撤掉。")
+    _reload_service(config)
+    return 0
+
+
+def cmd_terms_ui(args: argparse.Namespace, _config: HookdConfig) -> int:
+    """Open the same local page as ``pii-guard web``, for hookd users."""
+
+    from pii_guard.web import run_web
+
+    run_web(port=args.port, open_browser=not args.no_open)
+    return 0
+
+
+TERMS_COMMANDS: Final[dict[str, Any]] = {
+    "inspect": cmd_terms_inspect,
+    "import": cmd_terms_import,
+    "status": cmd_terms_status,
+    "remove": cmd_terms_remove,
+    "ui": cmd_terms_ui,
+}
+
+
+def cmd_terms(args: argparse.Namespace, config: HookdConfig) -> int:
+    handler = TERMS_COMMANDS.get(args.terms_command)
+    if handler is None:
+        print("Unknown terms command.", file=sys.stderr)
+        return 1
+    return int(handler(args, config))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pii-guard-hookd",
@@ -510,6 +820,43 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--harden", action="store_true", help="also check the hardened settings")
     check.add_argument("--mod", action="store_true", help="also check the mod front end")
 
+    terms = subparsers.add_parser("terms", help="manage the project's reference lists")
+    terms_sub = terms.add_subparsers(dest="terms_command", required=True)
+
+    inspect = terms_sub.add_parser("inspect", help="show what a table's columns look like")
+    inspect.add_argument("file")
+    inspect.add_argument("--sheet", default=None, help="worksheet name for .xlsx files")
+    inspect.add_argument("--json", action="store_true", help="machine-readable, still no values")
+
+    bring = terms_sub.add_parser("import", help="record a table as a reference list")
+    bring.add_argument("file")
+    bring.add_argument("--sheet", default=None)
+    bring.add_argument(
+        "--map",
+        action="append",
+        default=None,
+        help="column to type pairs, as 姓名=PERSON,電話=TW_MOBILE",
+    )
+    bring.add_argument("--yes", action="store_true", help="accept every guess without asking")
+    bring.add_argument(
+        "--materialize",
+        action="store_true",
+        help="also write .pii-guard/terms.txt, which does hold the real values",
+    )
+    bring.add_argument("--project", default=None, help="project directory (default: cwd)")
+
+    terms_status = terms_sub.add_parser("status", help="list the recorded lists and their counts")
+    terms_status.add_argument("--project", default=None)
+
+    terms_remove = terms_sub.add_parser("remove", help="forget one recorded list, or all of them")
+    terms_remove.add_argument("file", nargs="?", default=None)
+    terms_remove.add_argument("--all", action="store_true")
+    terms_remove.add_argument("--project", default=None)
+
+    terms_ui = terms_sub.add_parser("ui", help="open the local page for importing a list")
+    terms_ui.add_argument("--port", type=int, default=0)
+    terms_ui.add_argument("--no-open", action="store_true", help="do not open a browser")
+
     subparsers.add_parser("status", help="report whether the service is running")
     subparsers.add_parser("stop", help="stop the running service")
 
@@ -532,6 +879,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": cmd_status,
         "stop": cmd_stop,
         "purge": cmd_purge,
+        "terms": cmd_terms,
     }
     try:
         return commands[args.command](args, config)

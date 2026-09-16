@@ -225,3 +225,28 @@ def test_structured_values_are_named_by_shape(value: str, entity: str) -> None:
 @pytest.mark.parametrize("value", ["王小明", "寶島顧問", "", "just words"])
 def test_unstructured_values_have_no_shape(value: str) -> None:
     assert policy.structured_entity_type(value) is None
+
+
+def test_reference_sources_are_read_into_the_policy() -> None:
+    config = policy.PolicyConfig.from_mapping(
+        {"reference_sources": ["/tmp/a/.pii-guard/sources.json", 7, "  "]}
+    )
+
+    assert config.reference_sources == ("/tmp/a/.pii-guard/sources.json",)
+
+
+def test_a_policy_without_reference_sources_is_empty() -> None:
+    assert policy.PolicyConfig.from_mapping({}).reference_sources == ()
+
+
+def test_the_policy_summary_counts_reference_sources_without_naming_them() -> None:
+    described = policy.PolicyConfig(reference_sources=("/tmp/secret/sources.json",)).describe()
+
+    assert described["reference_sources"] == 1
+    assert "/tmp/secret/sources.json" not in str(described)
+
+
+def test_the_seed_ceiling_holds_a_whole_customer_list() -> None:
+    # A reference list built from a real table is routinely thousands of rows.
+    assert policy.MAX_SEED_TERMS >= 50_000
+    assert policy.MAX_SEED_BYTES >= 10 * 1024 * 1024

@@ -7,6 +7,7 @@ import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -588,3 +589,347 @@ def test_idle_keepalive_connection_does_not_block_other_requests(running_server)
         idle.close()
     assert status == 200
     assert elapsed < 2.0, f"second request waited {elapsed:.2f}s behind an idle connection"
+
+
+# ---------------------------------------------------------------------------
+# Reference lists on the local page
+# ---------------------------------------------------------------------------
+
+REFERENCE_NAMES = ("吳孟儒", "蔡佩君", "鄭宇翔")
+REFERENCE_MOBILES = ("0912000111", "0912000222", "0912000333")
+REFERENCE_ORDERS = ("ORD-000101", "ORD-000102", "ORD-000103")
+REFERENCE_CSV = "姓名,手機,訂單編號,金額\n" + "".join(
+    f"{name},{mobile},{order},{9000 + index}\n"
+    for index, (name, mobile, order) in enumerate(
+        zip(REFERENCE_NAMES, REFERENCE_MOBILES, REFERENCE_ORDERS, strict=True)
+    )
+)
+
+
+def _reference_multipart(body: str, filename: str, sheet: str = "") -> tuple[bytes, str]:
+    boundary = "reference-test-boundary"
+    pieces = [
+        f'--{boundary}\r\nContent-Disposition: form-data; name="sheet"\r\n\r\n{sheet}\r\n',
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+        f'filename="{filename}"\r\nContent-Type: text/csv\r\n\r\n{body}\r\n',
+        f"--{boundary}--\r\n",
+    ]
+    return "".join(pieces).encode("utf-8"), f"multipart/form-data; boundary={boundary}"
+
+
+@pytest.fixture()
+def reference_table(tmp_path: Path) -> Path:
+    target = tmp_path / "customers.csv"
+    target.write_text(REFERENCE_CSV, encoding="utf-8")
+    return target
+
+
+@pytest.fixture()
+def reference_project(tmp_path: Path) -> Path:
+    project = tmp_path / "web-project"
+    project.mkdir()
+    return project
+
+
+def _reference_app(tmp_path: Path) -> LocalWebApplication:
+    return LocalWebApplication(PrivateJobStore(tmp_path / "jobs", engine=FakeEngine()))
+
+
+def test_reference_inspect_names_the_columns(tmp_path: Path, reference_table: Path) -> None:
+    app = _reference_app(tmp_path)
+
+    report = app.reference_inspect(
+        reference_table.read_bytes(), reference_table.name, None
+    )
+
+    assert [column["name"] for column in report["columns"]] == [
+        "姓名",
+        "手機",
+        "訂單編號",
+        "金額",
+    ]
+    assert report["columns"][0]["guessed_type"] == "PERSON"
+    assert report["columns"][3]["guessed_type"] == "SKIP"
+
+
+def test_reference_inspect_returns_at_most_three_samples(
+    tmp_path: Path, reference_table: Path
+) -> None:
+    app = _reference_app(tmp_path)
+
+    report = app.reference_inspect(
+        reference_table.read_bytes(), reference_table.name, None
+    )
+
+    for column in report["columns"]:
+        assert len(column["samples"]) <= 3
+
+
+def test_reference_save_records_the_columns_and_reports_counts(
+    tmp_path: Path, reference_table: Path, reference_project: Path
+) -> None:
+    app = _reference_app(tmp_path)
+    app.reference_inspect(reference_table.read_bytes(), reference_table.name, None)
+
+    result = app.reference_save(
+        {
+            "project": str(reference_project),
+            "source_path": str(reference_table),
+            "columns": {"姓名": "PERSON", "手機": "TW_MOBILE", "金額": "SKIP"},
+            "patterns": [],
+        }
+    )
+
+    assert result["counts"] == {"PERSON": 3, "TW_MOBILE": 3}
+    stored = json.loads(
+        (reference_project / ".pii-guard" / "sources.json").read_text(encoding="utf-8")
+    )
+    assert stored["sources"][0]["columns"] == {"姓名": "PERSON", "手機": "TW_MOBILE"}
+
+
+def test_reference_save_never_answers_with_a_value(
+    tmp_path: Path, reference_table: Path, reference_project: Path
+) -> None:
+    app = _reference_app(tmp_path)
+
+    result = app.reference_save(
+        {
+            "project": str(reference_project),
+            "source_path": str(reference_table),
+            "columns": {"姓名": "PERSON", "訂單編號": "ORDER_ID"},
+            "patterns": [],
+        }
+    )
+
+    rendered = json.dumps(result, ensure_ascii=False)
+    for value in (*REFERENCE_NAMES, *REFERENCE_ORDERS):
+        assert value not in rendered
+
+
+def test_reference_save_refuses_a_path_that_is_not_there(
+    tmp_path: Path, reference_project: Path
+) -> None:
+    app = _reference_app(tmp_path)
+
+    with pytest.raises(WorkflowError) as error:
+        app.reference_save(
+            {
+                "project": str(reference_project),
+                "source_path": str(tmp_path / "gone.csv"),
+                "columns": {"姓名": "PERSON"},
+            }
+        )
+
+    assert error.value.code == "TABLE_NOT_FOUND"
+
+
+def test_reference_save_can_keep_a_copy_inside_the_project(
+    tmp_path: Path, reference_table: Path, reference_project: Path
+) -> None:
+    import stat as stat_module
+
+    app = _reference_app(tmp_path)
+    report = app.reference_inspect(
+        reference_table.read_bytes(), reference_table.name, None
+    )
+
+    result = app.reference_save(
+        {
+            "project": str(reference_project),
+            "columns": {"姓名": "PERSON"},
+            "copy_into_project": True,
+            "upload_id": report["upload_id"],
+        }
+    )
+
+    copied = reference_project / ".pii-guard" / "lists" / "customers.csv"
+    assert copied.is_file()
+    assert stat_module.S_IMODE(copied.stat().st_mode) == 0o600
+    assert result["source_path"] == str(copied)
+
+
+def test_copying_without_a_fresh_upload_is_refused(
+    tmp_path: Path, reference_project: Path
+) -> None:
+    app = _reference_app(tmp_path)
+
+    with pytest.raises(WorkflowError) as error:
+        app.reference_save(
+            {
+                "project": str(reference_project),
+                "columns": {"姓名": "PERSON"},
+                "copy_into_project": True,
+                "upload_id": "stale",
+            }
+        )
+
+    assert error.value.code == "UPLOAD_EXPIRED"
+
+
+def test_reference_status_reports_what_is_saved(
+    tmp_path: Path, reference_table: Path, reference_project: Path
+) -> None:
+    app = _reference_app(tmp_path)
+    app.reference_save(
+        {
+            "project": str(reference_project),
+            "source_path": str(reference_table),
+            "columns": {"姓名": "PERSON"},
+        }
+    )
+
+    status = app.reference_status(str(reference_project))
+
+    assert status["counts"] == {"PERSON": 3}
+    assert status["sources"][0]["present"] is True
+    for value in REFERENCE_NAMES:
+        assert value not in json.dumps(status, ensure_ascii=False)
+
+
+def test_reference_status_on_an_unknown_project_is_a_clean_failure(tmp_path: Path) -> None:
+    app = _reference_app(tmp_path)
+
+    with pytest.raises(WorkflowError) as error:
+        app.reference_status(str(tmp_path / "not-a-project"))
+
+    assert error.value.code == "PROJECT_NOT_FOUND"
+
+
+def test_reference_try_shows_the_redacted_text_only(
+    tmp_path: Path, reference_table: Path, reference_project: Path
+) -> None:
+    app = _reference_app(tmp_path)
+    app.reference_save(
+        {
+            "project": str(reference_project),
+            "source_path": str(reference_table),
+            "columns": {"姓名": "PERSON", "訂單編號": "ORDER_ID"},
+            "patterns": [
+                {"type": "ORDER_ID", "regex": r"(?<![A-Za-z0-9])[A-Z]{3}\-\d{6}(?![A-Za-z0-9])"}
+            ],
+        }
+    )
+
+    result = app.reference_try("聯絡人吳孟儒，訂單 ORD-000101 已出貨。", str(reference_project))
+
+    assert "吳孟儒" not in result["text"]
+    assert "ORD-000101" not in result["text"]
+    assert "<PERSON_" in result["text"]
+    assert "mapping" not in result
+
+
+def test_reference_try_masks_a_number_the_list_has_never_seen(
+    tmp_path: Path, reference_table: Path, reference_project: Path
+) -> None:
+    app = _reference_app(tmp_path)
+    app.reference_save(
+        {
+            "project": str(reference_project),
+            "source_path": str(reference_table),
+            "columns": {"訂單編號": "ORDER_ID"},
+            "patterns": [
+                {"type": "ORDER_ID", "regex": r"(?<![A-Za-z0-9])[A-Z]{3}\-\d{6}(?![A-Za-z0-9])"}
+            ],
+        }
+    )
+
+    result = app.reference_try("新訂單 ORD-999999 已成立。", str(reference_project))
+
+    assert "ORD-999999" not in result["text"]
+
+
+def test_reference_try_refuses_a_non_string(tmp_path: Path, reference_project: Path) -> None:
+    app = _reference_app(tmp_path)
+
+    with pytest.raises(WorkflowError) as error:
+        app.reference_try(None, str(reference_project))  # type: ignore[arg-type]
+
+    assert error.value.code == "INVALID_REQUEST"
+
+
+def test_the_reference_endpoints_answer_over_http(
+    running_server, tmp_path: Path, reference_table: Path, reference_project: Path
+) -> None:
+    base, _server, _store = running_server
+
+    body, content_type = _reference_multipart(REFERENCE_CSV, "customers.csv")
+    status, report = _request(
+        base, "/api/reference/inspect", method="POST", data=body, content_type=content_type
+    )
+    assert status == 200
+    assert isinstance(report, dict)
+
+    payload = json.dumps(
+        {
+            "project": str(reference_project),
+            "source_path": str(reference_table),
+            "columns": {"姓名": "PERSON"},
+            "patterns": [],
+        }
+    ).encode("utf-8")
+    status, saved = _request(
+        base,
+        "/api/reference/save",
+        method="POST",
+        data=payload,
+        content_type="application/json",
+    )
+    assert status == 200
+    assert isinstance(saved, dict)
+    assert saved["counts"] == {"PERSON": 3}
+
+    status, listed = _request(
+        base, f"/api/reference/status?project={urllib.parse.quote(str(reference_project))}"
+    )
+    assert status == 200
+    assert isinstance(listed, dict)
+    assert listed["terms"] == 3
+
+    status, tried = _request(
+        base,
+        "/api/reference/try",
+        method="POST",
+        data=json.dumps(
+            {"text": "客戶吳孟儒來電。", "project": str(reference_project)}
+        ).encode("utf-8"),
+        content_type="application/json",
+    )
+    assert status == 200
+    assert isinstance(tried, dict)
+    assert "吳孟儒" not in tried["text"]
+
+
+def test_the_page_offers_both_tabs() -> None:
+    from pii_guard.web import WEB_PAGE
+
+    assert 'id="tab-quick"' in WEB_PAGE
+    assert 'id="tab-terms"' in WEB_PAGE
+    assert "檔案只在你的電腦上處理，不會上傳到任何地方" in WEB_PAGE
+
+
+def test_reference_save_registers_the_project_with_the_service(
+    tmp_path: Path, reference_table: Path, reference_project: Path, monkeypatch
+) -> None:
+    config = tmp_path / "config" / "hookd.json"
+    monkeypatch.setenv("PII_GUARD_HOOKD_CONFIG", str(config))
+    app = _reference_app(tmp_path)
+
+    result = app.reference_save(
+        {
+            "project": str(reference_project),
+            "source_path": str(reference_table),
+            "columns": {"姓名": "PERSON"},
+        }
+    )
+
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    assert payload["policy"]["reference_sources"] == [
+        str(reference_project / ".pii-guard" / "sources.json")
+    ]
+    assert result["registered"] is True
+
+
+def test_the_page_warns_when_a_reload_loaded_nothing() -> None:
+    from pii_guard.web import WEB_PAGE
+
+    assert "等於現在沒有遮任何東西" in WEB_PAGE

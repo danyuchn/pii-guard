@@ -44,6 +44,32 @@ CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir ~/.claude/plugins/pii-gu
   **沒有這條的話，`stop` 之後就再也沒有東西會把服務叫回來**，之後每個 session 都是死的，
   直到使用者自己手動 serve。
 
+## `/pii-terms`：把客戶名單設成固定要遮的字
+
+plugin 附一個指令檔 `commands/pii-terms.md`，裝上 Mod 之後就有 `/pii-terms`：
+
+```
+/pii-terms ~/Downloads/客戶名單.xlsx
+```
+
+它會跑 `terms inspect --json` 拿欄位（那份輸出刻意不含任何值），用
+AskUserQuestion 逐欄跟你確認，最後跑 `terms import --map ... --yes` 寫進設定。
+指令檔明文禁止模型 Read 或 cat 那份名單，**模型從頭到尾看不到名單內容**，
+只轉述筆數。
+
+設計、預設值與值的流向見 hookd README 的「參考名單」一節；兩個前端用的是同一個
+服務、同一份 `.pii-guard/sources.json`。
+
+**classic hooks 使用者**（沒裝 `--mod`）要手動複製這個檔案才有這個指令：
+
+```bash
+mkdir -p .claude/commands
+cp examples/claude-code-mod/commands/pii-terms.md .claude/commands/
+```
+
+不想用指令的話，`uv run pii-guard-hookd terms import <檔案>` 或
+`uv run pii-guard-hookd terms ui` 的網頁分頁做的是同一件事。
+
 ## 涵蓋範圍
 
 | 事件 | 往下（進工具前） | 往上（回模型前） |

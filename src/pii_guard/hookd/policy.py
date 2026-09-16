@@ -122,6 +122,7 @@ class PolicyConfig:
     allowed_tools: tuple[str, ...] = ()
     output_gate: bool = True
     seed_terms_files: tuple[str, ...] = field(default=())
+    reference_sources: tuple[str, ...] = field(default=())
 
     @classmethod
     def from_mapping(cls, payload: object) -> PolicyConfig:
@@ -143,6 +144,7 @@ class PolicyConfig:
             allowed_tools=words("allowed_tools"),
             output_gate=bool(gate) if isinstance(gate, bool) else True,
             seed_terms_files=words("seed_terms_files"),
+            reference_sources=words("reference_sources"),
         )
 
     @property
@@ -161,6 +163,7 @@ class PolicyConfig:
             "allowed_tools": list(self.allowed_tools),
             "network_commands": len(self.network_commands),
             "encoder_commands": len(self.encoder_commands),
+            "reference_sources": len(self.reference_sources),
         }
 
 
@@ -344,8 +347,11 @@ def _is_remote(tool_input: Mapping[str, Any]) -> bool:
     return False
 
 
-MAX_SEED_TERMS: Final[int] = 5000
-MAX_SEED_BYTES: Final[int] = 1024 * 1024
+# A reference list built from a customer table is routinely thousands of
+# values, so the ceiling is high enough to hold one and low enough to keep the
+# compiled sweep pattern to a sane size.
+MAX_SEED_TERMS: Final[int] = 50_000
+MAX_SEED_BYTES: Final[int] = 10 * 1024 * 1024
 
 
 def load_seed_terms(paths: Iterable[str]) -> tuple[tuple[str, str], ...]:

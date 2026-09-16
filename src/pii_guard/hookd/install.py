@@ -50,6 +50,9 @@ SANDBOX_BLOCK: Final[dict[str, Any]] = {
     "network": {"allowedDomains": []},
 }
 SEED_TERMS_RELATIVE: Final[str] = ".pii-guard/terms.txt"
+# The reference-list description: which columns of which table mean what.  It
+# holds no values, so it is the file the installer points the service at.
+REFERENCE_SOURCES_RELATIVE: Final[str] = ".pii-guard/sources.json"
 # The Mod front end: a plugin directory whose hooks module replaces every
 # classic hook except MessageDisplay, which has no function-hook equivalent
 # because display-only restore does not exist in that API.
@@ -334,6 +337,13 @@ def default_seed_terms_files(project: Path) -> list[str]:
     return [str(candidate)] if candidate.is_file() else []
 
 
+def default_reference_sources(project: Path) -> list[str]:
+    """The project's reference-list description, when it has one."""
+
+    candidate = project / REFERENCE_SOURCES_RELATIVE
+    return [str(candidate)] if candidate.is_file() else []
+
+
 def _is_ours(entry: object) -> bool:
     """Recognise an entry this installer wrote, wherever the client now lives."""
 
@@ -446,6 +456,7 @@ def write_installer_config(
     engine: str,
     *,
     seed_terms_files: list[str] | None = None,
+    reference_sources: list[str] | None = None,
     existing_policy: Mapping[str, Any] | None = None,
 ) -> None:
     """Record what the hook client needs in order to start the service."""
@@ -459,6 +470,17 @@ def write_installer_config(
     policy_block.setdefault("output_gate", True)
     if seed_terms_files or "seed_terms_files" not in policy_block:
         policy_block["seed_terms_files"] = seed_terms_files or []
+    # Projects register themselves as they are imported, so a re-run of install
+    # must add to that list rather than replace it with whatever is in cwd.
+    known = [
+        item
+        for item in policy_block.get("reference_sources") or []
+        if isinstance(item, str) and item.strip()
+    ]
+    for descriptor in reference_sources or []:
+        if descriptor not in known:
+            known.append(descriptor)
+    policy_block["reference_sources"] = known
     payload = {
         "repo": str(repo),
         "engine": engine,
@@ -697,6 +719,8 @@ def doctor(
         else:
             results.append(CheckResult("engine", True, "regex by choice, names NOT covered"))
 
+    results.extend(_reference_checks(installer_config))
+
     sessions_dir = config.sessions_dir
     if not sessions_dir.is_dir():
         results.append(CheckResult("session store", True, "no mappings stored yet"))
@@ -705,6 +729,49 @@ def doctor(
     else:
         results.append(CheckResult("session store", False, f"{sessions_dir} is not mode 0700"))
 
+    return results
+
+
+def _reference_checks(installer_config: Path) -> list[CheckResult]:
+    """Report each reference source: is it there, and how much does it add?
+
+    Counts only.  Nothing in a doctor report is ever a value from the list.
+    """
+
+    from pii_guard import reference as reference_module
+
+    try:
+        payload = json.loads(installer_config.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    policy_block = payload.get("policy") if isinstance(payload, dict) else None
+    raw = policy_block.get("reference_sources") if isinstance(policy_block, Mapping) else None
+    files = [item for item in raw or [] if isinstance(item, str) and item.strip()]
+    if not files:
+        return []
+    results: list[CheckResult] = []
+    for descriptor in files:
+        sources = reference_module.load_sources_file(descriptor)
+        if not sources:
+            results.append(CheckResult("reference list", False, f"unreadable: {descriptor}"))
+            continue
+        loaded = reference_module.load_reference_terms(sources)
+        for source in sources:
+            present = Path(source.path).expanduser().is_file()
+            detail = (
+                f"{source.path}: {len(source.columns)} column(s), "
+                f"{len(source.patterns)} shape rule(s)"
+            )
+            results.append(
+                CheckResult(
+                    "reference source",
+                    present,
+                    detail if present else f"missing file {source.path}",
+                )
+            )
+        results.append(
+            CheckResult("reference terms", True, f"{len(loaded.terms)} term(s) loaded")
+        )
     return results
 
 

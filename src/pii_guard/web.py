@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import html
 import http.server
+import io
 import json
 import secrets
 import threading
 import urllib.parse
+import urllib.request
 import webbrowser
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -95,10 +97,36 @@ button:disabled { cursor: default; opacity: .45; }
 #job { display: none; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 a { color: var(--blue); }
+nav.tabs { display: flex; gap: 6px; padding: 0 20px; border-bottom: 1px solid var(--line); }
+nav.tabs button { border: none; border-bottom: 3px solid transparent; border-radius: 0;
+  padding: 10px 14px; opacity: .65; }
+nav.tabs button[aria-selected="true"] { border-bottom-color: var(--accent); opacity: 1; }
+table.grid { border-collapse: collapse; width: 100%; margin-top: 8px; }
+table.grid th, table.grid td { border: 1px solid var(--line); padding: 6px 8px;
+  text-align: left; vertical-align: top; font-size: 14px; }
+table.grid td.samples { font-family: ui-monospace, monospace; opacity: .8;
+  word-break: break-all; }
+textarea { font: inherit; width: 100%; padding: 8px 10px; border: 1px solid var(--line);
+  border-radius: 6px; }
+.preview { white-space: pre-wrap; word-break: break-word; min-height: 6em;
+  border: 1px solid var(--line); border-radius: 7px; padding: 12px; margin-top: 10px; }
+.ok-card { border-left: 3px solid #2e7d32; padding: 8px 12px;
+  background: color-mix(in srgb, #2e7d32 10%, transparent); }
+.ok-card.warn-card { border-left-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent); }
+label.inline { display: inline-flex; gap: 6px; align-items: center; }
 </style></head><body>
-<header><h1>PII Guard 本機快審</h1>
-<div class="muted">所有處理只在本機完成。快速模式立即產生結果；加強模式可選本機稽核。</div></header>
+<header><h1>PII Guard 本機工具</h1>
+<div class="muted">所有處理只在本機完成。「快審」處理單一文件；
+「名單」把客戶名單設成固定要遮的字。</div></header>
+<nav class="tabs" role="tablist">
+<button id="tab-quick-button" type="button" role="tab" aria-selected="true"
+aria-controls="tab-quick">快審</button>
+<button id="tab-terms-button" type="button" role="tab" aria-selected="false"
+aria-controls="tab-terms">名單</button>
+</nav>
 <main>
+<div id="tab-quick" role="tabpanel">
 <p class="notice">這頁只顯示去識別化文字與代號。私有對照表留在本機工作目錄，
 不會放進回應、頁面或記錄。PDF 只抽取可選取的文字，不保留原 PDF 版面，
 也不會輸出去識別化 PDF；掃描型、圖片型 PDF 與 OCR 留待後續階段。加強模式是可選的本機
@@ -129,6 +157,48 @@ aria-disabled="true">下載去識別化文字</a>
 <button id="delete" class="danger">刪除這個工作</button></div>
 <p id="format-note" class="muted">還原檔只寫到上面的私有工作目錄，不透過 HTTP 下載；
 確認不再需要時請手動刪除此工作。</p></section>
+</div>
+
+<div id="tab-terms" role="tabpanel" hidden>
+<p class="notice">把你的客戶名單（Excel 或 CSV）交給這頁，之後 AI 看到的內容裡，
+名單上的姓名、電話這些會自動換成代號。<strong>檔案只在你的電腦上處理，不會上傳到任何地方。</strong>
+程式只會記住「這個檔案的哪一欄是什麼」，不會另外存一份名單內容。</p>
+
+<section aria-labelledby="ref-step1"><h2 id="ref-step1">1. 選檔案</h2>
+<div class="controls"><input id="ref-file" type="file" accept=".xlsx,.xlsm,.csv,.tsv">
+<label for="ref-sheet">工作表</label>
+<select id="ref-sheet"><option value="">（預設第一個）</option></select>
+<button id="ref-inspect" class="primary">讀取欄位</button></div>
+<div id="ref-message" class="muted" role="status"></div></section>
+
+<section id="ref-columns-box" aria-labelledby="ref-step2" hidden>
+<h2 id="ref-step2">2. 確認每一欄要怎麼遮</h2>
+<p class="muted">金額與日期預設「不要遮」：短數字到處都會撞到，遮了會把正常內容也改掉。</p>
+<table class="grid"><thead><tr><th>欄位</th><th>這欄是什麼</th><th>筆數</th>
+<th>前 3 筆預覽</th></tr></thead><tbody id="ref-columns"></tbody></table>
+<div id="ref-shapes" class="muted"></div></section>
+
+<section id="ref-save-box" aria-labelledby="ref-step3" hidden>
+<h2 id="ref-step3">3. 儲存並啟用</h2>
+<div class="controls"><label for="ref-project">存到這個專案</label>
+<input id="ref-project" size="42" placeholder="/Users/你/專案"></div>
+<div class="controls"><label class="inline"><input id="ref-copy" type="checkbox">
+複製一份名單到專案的 .pii-guard/ 夾（只有你讀得到）</label></div>
+<div class="controls" id="ref-path-row"><label for="ref-source-path">這個檔案放在哪</label>
+<input id="ref-source-path" size="42"></div>
+<div class="muted">瀏覽器拿不到檔案的真實路徑，所以請確認上面這一行，
+或改勾上面的「複製一份」。</div>
+<div class="controls"><label class="inline"><input id="ref-materialize" type="checkbox">
+另外寫一份純文字詞表（這份會含真實值）</label></div>
+<div class="controls"><button id="ref-save" class="primary">儲存</button></div>
+<div id="ref-result" class="ok-card" hidden></div></section>
+
+<section aria-labelledby="ref-step4"><h2 id="ref-step4">試試看</h2>
+<p class="muted">貼一段文字，看 AI 會看到的樣子。這裡只用規則引擎加上剛存的名單，不會顯示原值。</p>
+<textarea id="ref-try-input" rows="5" placeholder="貼一段含名單內容的文字"></textarea>
+<div class="controls"><button id="ref-try">看遮完的樣子</button></div>
+<div id="ref-try-output" class="preview"></div></section>
+</div>
 </main>
 <script>
 const BASE = location.pathname.replace(/\/$/, ""), review = document.getElementById("review");
@@ -270,6 +340,195 @@ document.getElementById("delete").addEventListener("click", async () => {
     say("私有工作與對照表已刪除；沒有自動到期機制。");
   }
 });
+
+// 名單分頁
+const refMessage = document.getElementById("ref-message");
+const refFile = document.getElementById("ref-file"),
+  refSheet = document.getElementById("ref-sheet");
+const refColumnsBox = document.getElementById("ref-columns-box");
+const refColumns = document.getElementById("ref-columns");
+const refSaveBox = document.getElementById("ref-save-box");
+const refResult = document.getElementById("ref-result");
+const refShapes = document.getElementById("ref-shapes");
+const refProject = document.getElementById("ref-project");
+const refSourcePath = document.getElementById("ref-source-path");
+const refCopy = document.getElementById("ref-copy");
+const refPathRow = document.getElementById("ref-path-row");
+let refReport = null, refTypes = [];
+function refSay(text) { refMessage.textContent = text; }
+async function refCall(path, options = {}) {
+  try {
+    const response = await fetch(BASE + path, {cache: "no-store", ...options});
+    const data = await response.json();
+    if (!response.ok) {
+      refSay("失敗：" + (data.message || "本機伺服器拒絕了這個請求。"));
+      return null;
+    }
+    return data;
+  } catch (_) { refSay("無法連線，請確認本機伺服器仍在執行。"); return null; }
+}
+function showTab(name) {
+  const terms = name === "terms";
+  document.getElementById("tab-quick").hidden = terms;
+  document.getElementById("tab-terms").hidden = !terms;
+  document.getElementById("tab-quick-button").setAttribute("aria-selected", String(!terms));
+  document.getElementById("tab-terms-button").setAttribute("aria-selected", String(terms));
+}
+document.getElementById("tab-quick-button").addEventListener("click", () => showTab("quick"));
+document.getElementById("tab-terms-button").addEventListener("click", () => showTab("terms"));
+refCopy.addEventListener("change", () => { refPathRow.hidden = refCopy.checked; });
+refFile.addEventListener("change", () => {
+  const selected = refFile.files[0];
+  if (!selected) return;
+  refSourcePath.value = "~/Downloads/" + selected.name;
+  refSay("按「讀取欄位」看這份名單有哪些欄位。");
+});
+function refRow(column) {
+  const row = document.createElement("tr");
+  const name = document.createElement("td");
+  name.textContent = column.name;
+  const picker = document.createElement("td");
+  const select = document.createElement("select");
+  select.dataset.column = column.name;
+  for (const type of refTypes) {
+    const option = document.createElement("option");
+    option.value = type.value;
+    option.textContent = type.label;
+    if (type.value === column.guessed_type) option.selected = true;
+    select.append(option);
+  }
+  picker.append(select);
+  if (column.guessed_type === "SKIP") {
+    const hint = document.createElement("div");
+    hint.className = "muted";
+    hint.textContent = "短數字容易誤遮，建議不遮";
+    picker.append(hint);
+  }
+  const count = document.createElement("td");
+  count.textContent = String(column.non_empty);
+  if (column.risky) {
+    const risky = document.createElement("div");
+    risky.className = "muted";
+    risky.textContent = "有 " + column.risky + " 筆太短，預設略過";
+    count.append(risky);
+  }
+  const samples = document.createElement("td");
+  samples.className = "samples";
+  samples.textContent = (column.samples || []).join("、");
+  row.append(name, picker, count, samples);
+  return row;
+}
+function refShapeList() {
+  const shapes = [];
+  if (!refReport) return shapes;
+  for (const column of refReport.columns) {
+    const select = refColumns.querySelector(
+      'select[data-column="' + CSS.escape(column.name) + '"]');
+    const chosen = select ? select.value : column.guessed_type;
+    if (column.shape && (chosen === "ORDER_ID" || chosen === "CUSTOM")) {
+      shapes.push({type: chosen, regex: column.shape, column: column.name});
+    }
+  }
+  return shapes;
+}
+function refRenderShapes() {
+  const shapes = refShapeList();
+  refShapes.textContent = shapes.length ?
+    "偵測到固定格式：" + shapes.map((s) => s.column).join("、") +
+    "。名單外的新編號也會一起遮。" : "";
+}
+refColumns.addEventListener("change", refRenderShapes);
+document.getElementById("ref-inspect").addEventListener("click", async () => {
+  if (!refFile.files.length) { refSay("請先選一個 Excel 或 CSV 檔案。"); return; }
+  const form = new FormData();
+  form.append("file", refFile.files[0]);
+  form.append("sheet", refSheet.value);
+  refSay("讀取中……");
+  const data = await refCall("/api/reference/inspect", {method: "POST", body: form});
+  if (!data) return;
+  refReport = data;
+  refTypes = data.types || [];
+  refSheet.innerHTML = "";
+  const auto = document.createElement("option");
+  auto.value = ""; auto.textContent = "（預設第一個）";
+  refSheet.append(auto);
+  for (const name of data.sheets || []) {
+    const option = document.createElement("option");
+    option.value = name; option.textContent = name;
+    if (name === data.sheet) option.selected = true;
+    refSheet.append(option);
+  }
+  refColumns.innerHTML = "";
+  for (const column of data.columns) refColumns.append(refRow(column));
+  refRenderShapes();
+  refColumnsBox.hidden = false;
+  refSaveBox.hidden = false;
+  refResult.hidden = true;
+  refSay(data.rows + " 筆資料，" + data.columns.length + " 個欄位。請逐欄確認。");
+});
+document.getElementById("ref-save").addEventListener("click", async () => {
+  if (!refReport) return;
+  const columns = {};
+  for (const select of refColumns.querySelectorAll("select[data-column]")) {
+    columns[select.dataset.column] = select.value;
+  }
+  const body = {
+    project: refProject.value.trim(),
+    source_path: refSourcePath.value.trim(),
+    sheet: refSheet.value || refReport.sheet || null,
+    columns: columns,
+    patterns: refShapeList().map((s) => ({type: s.type, regex: s.regex})),
+    materialize: document.getElementById("ref-materialize").checked,
+    copy_into_project: refCopy.checked,
+    upload_id: refReport.upload_id
+  };
+  refSay("儲存中……");
+  const data = await refCall("/api/reference/save", {
+    method: "POST", headers: {"content-type": "application/json"},
+    body: JSON.stringify(body)
+  });
+  if (!data) return;
+  const lines = [];
+  for (const [type, count] of Object.entries(data.counts || {})) {
+    const label = data.labels && data.labels[type] ? data.labels[type] : type;
+    lines.push(label + " " + count + " 筆");
+  }
+  const service = data.service || {};
+  let serviceLine;
+  if (!service.running) {
+    serviceLine = "保護服務：尚未啟動，下次開 Claude Code 會自動載入。";
+  } else if (!service.reloaded) {
+    serviceLine = "保護服務：執行中，但這次沒能重新載入。";
+  } else if (!service.terms) {
+    // A reload that loaded nothing must not look like success.
+    serviceLine = "注意：保護服務重新載入後是 0 筆，等於現在沒有遮任何東西。" +
+      "請確認欄位不是全設成「不要遮」，以及名單檔還在原處。";
+  } else {
+    serviceLine = "保護服務：執行中 ✓ 已重新載入 " + service.terms + " 筆。";
+  }
+  refResult.classList.toggle("warn-card",
+    Boolean(service.running && service.reloaded && !service.terms));
+  refResult.textContent = (lines.length ?
+    "之後 AI 看到的內容裡，這些會自動被遮掉：" + lines.join("、") + "。" :
+    "已儲存，但目前沒有任何欄位會被遮蔽。") +
+    (data.risky_skipped ? "略過 " + data.risky_skipped + " 筆過短的值。" : "") +
+    (data.materialized ? "另外寫了 " + data.materialized + " 筆詞表。" : "") +
+    serviceLine;
+  refResult.hidden = false;
+  refSay("已存到 " + data.saved_path);
+});
+document.getElementById("ref-try").addEventListener("click", async () => {
+  const text = document.getElementById("ref-try-input").value;
+  if (!text.trim()) { refSay("先貼一段文字再試。"); return; }
+  refSay("處理中……");
+  const data = await refCall("/api/reference/try", {
+    method: "POST", headers: {"content-type": "application/json"},
+    body: JSON.stringify({text: text, project: refProject.value.trim()})
+  });
+  if (!data) return;
+  document.getElementById("ref-try-output").textContent = data.text;
+  refSay("這就是 AI 會看到的內容。");
+});
 </script></body></html>"""
 
 
@@ -388,7 +647,7 @@ def _multipart_fields(
             continue
         payload = part.get_payload(decode=True)
         payload_bytes = payload if isinstance(payload, bytes) else b""
-        if name in {"mode", "text"}:
+        if name in {"mode", "text", "sheet", "project", "source_path"}:
             try:
                 fields[name] = payload_bytes.decode("utf-8")
             except UnicodeDecodeError as exc:
@@ -434,9 +693,9 @@ def _download_format(path: str, segments: list[str]) -> str:
 
 
 def _error_status(error: WorkflowError) -> int:
-    if error.code in {"NOT_FOUND", "JOB_NOT_FOUND"}:
+    if error.code in {"NOT_FOUND", "JOB_NOT_FOUND", "TABLE_NOT_FOUND"}:
         return 404
-    if error.code in {"INPUT_TOO_LARGE", "REQUEST_TOO_LARGE"}:
+    if error.code in {"INPUT_TOO_LARGE", "REQUEST_TOO_LARGE", "TABLE_TOO_LARGE"}:
         return 413
     if error.code in {"DELETE_CONFLICT", "ENHANCED_BUSY", "JOB_DELETING", "JOB_NOT_READY"}:
         return 409
@@ -472,6 +731,10 @@ class LocalWebApplication:
         self._audit_threads: set[threading.Thread] = set()
         self._close_event = threading.Event()
         self._closed = False
+        # One uploaded table at a time, held in memory so the browser never
+        # writes a copy of someone's customer list to a temporary file.
+        self._reference_upload: tuple[str, str, bytes] | None = None
+        self._reference_engine: object | None = None
 
     @staticmethod
     def _safe_state(raw: object) -> dict[str, object]:
@@ -776,6 +1039,301 @@ class LocalWebApplication:
                 self._enhanced_job = None
         return {"ok": True, "job_id": job_id, "deleted": True}
 
+    # ------------------------------------------------------------------
+    # Reference lists
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _reference_project(value: object) -> Path:
+        """Resolve the project directory a reference list belongs to."""
+
+        raw = str(value or "").strip()
+        project = Path(raw).expanduser() if raw else Path.cwd()
+        if not project.is_dir():
+            raise WorkflowError("PROJECT_NOT_FOUND", "That project directory does not exist.")
+        return project
+
+    def reference_types(self) -> list[dict[str, str]]:
+        """The type menu the page shows, in the order it should be listed."""
+
+        from pii_guard.reference import COLUMN_TYPES
+
+        return [{"value": name, "label": label} for name, label in COLUMN_TYPES.items()]
+
+    def reference_inspect(
+        self, data: bytes, filename: str, sheet: str | None = None
+    ) -> dict[str, object]:
+        """Describe an uploaded table's columns, with three samples each.
+
+        The samples are the one place a value from the list crosses HTTP.  The
+        page is on loopback behind a random path token and shows the user their
+        own file, which is the only way a non-technical person can confirm they
+        picked the right column.
+        """
+
+        from pii_guard.reference import build_report, parse_csv_bytes
+
+        suffix = Path(filename).suffix.lower()
+        upload_id = secrets.token_urlsafe(16)
+        selected: str | None
+        sheets: tuple[str, ...]
+        if suffix in {".xlsx", ".xlsm"}:
+            # openpyxl takes a file-like object, so BytesIO keeps the workbook
+            # in memory and no copy of the list is written to a temporary file.
+            rows, selected, sheets = self._excel_rows(io.BytesIO(data), sheet)
+        elif suffix in {".csv", ".tsv", ".txt"}:
+            rows = parse_csv_bytes(data, delimiter="\t" if suffix == ".tsv" else None)
+            selected, sheets = None, ()
+        else:
+            raise WorkflowError(
+                "TABLE_UNSUPPORTED", "Only .xlsx, .xlsm, .csv and .tsv tables are supported."
+            )
+        report = build_report(rows, path=filename, sheet=selected, sheets=sheets)
+        with self.lock:
+            self._reference_upload = (upload_id, Path(filename).name, data)
+        payload = report.describe(include_samples=True)
+        payload["upload_id"] = upload_id
+        payload["filename"] = Path(filename).name
+        payload["types"] = self.reference_types()
+        return payload
+
+    @staticmethod
+    def _excel_rows(
+        stream: io.BytesIO, sheet: str | None
+    ) -> tuple[list[list[str]], str, tuple[str, ...]]:
+        """Read an uploaded workbook straight out of memory."""
+
+        from pii_guard.reference import MAX_COLUMNS, MAX_TABLE_ROWS, _cell_text
+
+        try:
+            import openpyxl
+        except ImportError as error:  # pragma: no cover - optional dependency
+            raise WorkflowError(
+                "OPENPYXL_MISSING", "Reading .xlsx needs openpyxl: uv sync --extra formats"
+            ) from error
+        try:
+            workbook = openpyxl.load_workbook(stream, read_only=True, data_only=True)
+        except Exception as error:  # noqa: BLE001 - any parse failure reads the same
+            raise WorkflowError("TABLE_MALFORMED", "The table could not be read.") from error
+        try:
+            names = tuple(str(name) for name in workbook.sheetnames)
+            if sheet and sheet not in names:
+                raise WorkflowError("SHEET_NOT_FOUND", "That sheet is not in this workbook.")
+            selected = sheet or (names[0] if names else "")
+            if not selected:
+                raise WorkflowError("TABLE_EMPTY", "The table has no sheets.")
+            rows: list[list[str]] = []
+            for row in workbook[selected].iter_rows(values_only=True):
+                rows.append([_cell_text(cell) for cell in row[:MAX_COLUMNS]])
+                if len(rows) >= MAX_TABLE_ROWS:
+                    break
+            return rows, selected, names
+        finally:
+            workbook.close()
+
+    def _copy_upload_into_project(self, project: Path, upload_id: str) -> Path:
+        """Keep the uploaded table inside the project, owner-only."""
+
+        from pii_guard.reference import _write_owner_only
+
+        with self.lock:
+            held = self._reference_upload
+        if held is None or held[0] != upload_id:
+            raise WorkflowError("UPLOAD_EXPIRED", "Upload the table again before saving.")
+        _, name, data = held
+        target = project / ".pii-guard" / "lists" / name
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _write_owner_only(target, "")
+        with open(target, "wb") as handle:
+            handle.write(data)
+        target.chmod(0o600)
+        return target
+
+    def reference_save(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Record one table as a reference list and ask the service to reload."""
+
+        from pii_guard.reference import (
+            ReferenceSource,
+            load_reference_terms,
+            load_sources,
+            materialize,
+            normalize_type,
+            register_project,
+            terms_path,
+            write_sources,
+        )
+
+        project = self._reference_project(payload.get("project"))
+        columns_raw = payload.get("columns")
+        if not isinstance(columns_raw, Mapping):
+            raise WorkflowError("INVALID_COLUMNS", "The column mapping is invalid.")
+        columns = {
+            str(name): normalize_type(str(entity))
+            for name, entity in columns_raw.items()
+            if str(entity).strip()
+        }
+        columns = {name: entity for name, entity in columns.items() if entity != "SKIP"}
+
+        upload_id = str(payload.get("upload_id") or "")
+        if payload.get("copy_into_project"):
+            source_path = str(self._copy_upload_into_project(project, upload_id))
+        else:
+            raw_path = str(payload.get("source_path") or "").strip()
+            if not raw_path:
+                raise WorkflowError("SOURCE_PATH_REQUIRED", "The table's own path is required.")
+            resolved = Path(raw_path).expanduser()
+            if not resolved.is_file():
+                raise WorkflowError("TABLE_NOT_FOUND", "That table does not exist.")
+            source_path = str(resolved)
+
+        patterns: list[tuple[str, str]] = []
+        raw_patterns = payload.get("patterns")
+        if isinstance(raw_patterns, list):
+            for entry in raw_patterns:
+                if not isinstance(entry, Mapping):
+                    continue
+                name = entry.get("type")
+                regex = entry.get("regex")
+                if isinstance(name, str) and isinstance(regex, str) and regex:
+                    patterns.append((normalize_type(name), regex))
+
+        sheet = payload.get("sheet")
+        source = ReferenceSource(
+            path=source_path,
+            sheet=str(sheet) if isinstance(sheet, str) and sheet else None,
+            columns=columns,
+            patterns=tuple(patterns),
+        )
+        kept = [
+            item
+            for item in load_sources(project)
+            if not (item.path == source.path and item.sheet == source.sheet)
+        ]
+        kept.append(source)
+        saved = write_sources(project, kept)
+        # Writing the description is not enough on its own: the service only
+        # reads the projects the installer config names.
+        registered = register_project(project)
+        loaded = load_reference_terms(kept)
+        materialized = 0
+        if payload.get("materialize"):
+            materialized = materialize(kept, terms_path(project))
+        summary = loaded.summary()
+        summary.update(
+            {
+                "ok": True,
+                "saved_path": str(saved),
+                "project": str(project),
+                "source_path": source_path,
+                "materialized": materialized,
+                "registered": registered,
+                "service": self._reload_hookd(),
+            }
+        )
+        return summary
+
+    def reference_status(self, project_value: object) -> dict[str, object]:
+        """What this project already has recorded; counts only."""
+
+        from pii_guard.reference import load_reference_terms, load_sources, sources_path
+
+        project = self._reference_project(project_value)
+        sources = load_sources(project)
+        loaded = load_reference_terms(sources)
+        summary = loaded.summary()
+        summary.update(
+            {
+                "ok": True,
+                "project": str(project),
+                "saved_path": str(sources_path(project)),
+                "sources": [
+                    {
+                        "path": source.path,
+                        "sheet": source.sheet,
+                        "columns": len(source.columns),
+                        "present": Path(source.path).expanduser().is_file(),
+                    }
+                    for source in sources
+                ],
+                "service": self._hookd_health(),
+            }
+        )
+        return summary
+
+    def _try_engine(self) -> object:
+        """A regex-only engine kept for the preview box, built once."""
+
+        with self.lock:
+            if self._reference_engine is None:
+                from pii_guard.hookd.core import create_engine
+
+                self._reference_engine = create_engine("regex")
+            return self._reference_engine
+
+    def reference_try(self, text: str, project_value: object) -> dict[str, object]:
+        """Show what the model would see, using the list that is saved now.
+
+        Only the redacted text comes back.  The mapping that could undo it is
+        built inside this call and dropped when it returns.
+        """
+
+        from pii_guard.hookd.core import SessionRedactor
+        from pii_guard.reference import load_reference_terms, load_sources
+
+        if not isinstance(text, str):
+            raise WorkflowError("INVALID_REQUEST", "A UTF-8 text input is required.")
+        if len(text.encode("utf-8")) > MAX_UPLOAD_BYTES:
+            raise WorkflowError("INPUT_TOO_LARGE", "Input exceeds the safety size limit.")
+        project = self._reference_project(project_value)
+        loaded = load_reference_terms(load_sources(project))
+        engine = self._try_engine()
+        register = getattr(engine, "register_pattern_recognizers", None)
+        if callable(register) and loaded.patterns:
+            register(loaded.patterns)
+        redactor = SessionRedactor(session_id="reference-preview", engine=engine)  # type: ignore[arg-type]
+        redactor.seed(loaded.terms)
+        result = redactor.redact(text)
+        return {"ok": True, "text": result.text, "counts": result.counts}
+
+    @staticmethod
+    def _hookd_state() -> dict[str, object] | None:
+        try:
+            from pii_guard.hookd.state import HookdConfig, read_state
+
+            return read_state(HookdConfig.from_env())
+        except Exception:  # noqa: BLE001 - the service being absent is normal
+            return None
+
+    @classmethod
+    def _hookd_health(cls) -> dict[str, object]:
+        state = cls._hookd_state()
+        if state is None:
+            return {"running": False}
+        return {"running": True, "port": state.get("port"), "engine": state.get("engine")}
+
+    @classmethod
+    def _reload_hookd(cls) -> dict[str, object]:
+        """Ask a running guard service to re-read the lists, if there is one."""
+
+        state = cls._hookd_state()
+        if state is None:
+            return {"running": False, "reloaded": False}
+        try:
+            request = urllib.request.Request(
+                f"http://{LOOPBACK_HOST}:{state['port']}/v1/reload",
+                data=b"{}",
+                method="POST",
+            )
+            request.add_header("Authorization", f"Bearer {state['token']}")
+            request.add_header("Host", f"{LOOPBACK_HOST}:{state['port']}")
+            request.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310
+                body = json.loads(response.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001 - a guard that is down is not an error here
+            return {"running": True, "reloaded": False}
+        terms = body.get("terms") if isinstance(body, Mapping) else 0
+        return {"running": True, "reloaded": True, "terms": terms}
+
     def close(self) -> None:
         """Stop the optional manager and release all background app threads."""
 
@@ -908,6 +1466,11 @@ def _handler_for(app: LocalWebApplication, token: str, port: int):
                 if route == "/":
                     self._send(WEB_PAGE.encode("utf-8"), "text/html; charset=utf-8")
                     return
+                if segments == ["api", "reference", "status"]:
+                    query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                    project = (query.get("project") or [""])[0]
+                    self._json(app.reference_status(project))
+                    return
                 if (
                     len(segments) == 4
                     and segments[:2] == ["api", "jobs"]
@@ -965,6 +1528,29 @@ def _handler_for(app: LocalWebApplication, token: str, port: int):
                     self._json(app.restore(segments[2]))
                     return
                 body = self._read_body()
+                if route == "/api/reference/inspect":
+                    content_type = self.headers.get("Content-Type", "")
+                    if not content_type.lower().startswith("multipart/form-data"):
+                        raise WorkflowError("INVALID_UPLOAD", "A file upload is required.")
+                    fields, filename, data, _ = _multipart_fields(body, content_type)
+                    self._json(
+                        app.reference_inspect(data, filename, fields.get("sheet") or None)
+                    )
+                    return
+                if route in {"/api/reference/save", "/api/reference/try"}:
+                    try:
+                        payload = json.loads(body.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise WorkflowError("INVALID_REQUEST", "Request body is invalid.") from exc
+                    if not isinstance(payload, dict):
+                        raise WorkflowError("INVALID_REQUEST", "Request body is invalid.")
+                    if route == "/api/reference/save":
+                        self._json(app.reference_save(payload))
+                    else:
+                        self._json(
+                            app.reference_try(payload.get("text", ""), payload.get("project"))
+                        )
+                    return
                 if route == "/api/process":
                     content_type = self.headers.get("Content-Type", "")
                     if content_type.lower().startswith("multipart/form-data"):

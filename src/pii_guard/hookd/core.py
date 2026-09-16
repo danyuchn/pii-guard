@@ -147,6 +147,11 @@ class SessionRedactor:
     reverse: dict[str, str] = field(default_factory=dict)
     counters: dict[str, int] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # The sweep runs on every redaction, and a reference list can hold tens of
+    # thousands of values, so the known values are compiled into one pattern
+    # and rebuilt only when the mapping actually changes.
+    _sweep_pattern: re.Pattern[str] | None = field(default=None, repr=False)
+    _sweep_dirty: bool = field(default=True, repr=False)
 
     def _allocate_locked(
         self,
@@ -171,6 +176,7 @@ class SessionRedactor:
                 break
         self.mapping[placeholder] = value
         self.reverse[value] = placeholder
+        self._sweep_dirty = True
         return placeholder
 
     def redact(self, text: str) -> RedactResult:
@@ -228,6 +234,32 @@ class SessionRedactor:
             output = output.replace(sentinel, placeholder)
         return output
 
+    def _sweep_regex_locked(self) -> re.Pattern[str] | None:
+        """Compile every known value into one alternation, longest first.
+
+        Longest first matters: a customer list holds both "王小明" and the
+        company "王小明企業社", and the shorter value must not win.
+        """
+
+        if not self._sweep_dirty and self._sweep_pattern is not None:
+            return self._sweep_pattern
+        values = [value for value in self.reverse if value]
+        if not values:
+            self._sweep_pattern = None
+            self._sweep_dirty = False
+            return None
+        values.sort(key=lambda value: (-len(value), value))
+        try:
+            self._sweep_pattern = re.compile("|".join(re.escape(value) for value in values))
+        except (re.error, OverflowError, MemoryError, RecursionError):
+            # A pattern this build cannot compile must not turn the sweep off;
+            # the per-value fallback below is slower but always available.
+            self._sweep_pattern = None
+            self._sweep_dirty = False
+            return None
+        self._sweep_dirty = False
+        return self._sweep_pattern
+
     def _sweep_known_values_locked(self, text: str) -> str:
         """Mask any known value the engine missed in this particular call.
 
@@ -238,14 +270,22 @@ class SessionRedactor:
 
         if not self.reverse:
             return text
-        values = sorted(self.reverse, key=len, reverse=True)
+        pattern = self._sweep_regex_locked()
         parts = _PLACEHOLDER_SPLIT_PATTERN.split(text)
+        if pattern is None:
+            values = sorted(self.reverse, key=lambda value: (-len(value), value))
+            for index, part in _outside_placeholders(text):
+                swept = part
+                for value in values:
+                    if value and value in swept:
+                        swept = swept.replace(value, self.reverse[value])
+                parts[index] = swept
+            return "".join(parts)
+        reverse = self.reverse
         for index, part in _outside_placeholders(text):
-            swept = part
-            for value in values:
-                if value and value in swept:
-                    swept = swept.replace(value, self.reverse[value])
-            parts[index] = swept
+            if not part:
+                continue
+            parts[index] = pattern.sub(lambda match: reverse[match.group()], part)
         return "".join(parts)
 
     def _counts_for(self, text: str) -> dict[str, int]:
@@ -370,6 +410,12 @@ class SessionStore:
     @property
     def config(self) -> HookdConfig:
         return self._config
+
+    @property
+    def engine(self) -> Engine | None:
+        """The loaded engine, or ``None`` for offline maintenance."""
+
+        return self._engine
 
     def _path_for(self, session_id: str) -> Path:
         return self._config.sessions_dir / f"{session_id}.json"

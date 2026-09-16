@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import stat
 import warnings
 from collections.abc import Iterable
@@ -288,6 +289,48 @@ class PiiGuardEngine:
         assert original == "張大明的身分證A123456789"
     """
 
+    # Extra entity names registered at runtime from a reference list's shape
+    # rules.  A class attribute, because ``create_regex_only_engine`` builds an
+    # instance with ``object.__new__`` and never runs ``__init__``.
+    _extra_entities: tuple[str, ...] = ()
+
+    @property
+    def supported_entities(self) -> list[str]:
+        """Every entity this instance detects, including runtime additions."""
+
+        return [*SUPPORTED_ENTITIES, *self._extra_entities]
+
+    def register_pattern_recognizers(self, specs: Iterable[tuple[str, str]]) -> int:
+        """Add regex recognizers named by a reference list's shape rules.
+
+        A column of order numbers has one shape, so masking that shape catches
+        the numbers that are not in the list yet.  Anything that will not
+        compile is dropped rather than failing the service.
+        """
+
+        from presidio_analyzer import Pattern, PatternRecognizer
+
+        added: list[str] = []
+        for entity_type, regex in specs:
+            if not isinstance(entity_type, str) or not isinstance(regex, str):
+                continue
+            if entity_type in self.supported_entities:
+                continue
+            try:
+                re.compile(regex)
+            except re.error:
+                continue
+            recognizer = PatternRecognizer(
+                supported_entity=entity_type,
+                supported_language="zh",
+                patterns=[Pattern(name=f"{entity_type}_shape", regex=regex, score=0.85)],
+            )
+            self._analyzer.registry.add_recognizer(recognizer)
+            added.append(entity_type)
+        if added:
+            self._extra_entities = (*self._extra_entities, *added)
+        return len(added)
+
     def __init__(
         self,
         ckip_model: str = "ckiplab/bert-base-chinese-ner",
@@ -315,7 +358,7 @@ class PiiGuardEngine:
             results = self._analyzer.analyze(
                 text=text,
                 language="zh",
-                entities=SUPPORTED_ENTITIES,
+                entities=self.supported_entities,
                 score_threshold=self.score_threshold,
             )
         results = _merge_adjacent_spans(results)
@@ -385,7 +428,8 @@ class PiiGuardEngine:
             return replace_fn
 
         operators = {
-            et: OperatorConfig("custom", {"lambda": make_lambda(et)}) for et in SUPPORTED_ENTITIES
+            et: OperatorConfig("custom", {"lambda": make_lambda(et)})
+            for et in self.supported_entities
         }
 
         results = self._filter_allowed_orgs(

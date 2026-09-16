@@ -314,3 +314,70 @@ def test_detect_ignores_a_placeholder_the_session_already_issued() -> None:
     redactor.redact("王小明")
 
     assert redactor.detect("把 <PERSON_1> 寫進檔案") == {}
+
+
+# ---------------------------------------------------------------------------
+# The compiled sweep that a reference list makes necessary
+# ---------------------------------------------------------------------------
+
+
+def test_the_sweep_prefers_the_longest_known_value() -> None:
+    redactor = _redactor({})
+    redactor.seed([("PERSON", "王小明"), ("ORG", "王小明企業社")])
+
+    swept = redactor.sweep_known("王小明企業社的負責人是王小明。")
+
+    assert swept == "<ORG_1>的負責人是<PERSON_1>。"
+
+
+def test_the_sweep_leaves_existing_placeholders_alone() -> None:
+    redactor = _redactor({})
+    # A value that also appears inside a placeholder's own text.
+    redactor.seed([("ORG", "PERSON"), ("PERSON", "王小明")])
+
+    swept = redactor.sweep_known("<PERSON_1> 與 王小明 是同一人，PERSON 是型別。")
+
+    assert "<PERSON_1>" in swept
+    assert swept.count("<ORG_1>") == 1
+
+
+def test_the_sweep_does_not_rewrite_the_markers_it_just_wrote() -> None:
+    redactor = _redactor({})
+    redactor.seed([("PERSON", "王小明"), ("ORG", "PERSON")])
+
+    swept = redactor.sweep_known("王小明")
+
+    assert swept == "<PERSON_1>"
+
+
+def test_seeding_after_a_sweep_takes_effect_immediately() -> None:
+    redactor = _redactor({})
+    redactor.seed([("PERSON", "王小明")])
+    assert redactor.sweep_known("王小明與龍哥") == "<PERSON_1>與龍哥"
+
+    redactor.seed([("PERSON", "龍哥")])
+
+    assert redactor.sweep_known("王小明與龍哥") == "<PERSON_1>與<PERSON_2>"
+
+
+def test_a_value_holding_regex_metacharacters_is_matched_literally() -> None:
+    redactor = _redactor({})
+    redactor.seed([("CUSTOM", "A+B (股) 公司")])
+
+    assert redactor.sweep_known("客戶 A+B (股) 公司 來電") == "客戶 <CUSTOM_1> 來電"
+
+
+def test_a_large_reference_list_sweeps_a_realistic_document_quickly() -> None:
+    import time
+
+    redactor = _redactor({})
+    redactor.seed([("ORDER_ID", f"ORD-{index:06d}") for index in range(10_000)])
+    # About 50KB of text, a fifth of which is values the sweep has to replace.
+    text = ("客戶來電詢問訂單 ORD-004242 的出貨進度，請協助查詢。" * 400)[:50_000]
+
+    started = time.perf_counter()
+    swept = redactor.sweep_known(text)
+    elapsed = time.perf_counter() - started
+
+    assert "ORD-004242" not in swept
+    assert elapsed < 0.5

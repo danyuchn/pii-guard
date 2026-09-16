@@ -21,6 +21,7 @@ from typing import Any, Final
 from pii_guard.hookd import hooks, policy
 from pii_guard.hookd.core import MAX_TEXT_BYTES, SessionStore, validate_session_id
 from pii_guard.local_workflow import WorkflowError
+from pii_guard.reference import ReferenceCache
 
 LOOPBACK_HOST: Final[str] = "127.0.0.1"
 MAX_REQUEST_BYTES: Final[int] = MAX_TEXT_BYTES + 256 * 1024
@@ -55,17 +56,61 @@ class HookdApplication:
         engine_fallback: bool = False,
         policy_config: policy.PolicyConfig | None = None,
         seed_terms: tuple[tuple[str, str], ...] = (),
+        reference: ReferenceCache | None = None,
     ) -> None:
         self._store = store
         self._engine_name = engine_name
         self._engine_fallback = engine_fallback
         self._policy = policy_config or policy.PolicyConfig()
+        self._reference = reference
+        self._registered_patterns: set[tuple[str, str]] = set()
         self._context = hooks.HookContext(
             names_covered=engine_name == "full",
             policy=self._policy,
             seed_terms=seed_terms,
+            seed_provider=None if reference is None else self._reference_terms,
         )
         self._lock = threading.Lock()
+        if reference is not None:
+            self._reference_terms()
+
+    def _reference_terms(self) -> tuple[tuple[str, str], ...]:
+        """Current reference terms, registering any new shape rules first."""
+
+        if self._reference is None:
+            return ()
+        loaded = self._reference.load()
+        self._register_patterns(loaded.patterns)
+        return loaded.terms
+
+    def _register_patterns(self, patterns: tuple[tuple[str, str], ...]) -> int:
+        """Teach the engine the shape rules a reference list inferred."""
+
+        fresh = [entry for entry in patterns if entry not in self._registered_patterns]
+        if not fresh:
+            return 0
+        register = getattr(self._store.engine, "register_pattern_recognizers", None)
+        if not callable(register):
+            return 0
+        try:
+            added = int(register(fresh))
+        except Exception:  # noqa: BLE001 - a bad shape rule must not stop the service
+            return 0
+        self._registered_patterns.update(fresh)
+        return added
+
+    def reload(self) -> dict[str, object]:
+        """Re-read every reference source; answers with counts, never values."""
+
+        if self._reference is None:
+            return {"ok": True, "terms": 0, "counts": {}, "sources": 0}
+        self._reference.invalidate()
+        loaded = self._reference.load()
+        self._register_patterns(loaded.patterns)
+        summary = loaded.summary()
+        summary["ok"] = True
+        summary["sources"] = len(self._reference.sources())
+        return summary
 
     @property
     def store(self) -> SessionStore:
@@ -79,7 +124,22 @@ class HookdApplication:
             "names_covered": self._context.names_covered,
             "policy": self._policy.describe(),
             "sessions": len(self._store.summary()),
+            "reference": self.reference_status(),
             "version": SERVICE_VERSION,
+        }
+
+    def reference_status(self) -> dict[str, object]:
+        """How many terms each type contributes, and from how many sources."""
+
+        if self._reference is None:
+            return {"sources": 0, "terms": 0, "counts": {}, "missing": []}
+        loaded = self._reference.load()
+        return {
+            "sources": len(self._reference.sources()),
+            "terms": len(loaded.terms),
+            "counts": dict(loaded.counts),
+            "missing": list(loaded.missing),
+            "patterns": len(loaded.patterns),
         }
 
     def redact(self, payload: Mapping[str, Any]) -> dict[str, object]:
@@ -260,7 +320,9 @@ def _handler_for(app: HookdApplication, token: str, port: int):
                 return
             try:
                 payload = self._body()
-                if segments == ["redact"]:
+                if segments == ["reload"]:
+                    self._json(app.reload())
+                elif segments == ["redact"]:
                     self._json(app.redact(payload))
                 elif segments == ["restore"]:
                     self._json(app.restore(payload))

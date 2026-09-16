@@ -62,6 +62,8 @@ Claude 呼叫 Read/Bash/Grep
 | `serve` | 手動啟動（背景）；`--foreground` 留在終端機 |
 | `status` / `stop` | 看狀態／停止 |
 | `purge <session_id>` / `purge --all` | 忘掉對照表 |
+| `terms inspect` / `import` / `status` / `remove` | 管理參考名單（見下方「參考名單」一節） |
+| `terms ui` | 開本機網頁的「名單」分頁，等同 `pii-guard web --open` |
 
 全部都以 `uv run pii-guard-hookd <指令>` 執行。
 
@@ -259,7 +261,8 @@ uv run pii-guard-hookd doctor --harden
     "output_gate": false,
     "encoders_extra": ["mycompany-encode"],
     "network_extra": ["mycompany-upload"],
-    "seed_terms_files": ["/path/to/.pii-guard/terms.txt"]
+    "seed_terms_files": ["/path/to/.pii-guard/terms.txt"],
+    "reference_sources": ["/path/to/.pii-guard/sources.json"]
   }
 }
 ```
@@ -267,9 +270,94 @@ uv run pii-guard-hookd doctor --harden
 放行網域改 settings 的 `sandbox.network.allowedDomains`。改完重啟服務
 （`stop` 之後下一個 session 會自己拉起來）。
 
-### 種子詞：補偵測抓不到的那一類
+### 參考名單：把客戶名單設成固定要遮的字
 
-`<專案>/.pii-guard/terms.txt` 每行一個值，可選 `TYPE<TAB>值`：
+偵測層抓不到暱稱、內部代號、非典型拼法，但這些值你手上通常已經有一份表了——
+客戶名單、訂單匯出檔。把那份表交給 pii-guard，它記住「哪一欄是什麼」，
+之後這些值在任何一次工具輸出裡都會被遮掉。
+
+**名單不會被複製。** 存下來的只有一份描述檔 `<專案>/.pii-guard/sources.json`：
+來源檔路徑、欄位對應、以及從欄位推出來的格式規則。**裡面沒有任何一筆值。**
+服務要用的時候直接讀原始的 xlsx／csv。
+
+#### 三種入口
+
+| 入口 | 指令 | 適合誰 |
+|------|------|--------|
+| 終端機 | `uv run pii-guard-hookd terms import <檔案>` | 習慣 CLI 的人 |
+| Claude Code | `/pii-terms <檔案路徑>` | 想讓 Claude 帶著走完流程 |
+| 網頁 | `uv run pii-guard-hookd terms ui`（等同 `pii-guard web --open`）的「名單」分頁 | 不碰終端機的人 |
+
+#### 終端機指令
+
+```bash
+# 看這份表有哪些欄位（輸出不含任何值，可以安全貼給別人看）
+uv run pii-guard-hookd terms inspect ~/Downloads/客戶名單.xlsx
+
+# 逐欄確認後存檔；--yes 全用猜的，--map 直接指定
+uv run pii-guard-hookd terms import ~/Downloads/客戶名單.xlsx
+uv run pii-guard-hookd terms import ~/Downloads/客戶名單.xlsx --yes
+uv run pii-guard-hookd terms import ~/Downloads/客戶名單.xlsx \
+    --map "姓名=PERSON,手機=TW_MOBILE,金額=SKIP" --yes
+
+# 看目前設了什麼、載入幾筆
+uv run pii-guard-hookd terms status
+
+# 移除
+uv run pii-guard-hookd terms remove ~/Downloads/客戶名單.xlsx
+uv run pii-guard-hookd terms remove --all
+```
+
+可選的欄位類型：`PERSON` 姓名、`ORG` 公司／組織、`TW_MOBILE` 手機、
+`TW_LANDLINE` 市話、`EMAIL_ADDRESS` 電子郵件、`TW_NATIONAL_ID` 身分證字號、
+`TW_BUSINESS_ID` 統一編號、`TW_ADDRESS` 地址、`TW_BANK_ACCOUNT` 銀行帳號、
+`TW_LICENSE_PLATE` 車牌、`ORDER_ID` 訂單／案件編號、`CUSTOM` 其他要遮的字、
+`SKIP` 不要遮。
+
+#### 登記：為什麼匯入一定要透過指令或網頁
+
+服務只讀 `~/.config/pii-guard/hookd.json` 裡 `policy.reference_sources` 列出的描述檔。
+`terms import` 與網頁儲存都會自動把專案登記進去（`terms remove --all` 或移掉最後一個
+來源時會撤掉），所以**先裝 hook、之後才匯入名單**這個正常順序是可以的，不必重跑
+`install`，也不必重啟服務。
+
+手動編輯 `.pii-guard/sources.json` 則不會被登記——服務不知道有這個檔。這種情況請跑一次
+`uv run pii-guard-hookd terms import`，或自己把路徑加進 `policy.reference_sources`。
+
+匯入後如果印出「注意：保護服務載入了 0 筆」，就是**現在什麼都沒遮**，別當成成功。
+跑 `terms status` 查原因，最常見的是欄位全設成「不要遮」，或名單檔已經被移走。
+
+#### 五條刻意的預設
+
+- **金額、日期、備註欄預設不遮。** 短數字到處都會撞到，遮了會把正常內容一起改掉。
+  真的要遮就自己 `--map 金額=CUSTOM`。
+- **太短的值自動略過**：中文少於 2 字、英數少於 4 字、純數字 6 位以內。
+  `terms import` 會告訴你略過幾筆。
+- **編號欄用格式規則，不只是逐值比對。** 某欄的值若有 90% 以上是同一個形狀
+  （例如 `ORD-` 加六位數字），就存下這條 regex，**名單以外的新編號也會一起遮**。
+  只有 `ORDER_ID` 與 `CUSTOM` 會這樣做——手機、身分證這些本來就有偵測器了。
+- **改了名單不用重啟服務。** 以來源檔的修改時間為準，每個新 session 重讀一次。
+  想立刻生效就 `terms import` 或網頁儲存，它們會呼叫服務的 `POST /v1/reload`。
+- **Excel 吃掉的開頭 0 會補回來。** 手機、市話、統編在 Excel 裡若存成數字，
+  `0912345678` 會變成 `912345678`，那樣永遠比不到文本裡的號碼。依欄位類型判斷並補回：
+  手機 `9` 開頭 9 碼、市話 `2`–`8` 開頭 8 至 9 碼、統編不足 8 碼補滿。
+  已經完整的值、含 `-` 的值、姓名與編號欄一律不動。
+
+#### 值到底會出現在哪裡
+
+不會出現在 stdout、log、hook 回覆、HTTP JSON、doctor 報告，也不會進
+`sources.json`。**唯二的例外**是你自己明確要求的兩件事：
+
+1. 網頁「名單」分頁的每欄前 3 筆預覽——那是給你確認選對欄位用的，只走 loopback，
+   而且不進任何 log。
+2. `terms import --materialize` 會另外寫一份 `.pii-guard/terms.txt`，那份**含真實值**，
+   權限 0600。不加這個旗標就不會有這個檔。
+
+`.pii-guard/` 會在第一次寫入時自動加進專案的 `.gitignore`。
+
+#### 舊的 terms.txt 仍然可用
+
+`<專案>/.pii-guard/terms.txt` 每行一個值，可選 `TYPE<TAB>值`，格式沒變：
 
 ```
 # 偵測抓不到的暱稱與內部代號
@@ -278,11 +366,8 @@ ORG	寶島顧問
 TW_MOBILE	0912345678
 ```
 
-`install` 會自動把它寫進設定。服務啟動時載入，之後這些值**在任何一次工具輸出裡
-都會被遮掉**，不需要偵測層認得它們。值本身不會出現在任何回覆裡，SessionStart
-只會說「載入 N 個種子詞」。
-
-這一條補的是 recall 的已知弱點：暱稱、非典型英文名、內部代號，NER 模型本來就抓不到。
+`install` 會把它與 `sources.json` 一起寫進設定，兩者可以並存。
+值本身不會出現在任何回覆裡，SessionStart 只會說「載入 N 個種子詞」。
 
 ### 誠實的殘餘風險
 

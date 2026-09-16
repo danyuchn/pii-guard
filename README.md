@@ -197,6 +197,13 @@ uv run python -m pii_guard web \
 uv run python -m pii_guard benchmark --fixture tests/fixtures/phase1_chinese.txt
 ```
 
+網頁分成兩個分頁。「快審」是上面這段流程；「名單」把客戶名單（xlsx／csv）的欄位對應存起來，
+之後這些值在所有進模型的內容裡都會先被換成代號——三步驟：選檔案、逐欄確認要不要遮、儲存並啟用，
+下面還有一個「試試看」框可以立刻確認效果。名單**不會被複製**，存下來的只有一份
+`<專案>/.pii-guard/sources.json`（來源路徑、欄位對應、格式規則，沒有任何值）。
+終端機等價指令是 `uv run pii-guard-hookd terms import <表格>`，Claude Code 裡是 `/pii-terms`。
+詳細行為與值的流向見 `examples/claude-code-hookd/README.md` 的「參考名單」一節。
+
 網頁只在 client 端以固定邏輯顯示 `~/.local/share/pii-safe-documents/jobs/<job_id>/` 提示；若啟動時自訂 `jobs-root`，則顯示「啟動 CLI 設定的私有工作根目錄 + 工作編號」，API 不回傳絕對路徑。「產生還原檔」只會把結果寫回同一個私有工作目錄，不透過 HTTP 傳回原文；「刪除這個工作」是手動刪除單一工作與對照表，沒有自動 TTL。
 
 加強模式先建立與快速模式相同的私有基線，再由獨立本機工作執行 Ollama 稽核。每個送入模型的視窗取樣三次，三次都成功才取聯集；模型回報的文字必須能精確或唯一地對回目前文字，最後仍要逐字還原成功。工作尚未通過時，API 與頁面都不提供去識別化文字、代號、下載、人工補遮或還原；可以取消，失敗、取消或伺服器中斷後可以明確重跑。同一時間只執行一個加強工作，快速模式仍可使用且不會探測或呼叫 Ollama。程式會保守拒絕常見的提示注入文字，但這是有限規則，不代表能證明所有提示注入都無效；`passed` 只表示這套有界稽核與完整性檢查已完成，不是零漏網保證。

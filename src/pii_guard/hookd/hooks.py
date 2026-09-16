@@ -8,7 +8,7 @@ client should print, or an empty object when there is nothing to change.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -68,6 +68,27 @@ class HookContext:
     names_covered: bool = False
     policy: policy.PolicyConfig = field(default_factory=policy.PolicyConfig)
     seed_terms: tuple[tuple[str, str], ...] = ()
+    # A reference list lives in a spreadsheet the user keeps editing, so the
+    # terms are asked for at the start of every session rather than read once
+    # when the service booted.  ``seed_terms`` stays the static fallback.
+    seed_provider: Callable[[], tuple[tuple[str, str], ...]] | None = None
+
+    def current_seed_terms(self) -> tuple[tuple[str, str], ...]:
+        """The terms to seed a new session with, newest list first."""
+
+        if self.seed_provider is None:
+            return self.seed_terms
+        try:
+            provided = self.seed_provider()
+        except Exception:  # noqa: BLE001 - a broken list must not kill a session
+            return self.seed_terms
+        merged = list(self.seed_terms)
+        known = {value for _, value in merged}
+        for entity_type, value in provided:
+            if value not in known:
+                known.add(value)
+                merged.append((entity_type, value))
+        return tuple(merged)
 
 
 NAMES_COVERED_MESSAGE: Final[str] = "pii-guard: on (full engine, names covered)"
@@ -386,9 +407,10 @@ def handle_session_start(
     """Tell the model that placeholders are expected and must be preserved."""
 
     seeded = 0
-    if context.seed_terms:
+    terms = context.current_seed_terms()
+    if terms:
         redactor = store.get(str(payload.get("session_id", "")))
-        seeded = redactor.seed(context.seed_terms)
+        seeded = redactor.seed(terms)
         if seeded:
             store.save(redactor)
     extra = "" if context.names_covered else NAMES_UNCOVERED_CONTEXT

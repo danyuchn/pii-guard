@@ -8,6 +8,7 @@ import threading
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
@@ -961,3 +962,257 @@ def test_compact_leaves_an_unknown_value_alone(service: RunningService) -> None:
 
 def test_compact_without_messages_is_a_no_op(service: RunningService) -> None:
     assert service.hook("Compact", {"session_id": "s1", "messages": []}) == {}
+
+
+# ---------------------------------------------------------------------------
+# Reference lists
+# ---------------------------------------------------------------------------
+
+
+class RecordingEngine(FakeEngine):
+    """A FakeEngine that also accepts the shape rules a reference list infers."""
+
+    def __init__(self, spans: dict[str, str]) -> None:
+        super().__init__(spans)
+        self.registered: list[tuple[str, str]] = []
+
+    def register_pattern_recognizers(self, specs) -> int:
+        added = list(specs)
+        self.registered.extend(added)
+        return len(added)
+
+
+def _reference_project(tmp_path, rows: list[tuple[str, str]]) -> tuple[object, str]:
+    """A project whose reference list is one two-column CSV of fake people."""
+
+    from pii_guard.reference import ReferenceCache, ReferenceSource, sources_path, write_sources
+
+    table = tmp_path / "customers.csv"
+    body = "姓名,訂單編號\n" + "".join(f"{name},{order}\n" for name, order in rows)
+    table.write_text(body, encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir(exist_ok=True)
+    write_sources(
+        project,
+        [
+            ReferenceSource(
+                path=str(table),
+                columns={"姓名": "PERSON", "訂單編號": "ORDER_ID"},
+                patterns=(("ORDER_ID", r"(?<![A-Za-z0-9])[A-Z]{3}\-\d{6}(?![A-Za-z0-9])"),),
+            )
+        ],
+    )
+    return ReferenceCache([str(sources_path(project))]), str(table)
+
+
+def test_a_reference_list_seeds_every_new_session(tmp_path) -> None:
+    config = HookdConfig(home=tmp_path / "hookd")
+    cache, _ = _reference_project(tmp_path, [("吳孟儒", "ORD-000101")])
+    app = HookdApplication(
+        SessionStore(config, FakeEngine({})), "regex", reference=cache
+    )
+
+    app.hook("SessionStart", {"session_id": "s1"})
+    redacted = app.redact({"session_id": "s1", "text": "聯絡人吳孟儒，訂單 ORD-000101。"})
+
+    assert "吳孟儒" not in redacted["text"]
+    assert "ORD-000101" not in redacted["text"]
+
+
+def test_the_session_start_reply_reports_a_count_and_no_values(tmp_path) -> None:
+    config = HookdConfig(home=tmp_path / "hookd")
+    cache, _ = _reference_project(tmp_path, [("吳孟儒", "ORD-000101")])
+    app = HookdApplication(
+        SessionStore(config, FakeEngine({})), "regex", reference=cache
+    )
+
+    reply = json.dumps(app.hook("SessionStart", {"session_id": "s1"}), ensure_ascii=False)
+
+    assert "吳孟儒" not in reply
+    assert "ORD-000101" not in reply
+    assert "2 seed terms loaded" in reply
+
+
+def test_health_reports_reference_counts_without_values(tmp_path) -> None:
+    config = HookdConfig(home=tmp_path / "hookd")
+    cache, _ = _reference_project(tmp_path, [("吳孟儒", "ORD-000101")])
+    app = HookdApplication(
+        SessionStore(config, FakeEngine({})), "regex", reference=cache
+    )
+
+    health = json.dumps(app.health(), ensure_ascii=False)
+
+    assert '"terms": 2' in health
+    assert "吳孟儒" not in health
+
+
+def test_reload_picks_up_an_edited_table_without_a_restart(tmp_path) -> None:
+    import os
+
+    config = HookdConfig(home=tmp_path / "hookd")
+    cache, table = _reference_project(tmp_path, [("吳孟儒", "ORD-000101")])
+    app = HookdApplication(
+        SessionStore(config, FakeEngine({})), "regex", reference=cache
+    )
+    app.hook("SessionStart", {"session_id": "s1"})
+
+    path = Path(table)
+    path.write_text(
+        path.read_text(encoding="utf-8") + "蔡佩君,ORD-000102\n", encoding="utf-8"
+    )
+    status = path.stat()
+    os.utime(path, ns=(status.st_atime_ns, status.st_mtime_ns + 1_000_000_000))
+
+    reloaded = app.reload()
+    app.hook("SessionStart", {"session_id": "s2"})
+    redacted = app.redact({"session_id": "s2", "text": "新客戶蔡佩君。"})
+
+    assert reloaded["terms"] == 4
+    assert "蔡佩君" not in redacted["text"]
+
+
+def test_reload_never_answers_with_a_value(tmp_path) -> None:
+    config = HookdConfig(home=tmp_path / "hookd")
+    cache, _ = _reference_project(tmp_path, [("吳孟儒", "ORD-000101")])
+    app = HookdApplication(
+        SessionStore(config, FakeEngine({})), "regex", reference=cache
+    )
+
+    body = json.dumps(app.reload(), ensure_ascii=False)
+
+    assert "吳孟儒" not in body
+    assert "ORD-000101" not in body
+
+
+def test_shape_rules_are_registered_with_the_engine(tmp_path) -> None:
+    config = HookdConfig(home=tmp_path / "hookd")
+    cache, _ = _reference_project(tmp_path, [("吳孟儒", "ORD-000101")])
+    engine = RecordingEngine({})
+    app = HookdApplication(SessionStore(config, engine), "regex", reference=cache)
+
+    app.reload()
+
+    assert engine.registered == [
+        ("ORDER_ID", r"(?<![A-Za-z0-9])[A-Z]{3}\-\d{6}(?![A-Za-z0-9])")
+    ]
+
+
+def test_a_shape_rule_is_only_registered_once(tmp_path) -> None:
+    config = HookdConfig(home=tmp_path / "hookd")
+    cache, _ = _reference_project(tmp_path, [("吳孟儒", "ORD-000101")])
+    engine = RecordingEngine({})
+    app = HookdApplication(SessionStore(config, engine), "regex", reference=cache)
+
+    app.reload()
+    app.reload()
+
+    assert len(engine.registered) == 1
+
+
+def test_the_reload_endpoint_needs_the_token(tmp_path) -> None:
+    config = HookdConfig(home=tmp_path / "hookd")
+    store = SessionStore(config, FakeEngine({}))
+    server, token, port = create_server(
+        HookdApplication(store, "regex"), HookdServerConfig(port=0)
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        service = RunningService(f"http://127.0.0.1:{port}", token, store)
+        unauthorized, _ = service.call("POST", "/v1/reload", {}, authorize=False)
+        authorized, body = service.call("POST", "/v1/reload", {})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert unauthorized == 401
+    assert authorized == 200
+    assert body["ok"] is True
+
+
+def test_a_broken_reference_list_does_not_break_a_session(tmp_path) -> None:
+    from pii_guard.reference import ReferenceCache
+
+    config = HookdConfig(home=tmp_path / "hookd")
+    broken = tmp_path / "sources.json"
+    broken.write_text("{not json", encoding="utf-8")
+    app = HookdApplication(
+        SessionStore(config, FakeEngine({})),
+        "regex",
+        reference=ReferenceCache([str(broken)]),
+    )
+
+    reply = app.hook("SessionStart", {"session_id": "s1"})
+
+    assert "systemMessage" in reply
+
+
+def test_a_project_registered_after_startup_is_picked_up_by_reload(
+    tmp_path, monkeypatch
+) -> None:
+    """The normal order of operations: install the hooks first, import later."""
+
+    from pii_guard.reference import (
+        ReferenceCache,
+        ReferenceSource,
+        register_project,
+        registered_source_files,
+        write_sources,
+    )
+
+    monkeypatch.setenv("PII_GUARD_HOOKD_CONFIG", str(tmp_path / "config" / "hookd.json"))
+    config = HookdConfig(home=tmp_path / "hookd")
+    # The service starts with nothing registered, exactly as it would after a
+    # plain install in a project that has no list yet.
+    app = HookdApplication(
+        SessionStore(config, FakeEngine({})),
+        "regex",
+        reference=ReferenceCache(registered_source_files),
+    )
+    app.hook("SessionStart", {"session_id": "s1"})
+    assert app.reload()["terms"] == 0
+
+    table = tmp_path / "customers.csv"
+    table.write_text("姓名\n吳孟儒\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    write_sources(project, [ReferenceSource(path=str(table), columns={"姓名": "PERSON"})])
+    register_project(project)
+
+    reloaded = app.reload()
+    app.hook("SessionStart", {"session_id": "s2"})
+    redacted = app.redact({"session_id": "s2", "text": "客戶吳孟儒來電。"})
+
+    assert reloaded["terms"] == 1
+    assert "吳孟儒" not in redacted["text"]
+
+
+def test_a_deregistered_project_stops_being_loaded(tmp_path, monkeypatch) -> None:
+    from pii_guard.reference import (
+        ReferenceCache,
+        ReferenceSource,
+        register_project,
+        registered_source_files,
+        unregister_project,
+        write_sources,
+    )
+
+    monkeypatch.setenv("PII_GUARD_HOOKD_CONFIG", str(tmp_path / "config" / "hookd.json"))
+    config = HookdConfig(home=tmp_path / "hookd")
+    table = tmp_path / "customers.csv"
+    table.write_text("姓名\n吳孟儒\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    write_sources(project, [ReferenceSource(path=str(table), columns={"姓名": "PERSON"})])
+    register_project(project)
+    app = HookdApplication(
+        SessionStore(config, FakeEngine({})),
+        "regex",
+        reference=ReferenceCache(registered_source_files),
+    )
+    assert app.reload()["terms"] == 1
+
+    unregister_project(project)
+
+    assert app.reload()["terms"] == 0
