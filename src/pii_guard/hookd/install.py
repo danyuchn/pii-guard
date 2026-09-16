@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
+from pii_guard._compat import mode_matches
 from pii_guard.hookd.state import HookdConfig, read_state
 from pii_guard.local_workflow import JOB_MODE, PRIVATE_MODE, WorkflowError
 
@@ -560,10 +561,24 @@ def write_launch_agent(path: Path, command: list[str], hookd_home: Path) -> None
     path.write_bytes(plistlib.dumps(payload))
 
 
+def launch_domain() -> str:
+    """The launchd GUI domain for the current user.
+
+    launchd exists only on macOS, and so does ``os.getuid``; looking it up
+    through getattr keeps a Windows type check honest about that instead of
+    pretending the attribute is always there.
+    """
+
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        raise WorkflowError("UNSUPPORTED_PLATFORM", "launchd is available on macOS only.")
+    return f"gui/{getuid()}"
+
+
 def load_launch_agent(path: Path) -> tuple[bool, str]:
     """Bootstrap the agent, falling back to the older load verb."""
 
-    code, message = run_launchctl(["bootstrap", f"gui/{os.getuid()}", str(path)])
+    code, message = run_launchctl(["bootstrap", launch_domain(), str(path)])
     if code == 0:
         return True, "bootstrapped"
     code, fallback = run_launchctl(["load", "-w", str(path)])
@@ -573,13 +588,13 @@ def load_launch_agent(path: Path) -> tuple[bool, str]:
 
 
 def unload_launch_agent(path: Path) -> None:
-    code, _ = run_launchctl(["bootout", f"gui/{os.getuid()}/{LAUNCH_LABEL}"])
+    code, _ = run_launchctl(["bootout", f"{launch_domain()}/{LAUNCH_LABEL}"])
     if code != 0:
         run_launchctl(["unload", "-w", str(path)])
 
 
 def launch_agent_loaded() -> bool:
-    code, _ = run_launchctl(["print", f"gui/{os.getuid()}/{LAUNCH_LABEL}"])
+    code, _ = run_launchctl(["print", f"{launch_domain()}/{LAUNCH_LABEL}"])
     return code == 0
 
 
@@ -724,7 +739,10 @@ def doctor(
     sessions_dir = config.sessions_dir
     if not sessions_dir.is_dir():
         results.append(CheckResult("session store", True, "no mappings stored yet"))
-    elif stat.S_IMODE(sessions_dir.stat().st_mode) == JOB_MODE:
+    elif mode_matches(sessions_dir.stat(), JOB_MODE):
+        # mode_matches is the guard's own privacy invariant, not a raw mode
+        # comparison: NTFS cannot store 0o700, so on Windows the verified ACL
+        # on the store is authoritative and a mode check would always fail.
         results.append(CheckResult("session store", True, f"{sessions_dir} is owner only"))
     else:
         results.append(CheckResult("session store", False, f"{sessions_dir} is not mode 0700"))

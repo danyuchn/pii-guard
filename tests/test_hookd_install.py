@@ -7,7 +7,7 @@ config directory is a tmp path and every launchctl call is monkeypatched.
 from __future__ import annotations
 
 import json
-import stat
+import os
 from pathlib import Path
 
 import pytest
@@ -16,6 +16,7 @@ from pii_guard.hookd import install as installer
 from pii_guard.hookd.__main__ import main
 from pii_guard.hookd.state import HookdConfig
 from pii_guard.local_workflow import WorkflowError
+from tests.conftest import assert_mode
 
 FOREIGN_HOOK = {
     "matcher": "Bash",
@@ -68,7 +69,7 @@ def test_install_into_a_fresh_config(env, capsys) -> None:
     ]
     client = installer.client_target(env["config_dir"])
     assert client.is_file()
-    assert stat.S_IMODE(client.stat().st_mode) == 0o700
+    assert_mode(client, 0o700)
     assert str(client) in settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
     # MCP output is not schema validated, so leaf redaction is safe there.
     assert settings["hooks"]["PostToolUse"][0]["matcher"] == "Read|Bash|Grep|mcp__.*"
@@ -131,7 +132,7 @@ def test_install_writes_an_owner_only_config(env) -> None:
     _install("--engine", "full")
 
     config_file = env["installer_config"]
-    assert stat.S_IMODE(config_file.stat().st_mode) == 0o600
+    assert_mode(config_file, 0o600)
     payload = json.loads(config_file.read_text(encoding="utf-8"))
     assert payload["engine"] == "full"
     assert Path(payload["repo"]).is_dir()
@@ -253,6 +254,12 @@ def test_launch_agent_plist_runs_the_foreground_command(tmp_path) -> None:
     assert payload["KeepAlive"] is True
 
 
+# launchd is macOS-only, and so is the os.getuid() its bootstrap target needs;
+# monkeypatching sys.platform cannot conjure either onto Windows.
+_LAUNCHD = pytest.mark.skipif(os.name == "nt", reason="launchd exists only on POSIX")
+
+
+@_LAUNCHD
 def test_load_launch_agent_falls_back_to_the_old_verb(tmp_path, monkeypatch) -> None:
     calls: list[list[str]] = []
 
@@ -269,6 +276,7 @@ def test_load_launch_agent_falls_back_to_the_old_verb(tmp_path, monkeypatch) -> 
     assert [call[0] for call in calls] == ["bootstrap", "load"]
 
 
+@_LAUNCHD
 def test_install_registers_the_launch_agent(env, monkeypatch, capsys) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr(installer, "run_launchctl", lambda a: (calls.append(a), (0, ""))[1])
@@ -307,9 +315,9 @@ def test_install_creates_owner_only_directories_from_the_start(env, tmp_path) ->
     nested = tmp_path / "share" / "pii-guard" / "hookd"
     HookdConfig(home=nested).ensure_home()
 
-    assert stat.S_IMODE(nested.stat().st_mode) == 0o700
-    assert stat.S_IMODE(nested.parent.stat().st_mode) == 0o700
-    assert stat.S_IMODE((nested / "sessions").stat().st_mode) == 0o700
+    assert_mode(nested, 0o700)
+    assert_mode(nested.parent, 0o700)
+    assert_mode((nested / "sessions"), 0o700)
 
 
 def test_ensure_home_leaves_pre_existing_directories_alone(tmp_path) -> None:
@@ -319,16 +327,16 @@ def test_ensure_home_leaves_pre_existing_directories_alone(tmp_path) -> None:
     HookdConfig(home=shared / "pii-guard" / "hookd").ensure_home()
 
     # A directory that was already there is not ours to tighten.
-    assert stat.S_IMODE(shared.stat().st_mode) == 0o755
-    assert stat.S_IMODE((shared / "pii-guard").stat().st_mode) == 0o700
+    assert_mode(shared, 0o755)
+    assert_mode((shared / "pii-guard"), 0o700)
 
 
 def test_install_leaves_the_hookd_home_owner_only(env) -> None:
     _install()
 
     home = env["hookd_home"]
-    assert stat.S_IMODE(home.stat().st_mode) == 0o700
-    assert stat.S_IMODE((home / "sessions").stat().st_mode) == 0o700
+    assert_mode(home, 0o700)
+    assert_mode((home / "sessions"), 0o700)
 
 
 def test_install_starts_the_service_without_launchd(env, monkeypatch, capsys) -> None:

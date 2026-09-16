@@ -8,13 +8,13 @@ list is that the table stays where it is.
 from __future__ import annotations
 
 import json
-import stat
 from pathlib import Path
 
 import pytest
 
 from pii_guard import reference
 from pii_guard.local_workflow import WorkflowError
+from tests.conftest import assert_mode
 
 pytest.importorskip("openpyxl")
 
@@ -292,8 +292,8 @@ def test_the_stored_description_is_owner_only(tmp_path: Path) -> None:
 
     saved = reference.write_sources(project, [source_for(tmp_path / "list.xlsx")])
 
-    assert stat.S_IMODE(saved.stat().st_mode) == 0o600
-    assert stat.S_IMODE(saved.parent.stat().st_mode) == 0o700
+    assert_mode(saved, 0o600)
+    assert_mode(saved.parent, 0o700)
 
 
 def test_writing_sources_adds_the_directory_to_gitignore(tmp_path: Path) -> None:
@@ -422,7 +422,7 @@ def test_materialize_writes_an_owner_only_term_file(tmp_path: Path) -> None:
     written = reference.materialize([source_for(table)], target)
 
     assert written > 0
-    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert_mode(target, 0o600)
     body = target.read_text(encoding="utf-8")
     assert "PERSON\t陳建華" in body
 
@@ -444,6 +444,7 @@ def test_materialized_terms_read_back_through_the_policy_loader(tmp_path: Path) 
 
 def test_the_cache_reloads_when_the_table_changes(tmp_path: Path) -> None:
     import os
+
     import openpyxl
 
     table = write_xlsx(tmp_path / "list.xlsx")
@@ -644,7 +645,7 @@ def test_the_registered_config_is_owner_only(tmp_path: Path, installer_config: P
 
     reference.register_project(project)
 
-    assert stat.S_IMODE(installer_config.stat().st_mode) == 0o600
+    assert_mode(installer_config, 0o600)
 
 
 def test_unregistering_removes_only_that_project(

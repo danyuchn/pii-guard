@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-import stat
 
 import pytest
 
 from pii_guard.hookd.core import SessionRedactor, SessionStore, create_engine
 from pii_guard.hookd.state import HookdConfig
 from pii_guard.local_workflow import WorkflowError
+from tests.conftest import assert_mode
 
 
 class FakeEngine:
@@ -158,8 +158,8 @@ def test_stored_session_file_is_owner_only(config: HookdConfig) -> None:
     store.save(redactor)
 
     path = config.sessions_dir / "session-a.json"
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert stat.S_IMODE(config.sessions_dir.stat().st_mode) == 0o700
+    assert_mode(path, 0o600)
+    assert_mode(config.sessions_dir, 0o700)
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["mapping"] == {"<PERSON_1>": "王小明"}
 

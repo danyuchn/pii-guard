@@ -18,6 +18,7 @@ from pii_guard import enhanced_audit
 from pii_guard.audit_manager import AuditManager
 from pii_guard.local_workflow import RESTORED_NAME, PrivateJobStore, WorkflowError
 from pii_guard.web import LocalWebApplication, WebConfig, _error_status, create_server
+from tests.conftest import assert_mode
 from tests.pdf_fixtures import build_image_only_pdf, build_text_pdf
 from tests.test_local_workflow import FakeEngine
 
@@ -726,7 +727,6 @@ def test_reference_save_refuses_a_path_that_is_not_there(
 def test_reference_save_can_keep_a_copy_inside_the_project(
     tmp_path: Path, reference_table: Path, reference_project: Path
 ) -> None:
-    import stat as stat_module
 
     app = _reference_app(tmp_path)
     report = app.reference_inspect(
@@ -744,7 +744,7 @@ def test_reference_save_can_keep_a_copy_inside_the_project(
 
     copied = reference_project / ".pii-guard" / "lists" / "customers.csv"
     assert copied.is_file()
-    assert stat_module.S_IMODE(copied.stat().st_mode) == 0o600
+    assert_mode(copied, 0o600)
     assert result["source_path"] == str(copied)
 
 

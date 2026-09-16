@@ -8,6 +8,7 @@ the service is or is not there.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -30,6 +31,39 @@ CLIENT = (
 )
 SPANS = {"王小明": "PERSON", "0912345678": "TW_MOBILE"}
 
+# The child environment is hand-built on purpose: the client must find the
+# service through its own variables, never through the developer's shell.
+# Windows still needs a handful of its own variables before a process can
+# open a socket at all, so those are carried over rather than invented.
+# USERPROFILE is deliberately NOT among them, so the tests that check the
+# default home still resolve to nothing rather than to a real installation.
+_WINDOWS_ESSENTIALS = (
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+)
+
+
+def child_environment(values: dict[str, str]) -> dict[str, str]:
+    """Build the environment Claude Code would hand the hook client."""
+
+    environment = dict(values)
+    if os.name != "nt":
+        environment["PATH"] = "/usr/bin:/bin"
+        return environment
+    for name in _WINDOWS_ESSENTIALS:
+        if name in os.environ and name not in environment:
+            environment[name] = os.environ[name]
+    # System32 has to stay reachable or the child cannot load its own DLLs.
+    environment["PATH"] = os.environ.get("PATH", "")
+    return environment
+
 
 def run_client(
     event: str,
@@ -41,8 +75,9 @@ def run_client(
 ) -> dict[str, object]:
     """Run the hook client exactly as Claude Code would."""
 
-    environment = dict(env) if env is not None else {"PII_GUARD_HOOKD_HOME": str(home)}
-    environment["PATH"] = "/usr/bin:/bin"
+    environment = child_environment(
+        dict(env) if env is not None else {"PII_GUARD_HOOKD_HOME": str(home)}
+    )
     if config is not None:
         environment["PII_GUARD_HOOKD_CONFIG"] = str(config)
     completed = subprocess.run(
@@ -329,12 +364,13 @@ def run_with_config(
         input=json.dumps(payload),
         capture_output=True,
         text=True,
-        env={
-            "PII_GUARD_HOOKD_HOME": str(home),
-            "PII_GUARD_HOOKD_CONFIG": str(config),
-            "PII_GUARD_HOOKD_START_TIMEOUT": start_timeout,
-            "PATH": "/usr/bin:/bin",
-        },
+        env=child_environment(
+            {
+                "PII_GUARD_HOOKD_HOME": str(home),
+                "PII_GUARD_HOOKD_CONFIG": str(config),
+                "PII_GUARD_HOOKD_START_TIMEOUT": start_timeout,
+            }
+        ),
         timeout=60,
         check=False,
     )

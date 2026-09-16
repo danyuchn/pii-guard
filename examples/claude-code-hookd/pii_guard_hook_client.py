@@ -319,7 +319,25 @@ def _start_only() -> int:
     return 0
 
 
+def _use_utf8_streams() -> None:
+    """Read and write UTF-8 whatever the console code page says.
+
+    Hook payloads are UTF-8 on every platform, but a Windows console hands
+    this process cp1252 streams, so a single Chinese name in a reply would
+    raise UnicodeEncodeError and kill the hook rather than redact anything.
+    """
+
+    for stream in (sys.stdin, sys.stdout):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8")
+            except (OSError, ValueError):
+                pass
+
+
 def main(argv: list[str]) -> int:
+    _use_utf8_streams()
     event = argv[1] if len(argv) > 1 else ""
     if event == "SessionStart" and START_ONLY_FLAG in argv[2:]:
         return _start_only()

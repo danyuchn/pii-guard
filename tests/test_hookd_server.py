@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import stat
 import threading
 import urllib.error
 import urllib.request
@@ -16,6 +15,7 @@ from pii_guard.hookd import policy
 from pii_guard.hookd.core import SessionStore
 from pii_guard.hookd.server import HookdApplication, HookdServerConfig, create_server
 from pii_guard.hookd.state import HookdConfig, read_state, write_state
+from tests.conftest import assert_mode
 from tests.test_hookd_core import FakeEngine
 
 SPANS = {"王小明": "PERSON", "0912345678": "TW_MOBILE"}
@@ -417,9 +417,9 @@ def test_state_files_are_owner_only(tmp_path) -> None:
         started_at=1.0,
     )
 
-    assert stat.S_IMODE(config.state_path.stat().st_mode) == 0o600
-    assert stat.S_IMODE(config.state_env_path.stat().st_mode) == 0o600
-    assert stat.S_IMODE(config.home.stat().st_mode) == 0o700
+    assert_mode(config.state_path, 0o600)
+    assert_mode(config.state_env_path, 0o600)
+    assert_mode(config.home, 0o700)
     env_text = config.state_env_path.read_text(encoding="utf-8")
     assert env_text == f"PII_HOOKD_PORT=54321\nPII_HOOKD_TOKEN={'a' * 32}\n"
     state = read_state(config)
