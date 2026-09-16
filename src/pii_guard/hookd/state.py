@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from pii_guard._compat import secure_private_directory
 from pii_guard.local_workflow import (
     JOB_MODE,
     PRIVATE_MODE,
@@ -32,6 +33,9 @@ STATE_VERSION: Final[int] = 1
 # Shell-safe values only: the env file is meant to be sourced or parsed with a
 # trivial split, so anything that could inject a newline or quote is rejected.
 _TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_-]{16,256}$")
+
+# Homes this process has already secured and verified.  See _secure_home.
+_SECURED_HOMES: set[Path] = set()
 
 
 @dataclass(frozen=True)
@@ -69,22 +73,61 @@ class HookdConfig:
         default permissions instead, leaving the enclosing directory
         world-readable, so the missing ancestors are created one at a time.
         Directories that already existed are left exactly as they are.
+
+        The home is secured before the sessions directory is created, so the
+        mappings never live for a moment below a boundary that has not been
+        established yet.
         """
 
-        for path in (self.home, self.sessions_dir):
-            missing = [
-                ancestor
-                for ancestor in (path, *path.parents)
-                if not ancestor.exists()
-            ]
-            for ancestor in reversed(missing):
-                ancestor.mkdir(mode=JOB_MODE)
+        self._make_owner_only(self.home)
+        self._secure_home()
+        self._make_owner_only(self.sessions_dir)
+
+    @staticmethod
+    def _make_owner_only(path: Path) -> None:
+        missing = [ancestor for ancestor in (path, *path.parents) if not ancestor.exists()]
+        for ancestor in reversed(missing):
+            ancestor.mkdir(mode=JOB_MODE)
         # mkdir honours the mode only when it actually creates the directory,
         # so an inherited-permission directory from an older run is tightened.
-        self.home.chmod(JOB_MODE)
-        self.sessions_dir.chmod(JOB_MODE)
-        _assert_owner_mode(self.home, JOB_MODE, directory=True)
-        _assert_owner_mode(self.sessions_dir, JOB_MODE, directory=True)
+        path.chmod(JOB_MODE)
+        _assert_owner_mode(path, JOB_MODE, directory=True)
+
+    def _secure_home(self) -> None:
+        """Establish and verify the Windows ACL boundary on the home.
+
+        The 0700 above is the whole boundary on POSIX and cosmetic on NTFS,
+        where chmod only toggles a read-only flag.  Windows therefore gets the
+        same protected, non-inheriting ACL the private jobs root gets --
+        current user, SYSTEM and Administrators, inheritance removed -- and the
+        sessions directory below it inherits that boundary.  Without this the
+        session mappings, which hold every real value behind a placeholder,
+        would be protected on Windows by nothing but whatever the parent chain
+        happened to hand down.
+
+        An existing home is tightened rather than refused, unlike a jobs root:
+        this directory is always the project's own, at the path the installer
+        chose, so tightening it is exactly what the chmod above does on POSIX.
+        A parent chain that lets another account replace it is still refused,
+        and taking ownership of a home somebody else created will fail.
+
+        Securing costs an icacls call plus a probe per parent directory, which
+        SessionStore.save cannot pay on every tool call, so a home this process
+        has already verified is not checked again.  The boundary cannot move
+        under a resident service without the account already being lost.
+        """
+
+        resolved = self.home.resolve()
+        if resolved in _SECURED_HOMES:
+            return
+        try:
+            secure_private_directory(resolved, created=True)
+        except OSError as exc:
+            raise WorkflowError(
+                "PERMISSION_CHECK_FAILED",
+                "The hookd home permissions could not be verified.",
+            ) from exc
+        _SECURED_HOMES.add(resolved)
 
 
 def write_state(

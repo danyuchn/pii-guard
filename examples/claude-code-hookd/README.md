@@ -104,6 +104,12 @@ Claude 呼叫 Read/Bash/Grep
 
 這些目錄一建立就是 `0700`，對照表與 state 檔是 `0600`。
 
+**Windows**：NTFS 沒有 POSIX 權限位，上面的 `0700`／`0600` 以 POSIX 為準。Windows 改以 ACL
+劃界——home 建立時移除繼承、限定目前使用者、SYSTEM 與 Administrators 完全控制，並在使用前讀回
+驗證，`sessions/` 與其中的對照表沿用這個邊界。home 必須位於使用者設定檔內，父目錄若允許其他帳號
+建立、刪除或置換子項目即拒絕啟動。改用 `PII_GUARD_HOOKD_HOME` 指到設定檔外（例如另一顆磁碟或
+網路磁碟）會 fail-closed。既有 home 會被收緊而不是拒絕，但收緊救不回收緊前已經外流的內容。
+
 對照表預設保存 14 天，服務啟動時掃掉過期的（`serve --session-ttl-days`，`0` 關閉）。
 
 ## 引擎選擇

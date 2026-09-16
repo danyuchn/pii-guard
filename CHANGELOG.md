@@ -29,6 +29,21 @@
 
 ### 修正
 
+- **Windows 的 hookd session 對照表原本只靠 NTFS 繼承。** 私有工作目錄（jobs root）建立時會移除
+  繼承、限定目前使用者／SYSTEM／Administrators 並讀回驗證，但 Phase 7 的 hookd home 沒跟上：
+  `ensure_home()` 只做 `mkdir(0700)` 加 `chmod(0700)`，兩者在 NTFS 上都只切換唯讀旗標，而
+  `_assert_owner_mode()` 的擁有者與權限兩項檢查在 Windows 分支恆為真。保護
+  `sessions/*.json`（每個佔位符對應的真實值）的因此只剩父目錄碰巧繼承下來的 ACL，且
+  `PII_GUARD_HOOKD_HOME` 指到設定檔外也不會被擋。現在 home 比照 jobs root 套用並驗證同一組
+  ACL，`sessions/` 沿用該邊界，父層檢查不過即 fail-closed。與 jobs root 不同的是既有 home 會
+  被收緊而不是拒絕——那是這個專案自己在預設路徑建立的目錄，收緊等同 POSIX 上一直在做的
+  `chmod`。邊界每個 process 只建立與驗證一次，避免每次工具呼叫都付 icacls 與父層探測的成本。
+- **Windows hook client 遇中文即崩潰。** Windows console 交給 client 的是 cp1252 stdio，
+  回覆裡只要出現一個中文姓名，`json.dump(..., ensure_ascii=False)` 就以 `UnicodeEncodeError`
+  中止整個 hook——等於 guard 在該次工具呼叫失效。client 啟動時改為把 stdin／stdout 轉成 UTF-8。
+- **`doctor` 在 Windows 永遠回報 session store 失敗。** 該檢查用裸 `S_IMODE(...) == 0o700`
+  比對，NTFS 記不住這個值，於是 `install`、`doctor`、`--harden` 與 `--mod` 一律以非零離開。
+  改用與專案其他地方一致的 `_compat.mode_matches()`。
 - **Windows 私有工作檔改為位元組保真。** 私有來源與去識別化檔的寫入端會把 LF 膨脹成 CRLF、
   讀取端又折回來並在第一個 `0x1A` 截斷，雜湊之所以對得上只是兩個錯誤互相抵消；含 `0x1A` 的
   文件會被靜默截斷。寫入端停用換行轉換、讀取端改二進位模式。舊版 Windows 寫出的工作只在

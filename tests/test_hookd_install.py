@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
+from pii_guard._compat import private_directory_acl_matches
 from pii_guard.hookd import install as installer
+from pii_guard.hookd import state
 from pii_guard.hookd.__main__ import main
 from pii_guard.hookd.state import HookdConfig
 from pii_guard.local_workflow import WorkflowError
@@ -332,6 +335,91 @@ def test_ensure_home_leaves_pre_existing_directories_alone(tmp_path) -> None:
     # A directory that was already there is not ours to tighten.
     assert_mode(shared, 0o755)
     assert_mode((shared / "pii-guard"), 0o700)
+
+
+def test_the_home_is_secured_before_the_sessions_directory_exists(monkeypatch, tmp_path) -> None:
+    """The mappings must never sit below a boundary that is not up yet."""
+
+    order: list[str] = []
+    home = tmp_path / "hookd"
+    real_secure = state.secure_private_directory
+
+    def spy(path, *, created):
+        order.append(f"secure:{(home / 'sessions').is_dir()}")
+        return real_secure(path, created=created)
+
+    monkeypatch.setattr(state, "secure_private_directory", spy)
+    monkeypatch.setattr(state, "_SECURED_HOMES", set())
+
+    HookdConfig(home=home).ensure_home()
+
+    assert order == ["secure:False"]
+    assert (home / "sessions").is_dir()
+
+
+def test_the_home_boundary_is_established_once_per_process(monkeypatch, tmp_path) -> None:
+    """SessionStore.save calls ensure_home on every write; securing is not free."""
+
+    calls: list[Path] = []
+    monkeypatch.setattr(state, "secure_private_directory", lambda p, *, created: calls.append(p))
+    monkeypatch.setattr(state, "_SECURED_HOMES", set())
+    config = HookdConfig(home=tmp_path / "hookd")
+
+    config.ensure_home()
+    config.ensure_home()
+    HookdConfig(home=tmp_path / "hookd").ensure_home()
+
+    assert calls == [(tmp_path / "hookd").resolve()]
+
+
+def test_an_unverifiable_home_fails_closed(monkeypatch, tmp_path) -> None:
+    def refuse(path, *, created):
+        raise OSError("parent ACL is unsafe")
+
+    monkeypatch.setattr(state, "secure_private_directory", refuse)
+    monkeypatch.setattr(state, "_SECURED_HOMES", set())
+
+    with pytest.raises(WorkflowError, match="PERMISSION_CHECK_FAILED"):
+        HookdConfig(home=tmp_path / "hookd").ensure_home()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACLs are platform-specific")
+def test_windows_home_acl_is_applied_verified_and_tamper_evident(tmp_path) -> None:
+    config = HookdConfig(home=tmp_path / "hookd")
+    config.ensure_home()
+
+    assert private_directory_acl_matches(config.home)
+
+    icacls = Path(os.environ["SystemRoot"]) / "System32" / "icacls.exe"
+    completed = subprocess.run(
+        [str(icacls), str(config.home), "/grant", "*S-1-1-0:(OI)(CI)R", "/Q"],
+        check=False,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+    assert not private_directory_acl_matches(config.home)
+
+    # A home this process already secured is trusted for the rest of the run;
+    # a fresh process, which is what a restart is, must refuse to reuse it.
+    state._SECURED_HOMES.discard(config.home.resolve())
+    with pytest.raises(WorkflowError, match="PERMISSION_CHECK_FAILED"):
+        config.ensure_home()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACLs are platform-specific")
+def test_windows_home_under_a_shared_parent_is_refused(tmp_path) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    icacls = Path(os.environ["SystemRoot"]) / "System32" / "icacls.exe"
+    completed = subprocess.run(
+        [str(icacls), str(shared), "/grant", "*S-1-1-0:(OI)(CI)F", "/Q"],
+        check=False,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+
+    with pytest.raises(WorkflowError, match="PERMISSION_CHECK_FAILED"):
+        HookdConfig(home=shared / "hookd").ensure_home()
 
 
 def test_install_leaves_the_hookd_home_owner_only(env) -> None:
