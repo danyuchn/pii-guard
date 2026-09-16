@@ -296,6 +296,9 @@ def test_settings_path_rejects_an_unknown_scope() -> None:
         installer.settings_path(Path("/tmp"), "global")
 
 
+# Loosening the store to 0o755 is how this check is provoked, and NTFS cannot
+# record that, so doctor correctly reports the verified ACL instead.
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes cannot be loosened on NTFS")
 def test_session_store_permissions_are_checked(env, monkeypatch, capsys) -> None:
     _install()
     capsys.readouterr()

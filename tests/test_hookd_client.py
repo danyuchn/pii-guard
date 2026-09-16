@@ -84,12 +84,16 @@ def run_client(
         [sys.executable, str(CLIENT), event, *arguments],
         input=json.dumps(payload),
         capture_output=True,
-        text=True,
+        # Explicit, not text=True: that decodes with the locale encoding, and a
+        # Windows reader thread dying on a Chinese name in cp1252 leaves stdout
+        # None with a returncode of 0, which reads as a pass until it doesn't.
+        encoding="utf-8",
         env=environment,
         timeout=60,
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
+    assert completed.stdout, f"the client wrote no reply; stderr={completed.stderr!r}"
     return json.loads(completed.stdout)
 
 
@@ -363,7 +367,7 @@ def run_with_config(
         [sys.executable, str(CLIENT), event],
         input=json.dumps(payload),
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         env=child_environment(
             {
                 "PII_GUARD_HOOKD_HOME": str(home),
@@ -375,6 +379,7 @@ def run_with_config(
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
+    assert completed.stdout, f"the client wrote no reply; stderr={completed.stderr!r}"
     return json.loads(completed.stdout)
 
 
