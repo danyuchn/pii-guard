@@ -78,3 +78,6 @@ logs/
 # Regenerate with: CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude -p "/plugin-types"
 examples/claude-code-mod/types/
 examples/claude-code-mod/evals/results/
+
+# Promo videos and other marketing media (large binaries, not versioned)
+media/
