@@ -153,3 +153,7 @@ Never report original values, mapping entries, raw model output, raw warning tex
 - The local model connection bypasses system proxies and verifies that port 11434 belongs to this user's Ollama process.
 - No automated detector is perfect. `agent_may_read_redacted: true` means the configured local checks passed, not that zero privacy risk is mathematically guaranteed.
 - Document text can try to mislead an LLM. The local audit is a supplemental detector, not a proof against adversarial prompt injection.
+
+## 相關
+
+Office xlsx/xlsm 去識別化給 demo 用（內容就地中和、痕跡點清單、驗收法）→ `references/xlsx-deidentification.md`。
